@@ -67,6 +67,15 @@ importers:
         specifier: ^7.2.4
         version: 7.3.6(@types/node@24.13.2)
 
+  packages/cli:
+    dependencies:
+      '@ponswarp/core':
+        specifier: workspace:*
+        version: link:../core
+      '@ponswarp/signaling':
+        specifier: workspace:*
+        version: link:../signaling
+
   packages/core: {}
 
   packages/react:

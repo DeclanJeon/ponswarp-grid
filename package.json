@@ -7,9 +7,9 @@
   "license": "MIT",
   "packageManager": "pnpm@11.9.0",
   "scripts": {
-    "build": "tsc -b packages/core packages/webrtc packages/signaling packages/react apps/demo",
+    "build": "tsc -b packages/core packages/webrtc packages/signaling packages/react packages/cli apps/demo",
     "test": "vitest run",
-    "type-check": "tsc -b packages/core packages/webrtc packages/signaling packages/react apps/demo --pretty false",
+    "type-check": "tsc -b packages/core packages/webrtc packages/signaling packages/react packages/cli apps/demo --pretty false",
     "dev:signal": "pnpm --filter @ponswarp/signaling start",
     "perf:500mb": "node scripts/perf-500mb.mjs",
     "clean": "node -e \"import('node:fs/promises').then(fs=>fs.rm('dist',{recursive:true,force:true}))\""

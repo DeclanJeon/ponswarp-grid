@@ -73,6 +73,30 @@ Troubleshooting:
 - Large final download unavailable: browser lacks a safe writable sink for a file above `safeAssembleBytes`; retry with a smaller file or a browser supporting File System Access writable streams.
 - OPFS unavailable: the storage factory falls back to IndexedDB and then Memory while recording warnings in the selected storage backend/debug state.
 
+## Node CLI direct transfer
+
+Build the CLI package and run a sender process:
+
+```bash
+pnpm build
+node packages/cli/dist/cli.js send ./file.bin --listen 127.0.0.1:0
+```
+
+The sender prints a `ponswarp://join/...` descriptor containing the owner endpoint and manifest. In another terminal, join and write the verified file:
+
+```bash
+node packages/cli/dist/cli.js join 'ponswarp://join/...' --out ./downloads
+```
+
+The receiver writes pieces to disk through `NodeFileStorageAdapter`, resumes from the session state on rerun, streams final assembly to the output file, and verifies the final SHA-256 hash when the manifest includes one. For a CLI grid check, keep Receiver A online after completion and pass its printed peer descriptor to Receiver B:
+
+```bash
+node packages/cli/dist/cli.js join 'ponswarp://join/...' --out ./receiver-a --seed-after-complete
+node packages/cli/dist/cli.js join 'ponswarp://join/...' --out ./receiver-b --peer 'ponswarp-peer://...'
+```
+
+Receiver B prints `Non-owner provider pieces: N`; a value greater than zero proves it fetched at least one piece from Receiver A instead of only the owner. CLI mode is localhost/LAN oriented.
+
 ## API quickstart
 
 ```ts

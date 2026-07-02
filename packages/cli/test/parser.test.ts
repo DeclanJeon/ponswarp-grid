@@ -1,0 +1,81 @@
+import { describe, expect, it } from 'vitest';
+import { CliUsageError, parseCliArgs, usage } from '../src/index';
+
+describe('PonsWarp CLI parser', () => {
+  it('parses help and version commands', () => {
+    expect(parseCliArgs([])).toEqual({ command: 'help' });
+    expect(parseCliArgs(['--help'])).toEqual({ command: 'help' });
+    expect(parseCliArgs(['version'])).toEqual({ command: 'version' });
+    expect(usage()).toContain('ponswarp send <file>');
+  });
+
+  it('parses send defaults and options', () => {
+    expect(parseCliArgs(['send', 'demo.bin'])).toMatchObject({
+      command: 'send',
+      file: 'demo.bin',
+      signal: 'ws://127.0.0.1:8787/ws',
+      listen: '127.0.0.1:0',
+      pieceSize: 1024 * 1024,
+      keepOpen: false
+    });
+
+    expect(parseCliArgs([
+      'send',
+      'demo.bin',
+      '--signal', 'ws://localhost:9999/ws',
+      '--listen=0.0.0.0:5000',
+      '--advertise', 'ws://10.0.0.2:5000',
+      '--piece-size', '262144',
+      '--session', 'sess_cli',
+      '--keep-open'
+    ])).toMatchObject({
+      command: 'send',
+      file: 'demo.bin',
+      signal: 'ws://localhost:9999/ws',
+      listen: '0.0.0.0:5000',
+      advertise: 'ws://10.0.0.2:5000',
+      pieceSize: 262144,
+      session: 'sess_cli',
+      keepOpen: true
+    });
+  });
+
+  it('parses join defaults and options', () => {
+    expect(parseCliArgs(['join', 'sess_1'])).toMatchObject({
+      command: 'join',
+      session: 'sess_1',
+      outDir: '.',
+      seedAfterComplete: false,
+      maxPeers: 8
+    });
+
+    expect(parseCliArgs(['join', 'ponswarp://join/sess_1', '--out', 'downloads', '--peer', 'ponswarp-peer://abc', '--seed-after-complete', '--max-peers', '3'])).toMatchObject({
+      command: 'join',
+      session: 'ponswarp://join/sess_1',
+      outDir: 'downloads',
+      seedAfterComplete: true,
+      peer: 'ponswarp-peer://abc',
+      maxPeers: 3
+    });
+  });
+
+  it('parses serve-signal status and clean', () => {
+    expect(parseCliArgs(['serve-signal'])).toEqual({ command: 'serve-signal', host: '0.0.0.0', port: 8787 });
+    expect(parseCliArgs(['serve-signal', '--host', '127.0.0.1', '--port', '9999'])).toEqual({ command: 'serve-signal', host: '127.0.0.1', port: 9999 });
+    expect(parseCliArgs(['status', 'sess_1'])).toEqual({ command: 'status', session: 'sess_1' });
+    expect(parseCliArgs(['clean', 'sess_1'])).toEqual({ command: 'clean', session: 'sess_1' });
+  });
+
+  it('rejects malformed input', () => {
+    expect(() => parseCliArgs(['bogus'])).toThrow(CliUsageError);
+    expect(() => parseCliArgs(['send'])).toThrow(/send requires/);
+    expect(() => parseCliArgs(['send', 'a', 'b'])).toThrow(/one file/);
+    expect(() => parseCliArgs(['join'])).toThrow(/join requires/);
+    expect(() => parseCliArgs(['join', 'sess', '--max-peers', '0'])).toThrow(/positive integer/);
+    expect(() => parseCliArgs(['serve-signal', '--port'])).toThrow(/Missing value/);
+    expect(() => parseCliArgs(['serve-signal', '--port', '70000'])).toThrow(/between 1 and 65535/);
+    expect(() => parseCliArgs(['send', 'demo.bin', '--singal', 'ws://typo'])).toThrow(/Unknown option/);
+    expect(() => parseCliArgs(['join', 'sess', '--seed-after-complete=true'])).toThrow(/does not take a value|Unknown option/);
+    expect(() => parseCliArgs(['status', 'sess', '--out', 'x'])).toThrow(/Unknown option/);
+  });
+});

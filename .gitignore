@@ -9,3 +9,4 @@ coverage/
 .gjc/
 artifacts/
 qa-artifacts/
+.ponswarp-grid/
