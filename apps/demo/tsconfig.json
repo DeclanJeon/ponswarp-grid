@@ -1,0 +1,23 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "jsx": "react-jsx",
+    "rootDir": "src",
+    "outDir": "dist/types",
+    "tsBuildInfoFile": "dist/tsconfig.tsbuildinfo",
+    "paths": {
+      "@ponswarp/core": ["../../packages/core/src/index.ts"],
+      "@ponswarp/react": ["../../packages/react/src/index.tsx"],
+      "@ponswarp/signaling": ["../../packages/signaling/src/index.ts"],
+      "@ponswarp/webrtc": ["../../packages/webrtc/src/index.ts"]
+    }
+  },
+  "references": [
+    { "path": "../../packages/core" },
+    { "path": "../../packages/react" },
+    { "path": "../../packages/signaling" },
+    { "path": "../../packages/webrtc" }
+  ],
+  "include": ["src/**/*.ts", "src/**/*.tsx"]
+}

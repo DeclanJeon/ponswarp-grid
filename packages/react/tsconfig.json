@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "jsx": "react-jsx",
+    "rootDir": "src",
+    "outDir": "dist",
+    "tsBuildInfoFile": "dist/tsconfig.tsbuildinfo",
+    "paths": { "@ponswarp/core": ["../core/src/index.ts"] }
+  },
+  "references": [{ "path": "../core" }],
+  "include": ["src/**/*.ts", "src/**/*.tsx"]
+}

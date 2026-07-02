@@ -1,0 +1,447 @@
+import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from 'node:http';
+import { createHash, randomUUID } from 'node:crypto';
+import type { Socket } from 'node:net';
+import {
+  PROTOCOL_VERSION,
+  SIGNALING_PROTOCOL,
+  RoomManager,
+  decodeSignaling,
+  encodeSignaling,
+  type PeerSummary,
+  type RoomSnapshot,
+  type SessionFileDescriptor,
+  type SignalingEnvelope
+} from './index.js';
+import type { PeerId, SessionId } from '@ponswarp/core';
+
+export interface SignalingServerConfig {
+  host: string;
+  port: number;
+  publicBaseUrl: string;
+  sessionTtlMs: number;
+  peerTtlMs: number;
+  maxPeersPerSession: number;
+  maxSessions: number;
+  heartbeatIntervalMs: number;
+  stalePeerTimeoutMs: number;
+  allowedOrigins: string[];
+}
+
+export const DEFAULT_SIGNALING_SERVER_CONFIG: SignalingServerConfig = {
+  host: '0.0.0.0',
+  port: 8787,
+  publicBaseUrl: 'http://localhost:5173',
+  sessionTtlMs: 60 * 60 * 1000,
+  peerTtlMs: 30 * 1000,
+  maxPeersPerSession: 16,
+  maxSessions: 1024,
+  heartbeatIntervalMs: 10 * 1000,
+  stalePeerTimeoutMs: 5 * 60 * 1000,
+  allowedOrigins: []
+};
+
+export type SignalingGatewayEvent =
+  | { type: 'sessionCreated'; session: RoomSnapshot }
+  | { type: 'peerJoined'; sessionId: SessionId; peer: PeerSummary; peers: PeerSummary[] }
+  | { type: 'peerLeft'; sessionId: SessionId; peerId: PeerId }
+  | { type: 'relayed'; envelope: SignalingEnvelope };
+
+export interface GatewayPeerConnection {
+  readonly peerId?: PeerId;
+  readonly sessionId?: SessionId;
+  send(data: string): void;
+  close(code?: number, reason?: string): void;
+}
+
+interface MutableGatewayPeerConnection extends GatewayPeerConnection {
+  peerId?: PeerId;
+  sessionId?: SessionId;
+  lastSeenAt: number;
+}
+
+export class SignalingGateway {
+  private readonly peers = new Set<MutableGatewayPeerConnection>();
+  private readonly events = new Set<(event: SignalingGatewayEvent) => void>();
+
+  constructor(
+    private readonly roomManager = new RoomManager(),
+    private readonly config: SignalingServerConfig = DEFAULT_SIGNALING_SERVER_CONFIG,
+    private readonly now: () => number = () => Date.now()
+  ) {}
+
+  attach(connection: GatewayPeerConnection): void {
+    const mutable = connection as MutableGatewayPeerConnection;
+    mutable.lastSeenAt = this.now();
+    this.peers.add(mutable);
+  }
+
+  detach(connection: GatewayPeerConnection): void {
+    const mutable = connection as MutableGatewayPeerConnection;
+    this.peers.delete(mutable);
+    if (mutable.sessionId && mutable.peerId) {
+      this.roomManager.leaveSession(mutable.sessionId, mutable.peerId);
+      this.broadcastPeerLeft(mutable.sessionId, mutable.peerId);
+      this.emit({ type: 'peerLeft', sessionId: mutable.sessionId, peerId: mutable.peerId });
+    }
+  }
+
+  onEvent(handler: (event: SignalingGatewayEvent) => void): () => void {
+    this.events.add(handler);
+    return () => this.events.delete(handler);
+  }
+
+  handleText(connection: GatewayPeerConnection, data: string): void {
+    const mutable = connection as MutableGatewayPeerConnection;
+    mutable.lastSeenAt = this.now();
+    let envelope: SignalingEnvelope;
+    try {
+      envelope = decodeSignaling(data);
+      this.handleEnvelope(mutable, envelope);
+    } catch (error) {
+      this.sendError(mutable, undefined, undefined, error instanceof Error ? error.message : String(error), 'bad_request');
+    }
+  }
+
+  cleanupStalePeers(): number {
+    const cutoff = this.now() - this.config.stalePeerTimeoutMs;
+    let removed = 0;
+    for (const peer of [...this.peers]) {
+      if (peer.lastSeenAt <= cutoff) {
+        peer.close(4000, 'stale peer');
+        this.detach(peer);
+        removed += 1;
+      }
+    }
+    removed += this.roomManager.cleanupExpired();
+    return removed;
+  }
+
+  private handleEnvelope(connection: MutableGatewayPeerConnection, envelope: SignalingEnvelope): void {
+    switch (envelope.type) {
+      case 'CREATE_SESSION':
+        this.handleCreateSession(connection, envelope);
+        return;
+      case 'JOIN_SESSION':
+        this.handleJoinSession(connection, envelope);
+        return;
+      case 'WEBRTC_OFFER':
+      case 'WEBRTC_ANSWER':
+      case 'ICE_CANDIDATE':
+        this.handleRelay(connection, envelope);
+        return;
+      case 'PEER_LEFT':
+        if (envelope.sessionId && envelope.fromPeerId) this.handleLeave(connection, envelope.sessionId, envelope.fromPeerId);
+        return;
+      default:
+        this.sendError(connection, envelope.sessionId, envelope.fromPeerId, `Unsupported client message ${envelope.type}`, 'unsupported_message');
+    }
+  }
+
+  private handleCreateSession(connection: MutableGatewayPeerConnection, envelope: SignalingEnvelope): void {
+    const payload = envelope.payload as { ownerPeerId: PeerId; files: SessionFileDescriptor[] };
+    const sessionId = envelope.sessionId ?? (`sess_${randomUUID()}` as SessionId);
+    const session = this.roomManager.createSession({ sessionId, ownerPeerId: payload.ownerPeerId, files: payload.files, ttlMs: this.config.sessionTtlMs });
+    connection.peerId = payload.ownerPeerId;
+    connection.sessionId = sessionId;
+    const response: SignalingEnvelope = {
+      protocol: SIGNALING_PROTOCOL,
+      version: PROTOCOL_VERSION,
+      messageId: `msg_${randomUUID()}`,
+      type: 'SESSION_CREATED',
+      sessionId,
+      fromPeerId: payload.ownerPeerId,
+      timestamp: this.now(),
+      payload: {
+        ownerPeerId: payload.ownerPeerId,
+        expiresAt: session.expiresAt,
+        shareUrl: `${this.config.publicBaseUrl.replace(/\/$/, '')}/#/join/${sessionId}`
+      }
+    };
+    connection.send(encodeSignaling(response));
+    this.emit({ type: 'sessionCreated', session });
+  }
+
+  private handleJoinSession(connection: MutableGatewayPeerConnection, envelope: SignalingEnvelope): void {
+    if (!envelope.sessionId || !envelope.fromPeerId) throw new Error('JOIN_SESSION requires sessionId and fromPeerId');
+    const session = this.roomManager.joinSession(envelope.sessionId, envelope.fromPeerId, 'receiver');
+    if (session.peers.length > this.config.maxPeersPerSession) {
+      this.roomManager.leaveSession(envelope.sessionId, envelope.fromPeerId);
+      throw new Error('Session peer limit exceeded');
+    }
+    connection.peerId = envelope.fromPeerId;
+    connection.sessionId = envelope.sessionId;
+    const response: SignalingEnvelope = {
+      protocol: SIGNALING_PROTOCOL,
+      version: PROTOCOL_VERSION,
+      messageId: `msg_${randomUUID()}`,
+      type: 'SESSION_JOINED',
+      sessionId: envelope.sessionId,
+      fromPeerId: envelope.fromPeerId,
+      timestamp: this.now(),
+      payload: {
+        selfPeerId: envelope.fromPeerId,
+        ownerPeerId: session.ownerPeerId,
+        peers: session.peers,
+        files: session.files
+      }
+    };
+    connection.send(encodeSignaling(response));
+    this.broadcastPeerJoined(envelope.sessionId, envelope.fromPeerId);
+    this.emit({ type: 'peerJoined', sessionId: envelope.sessionId, peer: { peerId: envelope.fromPeerId, role: 'receiver' }, peers: [...session.peers] });
+  }
+
+  private handleRelay(connection: MutableGatewayPeerConnection, envelope: SignalingEnvelope): void {
+    const relay = this.roomManager.relayWebRtc(envelope);
+    const target = [...this.peers].find(peer => peer.peerId === relay.toPeerId && peer.sessionId === relay.sessionId);
+    if (!target) throw new Error(`Target peer is not connected: ${relay.toPeerId}`);
+    target.send(encodeSignaling(relay.envelope));
+    this.emit({ type: 'relayed', envelope: relay.envelope });
+  }
+
+  private handleLeave(connection: MutableGatewayPeerConnection, sessionId: SessionId, peerId: PeerId): void {
+    this.roomManager.leaveSession(sessionId, peerId);
+    this.broadcastPeerLeft(sessionId, peerId);
+    connection.sessionId = undefined;
+    connection.peerId = undefined;
+    this.emit({ type: 'peerLeft', sessionId, peerId });
+  }
+
+  private broadcastPeerJoined(sessionId: SessionId, peerId: PeerId): void {
+    const envelope: SignalingEnvelope = {
+      protocol: SIGNALING_PROTOCOL,
+      version: PROTOCOL_VERSION,
+      messageId: `msg_${randomUUID()}`,
+      type: 'PEER_JOINED',
+      sessionId,
+      fromPeerId: peerId,
+      timestamp: this.now(),
+      payload: { peerId, role: 'receiver' }
+    };
+    this.broadcast(sessionId, envelope, peerId);
+  }
+
+  private broadcastPeerLeft(sessionId: SessionId, peerId: PeerId): void {
+    const envelope: SignalingEnvelope = {
+      protocol: SIGNALING_PROTOCOL,
+      version: PROTOCOL_VERSION,
+      messageId: `msg_${randomUUID()}`,
+      type: 'PEER_LEFT',
+      sessionId,
+      fromPeerId: peerId,
+      timestamp: this.now(),
+      payload: { peerId }
+    };
+    this.broadcast(sessionId, envelope, peerId);
+  }
+
+  private broadcast(sessionId: SessionId, envelope: SignalingEnvelope, exceptPeerId?: PeerId): void {
+    const encoded = encodeSignaling(envelope);
+    for (const peer of this.peers) {
+      if (peer.sessionId === sessionId && peer.peerId !== exceptPeerId) peer.send(encoded);
+    }
+  }
+
+  private sendError(connection: MutableGatewayPeerConnection, sessionId: SessionId | undefined, toPeerId: PeerId | undefined, message: string, code: string): void {
+    const envelope: SignalingEnvelope = {
+      protocol: SIGNALING_PROTOCOL,
+      version: PROTOCOL_VERSION,
+      messageId: `msg_${randomUUID()}`,
+      type: 'ERROR',
+      sessionId,
+      toPeerId,
+      timestamp: this.now(),
+      payload: { code, message }
+    };
+    connection.send(encodeSignaling(envelope));
+  }
+
+  private emit(event: SignalingGatewayEvent): void {
+    this.events.forEach(handler => handler(event));
+  }
+}
+
+export interface SignalingHttpServer {
+  server: HttpServer;
+  gateway: SignalingGateway;
+  listen(): Promise<void>;
+  close(): Promise<void>;
+}
+
+export function createSignalingHttpServer(input: { config?: Partial<SignalingServerConfig>; roomManager?: RoomManager } = {}): SignalingHttpServer {
+  const config = { ...DEFAULT_SIGNALING_SERVER_CONFIG, ...input.config };
+  const gateway = new SignalingGateway(input.roomManager ?? new RoomManager(), config);
+  const server = createServer((request, response) => handleHttpRequest(request, response));
+  const interval = setInterval(() => gateway.cleanupStalePeers(), config.heartbeatIntervalMs);
+  interval.unref?.();
+
+  server.on('upgrade', (request, socket) => {
+    if (!isOriginAllowed(request.headers.origin, config.allowedOrigins)) {
+      socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    if (request.url !== '/ws') {
+      socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    if (typeof request.headers['sec-websocket-key'] !== 'string') {
+      socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    const connection = acceptWebSocket(request, socket as Socket);
+    gateway.attach(connection);
+    connection.onText = text => gateway.handleText(connection, text);
+    connection.onClose = () => gateway.detach(connection);
+  });
+
+  return {
+    server,
+    gateway,
+    listen: () => new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(config.port, config.host, () => {
+        server.off('error', reject);
+        resolve();
+      });
+    }),
+    close: () => new Promise((resolve, reject) => {
+      clearInterval(interval);
+      server.close(error => error ? reject(error) : resolve());
+    })
+  };
+}
+
+function handleHttpRequest(request: IncomingMessage, response: ServerResponse): void {
+  if (request.url === '/healthz') {
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ ok: true }));
+    return;
+  }
+  response.writeHead(404, { 'content-type': 'application/json' });
+  response.end(JSON.stringify({ error: 'not_found' }));
+}
+
+function isOriginAllowed(origin: string | undefined, allowedOrigins: string[]): boolean {
+  return allowedOrigins.length === 0 || (origin !== undefined && allowedOrigins.includes(origin));
+}
+
+class MinimalWebSocketConnection implements MutableGatewayPeerConnection {
+  peerId?: PeerId;
+  sessionId?: SessionId;
+  lastSeenAt = Date.now();
+  onText?: (text: string) => void;
+  onClose?: () => void;
+  private buffer = Buffer.alloc(0);
+  private closed = false;
+
+  constructor(private readonly socket: Socket) {
+    socket.on('data', chunk => this.handleData(chunk));
+    socket.on('close', () => this.handleClose());
+    socket.on('error', () => this.handleClose());
+  }
+
+  send(data: string): void {
+    if (this.closed) return;
+    const payload = Buffer.from(data, 'utf8');
+    const header = createFrameHeader(payload.length, 0x1);
+    this.socket.write(Buffer.concat([header, payload]));
+  }
+
+  close(code = 1000, reason = 'closed'): void {
+    if (this.closed) return;
+    const reasonBuffer = Buffer.from(reason);
+    const payload = Buffer.alloc(2 + reasonBuffer.length);
+    payload.writeUInt16BE(code, 0);
+    reasonBuffer.copy(payload, 2);
+    this.socket.write(Buffer.concat([createFrameHeader(payload.length, 0x8), payload]));
+    this.socket.end();
+    this.handleClose();
+  }
+
+  private handleData(chunk: Buffer): void {
+    try {
+      this.buffer = Buffer.concat([this.buffer, chunk]);
+      while (this.buffer.length >= 2) {
+        const frame = readFrame(this.buffer);
+        if (!frame) return;
+        this.buffer = this.buffer.subarray(frame.consumed);
+        if (frame.opcode === 0x8) { this.close(); return; }
+        if (frame.opcode === 0x9) { this.socket.write(Buffer.concat([createFrameHeader(frame.payload.length, 0xA), frame.payload])); continue; }
+        if (frame.opcode === 0x1) this.onText?.(frame.payload.toString('utf8'));
+      }
+    } catch {
+      this.close(1002, 'protocol error');
+    }
+  }
+
+  private handleClose(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.onClose?.();
+  }
+}
+
+function acceptWebSocket(request: IncomingMessage, socket: Socket): MinimalWebSocketConnection {
+  const key = request.headers['sec-websocket-key'];
+  if (typeof key !== 'string') {
+    socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+    socket.destroy();
+    return new MinimalWebSocketConnection(socket);
+  }
+  const accept = createHash('sha1').update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64');
+  socket.write([
+    'HTTP/1.1 101 Switching Protocols',
+    'Upgrade: websocket',
+    'Connection: Upgrade',
+    `Sec-WebSocket-Accept: ${accept}`,
+    '\r\n'
+  ].join('\r\n'));
+  return new MinimalWebSocketConnection(socket);
+}
+
+function createFrameHeader(length: number, opcode: number): Buffer {
+  if (length < 126) return Buffer.from([0x80 | opcode, length]);
+  if (length <= 0xffff) {
+    const header = Buffer.alloc(4);
+    header[0] = 0x80 | opcode;
+    header[1] = 126;
+    header.writeUInt16BE(length, 2);
+    return header;
+  }
+  const header = Buffer.alloc(10);
+  header[0] = 0x80 | opcode;
+  header[1] = 127;
+  header.writeBigUInt64BE(BigInt(length), 2);
+  return header;
+}
+
+function readFrame(buffer: Buffer): { opcode: number; payload: Buffer; consumed: number } | null {
+  const first = buffer[0];
+  const second = buffer[1];
+  const opcode = first & 0x0f;
+  const masked = (second & 0x80) !== 0;
+  let length = second & 0x7f;
+  let offset = 2;
+  if (length === 126) {
+    if (buffer.length < 4) return null;
+    length = buffer.readUInt16BE(2);
+    offset = 4;
+  } else if (length === 127) {
+    if (buffer.length < 10) return null;
+    const bigLength = buffer.readBigUInt64BE(2);
+    if (bigLength > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('WebSocket frame too large');
+    length = Number(bigLength);
+    offset = 10;
+  }
+  const maskOffset = offset;
+  if (masked) offset += 4;
+  if (buffer.length < offset + length) return null;
+  const payload = Buffer.from(buffer.subarray(offset, offset + length));
+  if (masked) {
+    const mask = buffer.subarray(maskOffset, maskOffset + 4);
+    for (let index = 0; index < payload.length; index += 1) payload[index] ^= mask[index % 4];
+  }
+  return { opcode, payload, consumed: offset + length };
+}

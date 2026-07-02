@@ -1,0 +1,28 @@
+{
+  "name": "ponswarp-grid",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Reusable browser P2P piece-transfer grid engine extracted from PonsWarp.",
+  "license": "MIT",
+  "packageManager": "pnpm@11.9.0",
+  "scripts": {
+    "build": "tsc -b packages/core packages/webrtc packages/signaling packages/react apps/demo",
+    "test": "vitest run",
+    "type-check": "tsc -b packages/core packages/webrtc packages/signaling packages/react apps/demo --pretty false",
+    "dev:signal": "pnpm --filter @ponswarp/signaling start",
+    "perf:500mb": "node scripts/perf-500mb.mjs",
+    "clean": "node -e \"import('node:fs/promises').then(fs=>fs.rm('dist',{recursive:true,force:true}))\""
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "@types/react": "^19.2.7",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.1",
+    "typescript": "~5.9.3",
+    "vite": "^7.2.4",
+    "vitest": "^4.0.14",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  }
+}
