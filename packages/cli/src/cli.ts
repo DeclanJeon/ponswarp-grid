@@ -2,6 +2,7 @@
 import { createSignalingHttpServer } from '@ponswarp/signaling/server';
 import { CliUsageError, parseCliArgs, usage } from './index.js';
 import { runJoin, runSend } from './cli-runtime.js';
+import { runDownload, runFiles, runGet, runNodeStart, runPublish, runShare } from './coordinator-runtime.js';
 
 async function main(argv: readonly string[]): Promise<number> {
   const command = parseCliArgs(argv);
@@ -21,9 +22,27 @@ async function main(argv: readonly string[]): Promise<number> {
       return 0;
     case 'join':
       return runJoin(command);
+    case 'node-start':
+      await runNodeStart(command);
+      return 0;
+    case 'publish':
+      await runPublish(command);
+      return 0;
+    case 'files':
+      await runFiles(command);
+      return 0;
+    case 'download':
+      await runDownload(command);
+      return 0;
+    case 'share':
+      await runShare(command);
+      return 0;
+    case 'get':
+      await runGet(command);
+      return 0;
     case 'status':
     case 'clean':
-      throw new CliUsageError(`${command.command} session management is scheduled under the current Ultragoal story sequence`);
+      throw new CliUsageError(`${command.command} session management is not available in this build yet`);
   }
 }
 

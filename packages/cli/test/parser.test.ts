@@ -66,6 +66,39 @@ describe('PonsWarp CLI parser', () => {
     expect(parseCliArgs(['clean', 'sess_1'])).toEqual({ command: 'clean', session: 'sess_1' });
   });
 
+  it('parses coordinator product commands with json and dry-run options', () => {
+    expect(parseCliArgs(['node', 'start', '--coordinator', 'http://127.0.0.1:8787', '--workspace', 'ws', '--node-id', 'node-a', '--display-name', 'Node A', '--public-key', 'ed25519:test', '--json', '--dry-run'])).toMatchObject({
+      command: 'node-start',
+      coordinator: 'http://127.0.0.1:8787',
+      workspace: 'ws',
+      nodeId: 'node-a',
+      displayName: 'Node A',
+      publicKey: 'ed25519:test',
+      json: true,
+      dryRun: true
+    });
+    expect(parseCliArgs(['publish', 'file.bin', '--workspace', 'ws', '--node-id', 'node-a', '--json'])).toMatchObject({ command: 'publish', file: 'file.bin', workspace: 'ws', nodeId: 'node-a', json: true });
+    expect(parseCliArgs(['files', '--workspace', 'ws', '--json'])).toMatchObject({ command: 'files', workspace: 'ws', json: true });
+    expect(parseCliArgs(['download', 'file-1', '--workspace', 'ws', '--out', 'downloads', '--dry-run', '--json'])).toMatchObject({ command: 'download', fileId: 'file-1', workspace: 'ws', outDir: 'downloads', dryRun: true, json: true });
+    expect(parseCliArgs(['share', 'demo.bin', '--workspace', 'ws', '--node-id', 'node-a', '--ttl-seconds', '3600', '--json', '--dry-run'])).toMatchObject({
+      command: 'share',
+      file: 'demo.bin',
+      workspace: 'ws',
+      nodeId: 'node-a',
+      ttlSeconds: 3600,
+      json: true,
+      dryRun: true
+    });
+    expect(parseCliArgs(['get', 'https://warp.ponslink.com/get/8F3K-22Q9', '--out', 'downloads', '--json', '--dry-run'])).toMatchObject({
+      command: 'get',
+      code: 'https://warp.ponslink.com/get/8F3K-22Q9',
+      workspace: 'default',
+      outDir: 'downloads',
+      json: true,
+      dryRun: true
+    });
+  });
+
   it('rejects malformed input', () => {
     expect(() => parseCliArgs(['bogus'])).toThrow(CliUsageError);
     expect(() => parseCliArgs(['send'])).toThrow(/send requires/);
@@ -77,5 +110,10 @@ describe('PonsWarp CLI parser', () => {
     expect(() => parseCliArgs(['send', 'demo.bin', '--singal', 'ws://typo'])).toThrow(/Unknown option/);
     expect(() => parseCliArgs(['join', 'sess', '--seed-after-complete=true'])).toThrow(/does not take a value|Unknown option/);
     expect(() => parseCliArgs(['status', 'sess', '--out', 'x'])).toThrow(/Unknown option/);
+    expect(() => parseCliArgs(['share'])).toThrow(/share requires/);
+    expect(() => parseCliArgs(['share', 'a', 'b'])).toThrow(/one file/);
+    expect(() => parseCliArgs(['share', 'demo.bin', '--ttl-seconds', '0'])).toThrow(/positive integer/);
+    expect(() => parseCliArgs(['get'])).toThrow(/get requires/);
+    expect(() => parseCliArgs(['get', 'a', 'b'])).toThrow(/one share code/);
   });
 });

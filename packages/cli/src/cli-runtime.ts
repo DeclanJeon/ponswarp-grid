@@ -1,10 +1,8 @@
-import { createWriteStream } from 'node:fs';
-import { mkdir, readFile, rename, rm } from 'node:fs/promises';
+import { mkdir, readFile, rename } from 'node:fs/promises';
 import { basename, join } from 'node:path';
-import { Writable } from 'node:stream';
 import { createHash } from 'node:crypto';
 import { PonsWarpEngine, type FileManifest, type PeerId, type SessionId, type TransferProgress } from '@ponswarp/core';
-import { NodeFileStorageAdapter } from './node-file-storage.js';
+import { NodeFileStorageAdapter, openNodeFileSource, type NodeFileSource } from './node-file-storage.js';
 import { NodePeerEndpointRegistry, NodeWebSocketTransport, type PeerEndpoint } from './node-websocket-transport.js';
 import { BrowserSignalingClient, type SessionFileDescriptor } from '@ponswarp/signaling';
 import type { JoinCommand, SendCommand } from './index.js';
@@ -31,30 +29,39 @@ export async function runSend(command: SendCommand): Promise<void> {
   const registry = new NodePeerEndpointRegistry();
   const transport = new NodeWebSocketTransport({ selfId: ownerPeerId, host: parseListenHost(command.listen), port: parseListenPort(command.listen), registry });
   const ownerEndpoint = await transport.listen();
-  const storage = new NodeFileStorageAdapter({ rootDir: join(process.cwd(), '.ponswarp-grid', 'owners', safeStorageKey(command.session ?? String(process.pid))) });
-  const engine = new PonsWarpEngine(storage, undefined, undefined, undefined, transport);
-  const fileBytes = await readFile(command.file);
-  const file = new Blob([fileBytes], { type: 'application/octet-stream' }) as Blob & { name: string; type: string };
-  Object.defineProperty(file, 'name', { value: basename(command.file) });
-  const session = await engine.createSession({
-    sessionId: command.session as SessionId | undefined,
-    files: [file],
-    pieceSize: command.pieceSize,
-    includeFileHash: true
-  });
-  const descriptor: CliSessionDescriptor = {
-    schemaVersion: 1,
-    sessionId: session.sessionId,
-    ownerPeerId,
-    ownerEndpoint: command.advertise ? { peerId: ownerPeerId, url: command.advertise } : ownerEndpoint,
-    manifests: session.manifests
-  };
-  await bestEffortCreateSignalingRoom(command.signal, ownerPeerId, session.sessionId, session.manifests);
-  console.log(`Session: ${session.sessionId}`);
-  console.log(`Join: ${encodeJoinDescriptor(descriptor)}`);
-  console.log(`Owner endpoint: ${descriptor.ownerEndpoint.url}`);
-  console.log(`Serving ${session.manifests[0]?.name ?? command.file} with ${session.manifests[0]?.pieceCount ?? 0} pieces.`);
-  await waitForShutdown(async () => transport.close());
+  let source: NodeFileSource | undefined;
+  try {
+    const storage = new NodeFileStorageAdapter({ rootDir: join(process.cwd(), '.ponswarp-grid', 'owners', safeStorageKey(command.session ?? String(process.pid))) });
+    const engine = new PonsWarpEngine(storage, undefined, undefined, undefined, transport);
+    source = await openNodeFileSource(command.file);
+    const file = toBlobLikeFile(source);
+    const session = await engine.createSession({
+      sessionId: command.session as SessionId | undefined,
+      files: [file],
+      pieceSize: command.pieceSize,
+      includeFileHash: source.size <= 256 * 1024 * 1024
+    });
+    const descriptor: CliSessionDescriptor = {
+      schemaVersion: 1,
+      sessionId: session.sessionId,
+      ownerPeerId,
+      ownerEndpoint: command.advertise ? { peerId: ownerPeerId, url: command.advertise } : ownerEndpoint,
+      manifests: session.manifests
+    };
+    await bestEffortCreateSignalingRoom(command.signal, ownerPeerId, session.sessionId, session.manifests);
+    console.log(`Session: ${session.sessionId}`);
+    console.log(`Join: ${encodeJoinDescriptor(descriptor)}`);
+    console.log(`Owner endpoint: ${descriptor.ownerEndpoint.url}`);
+    console.log(`Serving ${session.manifests[0]?.name ?? command.file} with ${session.manifests[0]?.pieceCount ?? 0} pieces.`);
+    await waitForShutdown(async () => {
+      await source?.close();
+      await transport.close();
+    });
+  } catch (error) {
+    await source?.close().catch(() => undefined);
+    await transport.close().catch(() => undefined);
+    throw error;
+  }
 }
 
 export async function runJoin(command: JoinCommand): Promise<number> {
@@ -69,6 +76,12 @@ export async function runJoin(command: JoinCommand): Promise<number> {
   await engine.joinSession(descriptor.sessionId, descriptor.manifests);
   const manifest = descriptor.manifests[0];
   if (!manifest) throw new Error('Join descriptor does not contain a file manifest');
+  await mkdir(command.outDir, { recursive: true });
+  const outputName = basename(manifest.name);
+  const outputPath = join(command.outDir, outputName);
+  const tempOutputPath = join(command.outDir, `.${outputName}.ponswarp-partial`);
+  const activeOutputPath = command.seedAfterComplete ? outputPath : tempOutputPath;
+  await storage.prepareOutputFile(manifest, activeOutputPath);
   await engine.resumeFile(manifest.fileId);
   await bestEffortJoinSignalingRoom(command.signal, descriptor.sessionId, receiverPeerId);
   const peerDescriptor = command.peer ? decodePeerDescriptor(command.peer) : undefined;
@@ -103,20 +116,19 @@ export async function runJoin(command: JoinCommand): Promise<number> {
     progress = await waitForProgress(engine, manifest.fileId, before);
     renderProgress(progress);
   }
-  await mkdir(command.outDir, { recursive: true });
-  const outputName = basename(manifest.name);
-  const outputPath = join(command.outDir, outputName);
-  const tempOutputPath = join(command.outDir, `.${outputName}.${process.pid}.${Date.now()}.tmp`);
   try {
-    const sink = Writable.toWeb(createWriteStream(tempOutputPath, { flags: 'wx' })) as WritableStream<Uint8Array>;
-    await storage.saveAssembledFile(manifest.fileId, manifest, sink);
+    const usage = await storage.getOutputStorageUsage(manifest.fileId);
+    if (usage.mode !== 'offset' || usage.outputBytes !== manifest.size) {
+      throw new Error(`Offset output storage was not prepared for ${manifest.name}`);
+    }
+    const completedPath = command.seedAfterComplete ? outputPath : tempOutputPath;
     if (manifest.fileHash) {
-      const hash = createHash('sha256').update(await readFile(tempOutputPath)).digest('hex');
+      const hash = createHash('sha256').update(await readFile(completedPath)).digest('hex');
       if (hash !== manifest.fileHash) throw new Error(`Final hash mismatch: expected ${manifest.fileHash}, got ${hash}`);
     }
-    await rename(tempOutputPath, outputPath);
+    if (!command.seedAfterComplete) await rename(tempOutputPath, outputPath);
   } catch (error) {
-    await rm(tempOutputPath, { force: true });
+    await transport.close().catch(() => undefined);
     throw error;
   }
   console.log(`Complete: ${outputName}`);
@@ -167,6 +179,29 @@ export function decodeJoinDescriptor(value: string): CliSessionDescriptor {
   return parsed;
 }
 
+function toBlobLikeFile(source: NodeFileSource): Blob & { name: string; type: string } {
+  return {
+    name: source.name,
+    type: source.type,
+    size: source.size,
+    async arrayBuffer(): Promise<ArrayBuffer> {
+      return source.readPiece(0, source.size);
+    },
+    slice(start = 0, end = source.size): Blob {
+      const offset = Math.max(0, Number(start));
+      const boundedEnd = Math.min(source.size, Math.max(offset, Number(end)));
+      const length = boundedEnd - offset;
+      return {
+        size: length,
+        type: source.type,
+        async arrayBuffer(): Promise<ArrayBuffer> {
+          return source.readPiece(offset, length);
+        }
+      } as Blob;
+    }
+  } as Blob & { name: string; type: string };
+}
+
 function parseListenHost(listen: string): string {
   return listen.split(':')[0] || '127.0.0.1';
 }
@@ -214,12 +249,14 @@ async function withTimeout<T>(operation: () => Promise<T>, timeoutMs: number): P
   }
 }
 
+const PIECE_PROGRESS_TIMEOUT_MS = 300_000;
+
 function waitForProgress(engine: PonsWarpEngine, fileId: FileManifest['fileId'], before: number): Promise<TransferProgress> {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       unsubscribe();
       reject(new Error('Timed out waiting for piece progress'));
-    }, 10_000);
+    }, PIECE_PROGRESS_TIMEOUT_MS);
     const unsubscribe = engine.on('progress', progress => {
       if (progress.verifiedPieces > before) {
         clearTimeout(timeout);

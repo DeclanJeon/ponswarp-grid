@@ -313,7 +313,7 @@ function isConnectionOpen(connection: PeerConnection): boolean {
 function closeConnection(connection: PeerConnection): void {
   if (connection.kind === 'socket') {
     connection.open = false;
-    connection.socket.end();
+    connection.socket.destroy();
     return;
   }
   connection.socket.close();

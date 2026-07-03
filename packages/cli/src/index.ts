@@ -1,4 +1,4 @@
-export type CliCommandName = 'send' | 'join' | 'serve-signal' | 'status' | 'clean' | 'help' | 'version';
+export type CliCommandName = 'send' | 'join' | 'serve-signal' | 'status' | 'clean' | 'node-start' | 'publish' | 'files' | 'download' | 'share' | 'get' | 'help' | 'version';
 export { NodeFileStorageAdapter, openNodeFileSource, toArrayBuffer, type NodeFileSource, type NodeFileStorageOptions } from './node-file-storage.js';
 export { NodePeerEndpointRegistry, NodeWebSocketTransport, type NodeWebSocketTransportOptions, type PeerEndpoint } from './node-websocket-transport.js';
 export { decodeJoinDescriptor, decodePeerDescriptor, encodeJoinDescriptor, encodePeerDescriptor, runJoin, runSend, type CliPeerDescriptor, type CliSessionDescriptor } from './cli-runtime.js';
@@ -39,7 +39,52 @@ export interface CleanCommand extends BaseCommand { command: 'clean'; session: s
 export interface HelpCommand extends BaseCommand { command: 'help' }
 export interface VersionCommand extends BaseCommand { command: 'version' }
 
-export type ParsedCliCommand = SendCommand | JoinCommand | ServeSignalCommand | StatusCommand | CleanCommand | HelpCommand | VersionCommand;
+export interface CoordinatorOptions {
+  coordinator: string;
+  workspace: string;
+  json: boolean;
+  dryRun: boolean;
+}
+
+export interface NodeStartCommand extends BaseCommand, CoordinatorOptions {
+  command: 'node-start';
+  nodeId: string;
+  displayName: string;
+  publicKey: string;
+}
+
+export interface PublishCommand extends BaseCommand, CoordinatorOptions {
+  command: 'publish';
+  file: string;
+  nodeId: string;
+  pieceSize: number;
+}
+
+export interface FilesCommand extends BaseCommand, Omit<CoordinatorOptions, 'dryRun'> {
+  command: 'files';
+}
+
+export interface DownloadCommand extends BaseCommand, CoordinatorOptions {
+  command: 'download';
+  fileId: string;
+  outDir: string;
+}
+
+export interface ShareCommand extends BaseCommand, CoordinatorOptions {
+  command: 'share';
+  file: string;
+  nodeId?: string;
+  pieceSize: number;
+  ttlSeconds?: number;
+}
+
+export interface GetCommand extends BaseCommand, CoordinatorOptions {
+  command: 'get';
+  code: string;
+  outDir: string;
+}
+
+export type ParsedCliCommand = SendCommand | JoinCommand | ServeSignalCommand | StatusCommand | CleanCommand | NodeStartCommand | PublishCommand | FilesCommand | DownloadCommand | ShareCommand | GetCommand | HelpCommand | VersionCommand;
 
 export class CliUsageError extends Error {
   constructor(message: string) { super(message); this.name = 'CliUsageError'; }
@@ -50,6 +95,7 @@ const DEFAULT_LISTEN = '127.0.0.1:0';
 const DEFAULT_PIECE_SIZE = 1024 * 1024;
 const DEFAULT_OUT_DIR = '.';
 const DEFAULT_MAX_PEERS = 8;
+const DEFAULT_COORDINATOR = 'http://127.0.0.1:8787';
 const TCP_PORT_MAX = 65535;
 
 
@@ -58,12 +104,18 @@ export function parseCliArgs(argv: readonly string[]): ParsedCliCommand {
   if (!command || command === 'help' || command === '--help' || command === '-h') return { command: 'help' };
   if (command === '--version' || command === '-v' || command === 'version') return { command: 'version' };
 
+  if (command === 'node') return parseNode(rest);
   switch (command) {
     case 'send': return parseSend(rest);
     case 'join': return parseJoin(rest);
     case 'serve-signal': return parseServeSignal(rest);
     case 'status': return parseSessionOnly('status', rest);
     case 'clean': return parseSessionOnly('clean', rest);
+    case 'publish': return parsePublish(rest);
+    case 'files': return parseFiles(rest);
+    case 'download': return parseDownload(rest);
+    case 'share': return parseShare(rest);
+    case 'get': return parseGet(rest);
     default: throw new CliUsageError(`Unknown command: ${command}`);
   }
 }
@@ -126,6 +178,107 @@ function parseSessionOnly(command: 'status' | 'clean', args: readonly string[]):
   return command === 'status' ? { command, session } : { command, session };
 }
 
+function parseNode(args: readonly string[]): NodeStartCommand {
+  const [subcommand, ...rest] = args;
+  if (subcommand !== 'start') throw new CliUsageError('node requires subcommand: start');
+  const positionals: string[] = [];
+  const options = parseOptions(rest, positionals, new Set(['coordinator', 'workspace', 'node-id', 'display-name', 'public-key', 'json', 'dry-run']));
+  if (positionals.length > 0) throw new CliUsageError('node start does not accept positional arguments');
+  return {
+    command: 'node-start',
+    coordinator: stringOption(options, 'coordinator', DEFAULT_COORDINATOR),
+    workspace: requiredStringOption(options, 'workspace'),
+    nodeId: requiredStringOption(options, 'node-id'),
+    displayName: stringOption(options, 'display-name', requiredStringOption(options, 'node-id')),
+    publicKey: requiredStringOption(options, 'public-key'),
+    json: booleanOption(options, 'json'),
+    dryRun: booleanOption(options, 'dry-run')
+  };
+}
+
+function parsePublish(args: readonly string[]): PublishCommand {
+  const positionals: string[] = [];
+  const options = parseOptions(args, positionals, new Set(['coordinator', 'workspace', 'node-id', 'piece-size', 'json', 'dry-run']));
+  const file = positionals[0];
+  if (!file) throw new CliUsageError('publish requires <file>');
+  if (positionals.length > 1) throw new CliUsageError(`publish accepts one file, got ${positionals.length}`);
+  return {
+    command: 'publish',
+    file,
+    coordinator: stringOption(options, 'coordinator', DEFAULT_COORDINATOR),
+    workspace: requiredStringOption(options, 'workspace'),
+    nodeId: requiredStringOption(options, 'node-id'),
+    pieceSize: positiveIntegerOption(options, 'piece-size', DEFAULT_PIECE_SIZE),
+    json: booleanOption(options, 'json'),
+    dryRun: booleanOption(options, 'dry-run')
+  };
+}
+
+function parseFiles(args: readonly string[]): FilesCommand {
+  const positionals: string[] = [];
+  const options = parseOptions(args, positionals, new Set(['coordinator', 'workspace', 'json']));
+  if (positionals.length > 0) throw new CliUsageError('files does not accept positional arguments');
+  return {
+    command: 'files',
+    coordinator: stringOption(options, 'coordinator', DEFAULT_COORDINATOR),
+    workspace: requiredStringOption(options, 'workspace'),
+    json: booleanOption(options, 'json')
+  };
+}
+
+function parseDownload(args: readonly string[]): DownloadCommand {
+  const positionals: string[] = [];
+  const options = parseOptions(args, positionals, new Set(['coordinator', 'workspace', 'out', 'json', 'dry-run']));
+  const fileId = positionals[0];
+  if (!fileId) throw new CliUsageError('download requires <file-id>');
+  if (positionals.length > 1) throw new CliUsageError(`download accepts one file id, got ${positionals.length}`);
+  return {
+    command: 'download',
+    fileId,
+    coordinator: stringOption(options, 'coordinator', DEFAULT_COORDINATOR),
+    workspace: requiredStringOption(options, 'workspace'),
+    outDir: stringOption(options, 'out', DEFAULT_OUT_DIR),
+    json: booleanOption(options, 'json'),
+    dryRun: booleanOption(options, 'dry-run')
+  };
+}
+
+function parseShare(args: readonly string[]): ShareCommand {
+  const positionals: string[] = [];
+  const options = parseOptions(args, positionals, new Set(['coordinator', 'workspace', 'node-id', 'piece-size', 'ttl-seconds', 'json', 'dry-run']));
+  const file = positionals[0];
+  if (!file) throw new CliUsageError('share requires <file>');
+  if (positionals.length > 1) throw new CliUsageError(`share accepts one file, got ${positionals.length}`);
+  return {
+    command: 'share',
+    file,
+    coordinator: stringOption(options, 'coordinator', DEFAULT_COORDINATOR),
+    workspace: stringOption(options, 'workspace', 'default'),
+    nodeId: optionalStringOption(options, 'node-id'),
+    pieceSize: positiveIntegerOption(options, 'piece-size', DEFAULT_PIECE_SIZE),
+    ttlSeconds: optionalPositiveIntegerOption(options, 'ttl-seconds'),
+    json: booleanOption(options, 'json'),
+    dryRun: booleanOption(options, 'dry-run')
+  };
+}
+
+function parseGet(args: readonly string[]): GetCommand {
+  const positionals: string[] = [];
+  const options = parseOptions(args, positionals, new Set(['coordinator', 'workspace', 'out', 'json', 'dry-run']));
+  const code = positionals[0];
+  if (!code) throw new CliUsageError('get requires <share-code-or-link>');
+  if (positionals.length > 1) throw new CliUsageError(`get accepts one share code or link, got ${positionals.length}`);
+  return {
+    command: 'get',
+    code,
+    coordinator: stringOption(options, 'coordinator', DEFAULT_COORDINATOR),
+    workspace: stringOption(options, 'workspace', 'default'),
+    outDir: stringOption(options, 'out', DEFAULT_OUT_DIR),
+    json: booleanOption(options, 'json'),
+    dryRun: booleanOption(options, 'dry-run')
+  };
+}
+
 function parseOptions(args: readonly string[], positionals: string[], allowed: ReadonlySet<string>): Map<string, string | true> {
   const options = new Map<string, string | true>();
   for (let index = 0; index < args.length; index += 1) {
@@ -158,7 +311,7 @@ function setKnownOption(options: Map<string, string | true>, allowed: ReadonlySe
 }
 
 function isBooleanFlag(key: string): boolean {
-  return key === 'keep-open' || key === 'seed-after-complete';
+  return key === 'keep-open' || key === 'seed-after-complete' || key === 'json' || key === 'dry-run';
 }
 
 function stringOption(options: Map<string, string | true>, key: string, fallback: string): string {
@@ -172,6 +325,12 @@ function optionalStringOption(options: Map<string, string | true>, key: string):
   const value = options.get(key);
   if (value === undefined) return undefined;
   if (value === true || value.length === 0) throw new CliUsageError(`--${key} requires a value`);
+  return value;
+}
+
+function requiredStringOption(options: Map<string, string | true>, key: string): string {
+  const value = optionalStringOption(options, key);
+  if (!value) throw new CliUsageError(`--${key} is required`);
   return value;
 }
 
@@ -191,6 +350,15 @@ function positiveIntegerOption(options: Map<string, string | true>, key: string,
   return value;
 }
 
+function optionalPositiveIntegerOption(options: Map<string, string | true>, key: string): number | undefined {
+  const raw = options.get(key);
+  if (raw === undefined) return undefined;
+  if (raw === true) throw new CliUsageError(`--${key} requires a value`);
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value <= 0) throw new CliUsageError(`--${key} must be a positive integer`);
+  return value;
+}
+
 function tcpPortOption(options: Map<string, string | true>, key: string, fallback: number): number {
   const value = positiveIntegerOption(options, key, fallback);
   if (value > TCP_PORT_MAX) throw new CliUsageError(`--${key} must be between 1 and ${TCP_PORT_MAX}`);
@@ -204,6 +372,12 @@ Usage:
   ponswarp send <file> [--signal ws://host:8787/ws] [--listen host:port] [--advertise ws://host:port] [--piece-size bytes] [--session id] [--keep-open]
   ponswarp join <session-or-url> --out <dir> [--signal ws://host:8787/ws] [--listen host:port] [--advertise ws://host:port] [--peer ponswarp-peer://...] [--seed-after-complete] [--max-peers n]
   ponswarp serve-signal [--host 0.0.0.0] [--port 8787]
+  ponswarp node start --workspace <id> --node-id <id> --public-key <key> [--coordinator http://host] [--display-name name] [--json] [--dry-run]
+  ponswarp publish <file> --workspace <id> --node-id <id> [--coordinator http://host] [--piece-size bytes] [--json] [--dry-run]
+  ponswarp files --workspace <id> [--coordinator http://host] [--json]
+  ponswarp download <file-id> --workspace <id> --out <dir> [--coordinator http://host] [--json] [--dry-run]
+  ponswarp share <file> [--workspace id] [--node-id id] [--coordinator http://host] [--piece-size bytes] [--ttl-seconds n] [--json] [--dry-run]
+  ponswarp get <share-code-or-link> [--workspace id] [--out <dir>] [--coordinator http://host] [--json] [--dry-run]
   ponswarp status <session>
   ponswarp clean <session>
 `;

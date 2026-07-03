@@ -97,6 +97,38 @@ node packages/cli/dist/cli.js join 'ponswarp://join/...' --out ./receiver-b --pe
 
 Receiver B prints `Non-owner provider pieces: N`; a value greater than zero proves it fetched at least one piece from Receiver A instead of only the owner. CLI mode is localhost/LAN oriented.
 
+## Node CLI coordinator product surface
+
+The direct `send`/`join` commands stay available as low-level transfer primitives and QA fallback. The product MVP command surface can also talk to a Workspace Coordinator that exposes `/api/mesh/*`:
+
+```bash
+node packages/cli/dist/cli.js node start \
+  --coordinator http://127.0.0.1:8787 \
+  --workspace my-workspace \
+  --node-id node-a \
+  --public-key ed25519:dev \
+  --json
+
+node packages/cli/dist/cli.js publish ./file.bin \
+  --coordinator http://127.0.0.1:8787 \
+  --workspace my-workspace \
+  --node-id node-a \
+  --json
+
+node packages/cli/dist/cli.js files \
+  --coordinator http://127.0.0.1:8787 \
+  --workspace my-workspace \
+  --json
+
+node packages/cli/dist/cli.js download <file-id> \
+  --coordinator http://127.0.0.1:8787 \
+  --workspace my-workspace \
+  --out ./downloads \
+  --json --dry-run
+```
+
+`--dry-run` prints the exact coordinator registration/publish/download plan without mutating server state. `node start` ensures the named workspace exists before registering the node. `download` currently performs coordinator discovery and candidate planning; byte transfer execution remains on the direct `send`/`join` primitive until coordinator-mediated provider transport is enabled.
+
 ## API quickstart
 
 ```ts

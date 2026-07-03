@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import type { FileId, FileManifest, PersistedSessionState, SaveFileResult, SessionId, StorageAdapter } from '@ponswarp/core';
@@ -20,10 +20,34 @@ export interface NodeFileSource {
   close(): Promise<void>;
 }
 
+export interface SaveAssembledFileOptions {
+  deletePiecesAfterWrite?: boolean;
+}
+
+export interface OffsetOutputState {
+  schemaVersion: 1;
+  fileId: FileId;
+  manifestSize: number;
+  pieceSize: number;
+  pieceCount: number;
+  outputPath: string;
+  pieceLayoutHash: string;
+  verifiedPieces: number[];
+  updatedAt: number;
+}
+
+export interface OutputStorageUsage {
+  mode: 'piece-cache' | 'offset';
+  outputBytes: number;
+  verifiedPieces: number;
+  totalPieces: number;
+}
+
 export class NodeFileStorageAdapter implements StorageAdapter {
   private sessionId: SessionId | null = null;
   private readonly rootDir: string;
   private readonly safeAssembleBytes: number;
+  private readonly offsetOutputs = new Map<FileId, { manifest: FileManifest; outputPath: string; verifiedPieces: Set<number> }>();
 
   constructor(options: NodeFileStorageOptions = {}) {
     this.rootDir = options.rootDir ?? join(process.cwd(), '.ponswarp-grid');
@@ -38,6 +62,22 @@ export class NodeFileStorageAdapter implements StorageAdapter {
   }
 
   async writePiece(fileId: FileId, pieceIndex: number, data: ArrayBuffer): Promise<void> {
+    const offsetOutput = this.offsetOutputs.get(fileId);
+    if (offsetOutput) {
+      const piece = offsetOutput.manifest.pieces.find(candidate => candidate.index === pieceIndex);
+      if (!piece) throw new Error(`Unknown piece ${pieceIndex} for ${offsetOutput.manifest.name}`);
+      if (data.byteLength !== piece.size) throw new Error(`Piece ${pieceIndex} size mismatch: expected ${piece.size}, got ${data.byteLength}`);
+      const handle = await open(offsetOutput.outputPath, 'r+');
+      try {
+        await handle.write(Buffer.from(data), 0, data.byteLength, piece.offset);
+      } finally {
+        await handle.close();
+      }
+      offsetOutput.verifiedPieces.add(pieceIndex);
+      await this.saveOffsetOutputState(fileId);
+      return;
+    }
+
     const path = this.piecePath(fileId, pieceIndex);
     await mkdir(dirname(path), { recursive: true });
     const tmp = `${path}.${process.pid}.${randomUUID()}${TMP_SUFFIX}`;
@@ -46,6 +86,24 @@ export class NodeFileStorageAdapter implements StorageAdapter {
   }
 
   async readPiece(fileId: FileId, pieceIndex: number): Promise<ArrayBuffer | undefined> {
+    const offsetOutput = this.offsetOutputs.get(fileId);
+    if (offsetOutput) {
+      if (!offsetOutput.verifiedPieces.has(pieceIndex)) return undefined;
+      const piece = offsetOutput.manifest.pieces.find(candidate => candidate.index === pieceIndex);
+      if (!piece) return undefined;
+      const handle = await open(offsetOutput.outputPath, 'r');
+      try {
+        const buffer = Buffer.alloc(piece.size);
+        const result = await handle.read(buffer, 0, piece.size, piece.offset);
+        return toArrayBuffer(result.bytesRead === piece.size ? buffer : buffer.subarray(0, result.bytesRead));
+      } catch (error) {
+        if (isNotFound(error)) return undefined;
+        throw error;
+      } finally {
+        await handle.close();
+      }
+    }
+
     try {
       const data = await readFile(this.piecePath(fileId, pieceIndex));
       return toArrayBuffer(data);
@@ -56,6 +114,9 @@ export class NodeFileStorageAdapter implements StorageAdapter {
   }
 
   async hasPiece(fileId: FileId, pieceIndex: number): Promise<boolean> {
+    const offsetOutput = this.offsetOutputs.get(fileId);
+    if (offsetOutput) return offsetOutput.verifiedPieces.has(pieceIndex);
+
     try {
       await stat(this.piecePath(fileId, pieceIndex));
       return true;
@@ -66,6 +127,13 @@ export class NodeFileStorageAdapter implements StorageAdapter {
   }
 
   async deletePiece(fileId: FileId, pieceIndex: number): Promise<void> {
+    const offsetOutput = this.offsetOutputs.get(fileId);
+    if (offsetOutput) {
+      offsetOutput.verifiedPieces.delete(pieceIndex);
+      await this.saveOffsetOutputState(fileId);
+      return;
+    }
+
     await rm(this.piecePath(fileId, pieceIndex), { force: true });
   }
 
@@ -89,6 +157,39 @@ export class NodeFileStorageAdapter implements StorageAdapter {
     } finally {
       this.sessionId = previousSession ?? sessionId;
     }
+  }
+
+  async prepareOutputFile(manifest: FileManifest, outputPath: string): Promise<void> {
+    await mkdir(dirname(outputPath), { recursive: true });
+    const handle = await open(outputPath, 'a+');
+    try {
+      await handle.truncate(manifest.size);
+    } finally {
+      await handle.close();
+    }
+
+    const saved = await this.loadOffsetOutputState(manifest.fileId);
+    const pieceLayoutHash = hashPieceLayout(manifest);
+    const verifiedPieces = saved && saved.outputPath === outputPath && saved.manifestSize === manifest.size && saved.pieceSize === manifest.pieceSize && saved.pieceCount === manifest.pieceCount && saved.pieceLayoutHash === pieceLayoutHash
+      ? new Set(saved.verifiedPieces)
+      : new Set<number>();
+    this.offsetOutputs.set(manifest.fileId, { manifest, outputPath, verifiedPieces });
+    await this.saveOffsetOutputState(manifest.fileId);
+  }
+
+  async getOutputStorageUsage(fileId: FileId): Promise<OutputStorageUsage> {
+    const offsetOutput = this.offsetOutputs.get(fileId);
+    if (offsetOutput) {
+      const info = await stat(offsetOutput.outputPath);
+      return {
+        mode: 'offset',
+        outputBytes: info.size,
+        verifiedPieces: offsetOutput.verifiedPieces.size,
+        totalPieces: offsetOutput.manifest.pieceCount
+      };
+    }
+
+    return { mode: 'piece-cache', outputBytes: 0, verifiedPieces: 0, totalPieces: 0 };
   }
 
   async assembleFile(fileId: FileId, manifest: FileManifest): Promise<Blob> {
@@ -118,9 +219,21 @@ export class NodeFileStorageAdapter implements StorageAdapter {
     });
   }
 
-  async saveAssembledFile(fileId: FileId, manifest: FileManifest, sink?: WritableStream<Uint8Array>): Promise<SaveFileResult> {
+  async saveAssembledFile(fileId: FileId, manifest: FileManifest, sink?: WritableStream<Uint8Array>, options: SaveAssembledFileOptions = {}): Promise<SaveFileResult> {
     if (sink) {
-      await this.createReadablePieceStream(fileId, manifest).pipeTo(sink);
+      const writer = sink.getWriter();
+      try {
+        for (const piece of manifest.pieces) {
+          const data = await this.readPiece(fileId, piece.index);
+          if (!data) throw new Error(`Missing piece ${piece.index} for ${manifest.name}`);
+          await writer.write(new Uint8Array(data));
+          if (options.deletePiecesAfterWrite) await this.deletePiece(fileId, piece.index);
+        }
+        await writer.close();
+      } catch (error) {
+        await writer.abort(error).catch(() => undefined);
+        throw error;
+      }
       return { type: 'stream', bytes: manifest.size };
     }
     if (manifest.size > this.safeAssembleBytes) return { type: 'unsupported', reason: 'file exceeds safe Blob assembly threshold' };
@@ -150,6 +263,42 @@ export class NodeFileStorageAdapter implements StorageAdapter {
   private piecePath(fileId: FileId, pieceIndex: number): string {
     const padded = String(pieceIndex).padStart(6, '0');
     return join(this.sessionDir(), 'pieces', sanitizePathSegment(fileId, 'fileId'), `${padded}.part`);
+  }
+
+  private offsetStatePath(fileId: FileId): string {
+    return join(this.sessionDir(), 'output', `${sanitizePathSegment(fileId, 'fileId')}.offset-state.json`);
+  }
+
+  private async loadOffsetOutputState(fileId: FileId): Promise<OffsetOutputState | null> {
+    try {
+      const data = await readFile(this.offsetStatePath(fileId), 'utf8');
+      const parsed = JSON.parse(data) as OffsetOutputState;
+      return parsed.schemaVersion === 1 ? parsed : null;
+    } catch (error) {
+      if (isNotFound(error)) return null;
+      throw error;
+    }
+  }
+
+  private async saveOffsetOutputState(fileId: FileId): Promise<void> {
+    const offsetOutput = this.offsetOutputs.get(fileId);
+    if (!offsetOutput) return;
+    await mkdir(dirname(this.offsetStatePath(fileId)), { recursive: true });
+    const state: OffsetOutputState = {
+      schemaVersion: 1,
+      fileId,
+      manifestSize: offsetOutput.manifest.size,
+      pieceSize: offsetOutput.manifest.pieceSize,
+      pieceCount: offsetOutput.manifest.pieceCount,
+      pieceLayoutHash: hashPieceLayout(offsetOutput.manifest),
+      outputPath: offsetOutput.outputPath,
+      verifiedPieces: [...offsetOutput.verifiedPieces].sort((a, b) => a - b),
+      updatedAt: Date.now()
+    };
+    const path = this.offsetStatePath(fileId);
+    const tmp = `${path}.${process.pid}.${randomUUID()}${TMP_SUFFIX}`;
+    await writeFile(tmp, JSON.stringify(state, null, 2));
+    await rename(tmp, path);
   }
 }
 
@@ -189,4 +338,10 @@ function sanitizePathSegment(value: string, name: string): string {
 
 function isNotFound(error: unknown): boolean {
   return typeof error === 'object' && error !== null && 'code' in error && (error as { code?: unknown }).code === 'ENOENT';
+}
+
+function hashPieceLayout(manifest: FileManifest): string {
+  const hash = createHash('sha256');
+  for (const piece of manifest.pieces) hash.update(`${piece.index}:${piece.offset}:${piece.size};`);
+  return hash.digest('hex');
 }

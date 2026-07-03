@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Writable } from 'node:stream';
@@ -86,6 +86,77 @@ describe('NodeFileStorageAdapter', () => {
       expect(Buffer.concat(chunks)).toEqual(Buffer.from([1, 2, 3, 4, 5, 6]));
       await expect(storage.assembleFile(fileId, manifest([3, 3]))).rejects.toThrow(/safe Blob/);
       await expect(storage.saveAssembledFile(fileId, manifest([3, 3]))).resolves.toMatchObject({ type: 'unsupported' });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('writes verified pieces directly into output offsets and seeds from output', async () => {
+    const root = await tempRoot();
+    try {
+      const storage = new NodeFileStorageAdapter({ rootDir: root });
+      await storage.init(sessionId);
+      const target = join(root, 'download.bin');
+      const testManifest = manifest([3, 2, 4]);
+      await storage.prepareOutputFile(testManifest, target);
+      await storage.writePiece(fileId, 2, new Uint8Array([6, 7, 8, 9]).buffer);
+      await storage.writePiece(fileId, 0, new Uint8Array([1, 2, 3]).buffer);
+
+      expect(await storage.hasPiece(fileId, 0)).toBe(true);
+      expect(await storage.hasPiece(fileId, 1)).toBe(false);
+      expect(await storage.hasPiece(fileId, 2)).toBe(true);
+      expect(Array.from(new Uint8Array((await storage.readPiece(fileId, 2))!))).toEqual([6, 7, 8, 9]);
+
+      const output = await readFile(target);
+      expect(Array.from(output.subarray(0, 3))).toEqual([1, 2, 3]);
+      expect(Array.from(output.subarray(3, 5))).toEqual([0, 0]);
+      expect(Array.from(output.subarray(5, 9))).toEqual([6, 7, 8, 9]);
+
+      const usage = await storage.getOutputStorageUsage(fileId);
+      expect(usage).toMatchObject({ mode: 'offset', outputBytes: 9, verifiedPieces: 2, totalPieces: 3 });
+      await expect(stat(join(root, 'sessions', sessionId, 'pieces', fileId, '000000.part'))).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('restores verified bitmap for offset output resume', async () => {
+    const root = await tempRoot();
+    try {
+      const target = join(root, 'download.bin');
+      const testManifest = manifest([2, 2]);
+      const first = new NodeFileStorageAdapter({ rootDir: root });
+      await first.init(sessionId);
+      await first.prepareOutputFile(testManifest, target);
+      await first.writePiece(fileId, 1, new Uint8Array([3, 4]).buffer);
+
+      const resumed = new NodeFileStorageAdapter({ rootDir: root });
+      await resumed.init(sessionId);
+      await resumed.prepareOutputFile(testManifest, target);
+      expect(await resumed.hasPiece(fileId, 0)).toBe(false);
+      expect(await resumed.hasPiece(fileId, 1)).toBe(true);
+      expect(Array.from(new Uint8Array((await resumed.readPiece(fileId, 1))!))).toEqual([3, 4]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not restore bitmap when manifest piece layout changes', async () => {
+    const root = await tempRoot();
+    try {
+      const target = join(root, 'download.bin');
+      const firstManifest = manifest([2, 2]);
+      const changedManifest = manifest([1, 3]);
+      const first = new NodeFileStorageAdapter({ rootDir: root });
+      await first.init(sessionId);
+      await first.prepareOutputFile(firstManifest, target);
+      await first.writePiece(fileId, 1, new Uint8Array([3, 4]).buffer);
+
+      const resumed = new NodeFileStorageAdapter({ rootDir: root });
+      await resumed.init(sessionId);
+      await resumed.prepareOutputFile(changedManifest, target);
+      expect(await resumed.hasPiece(fileId, 1)).toBe(false);
+      expect(await resumed.readPiece(fileId, 1)).toBeUndefined();
     } finally {
       await rm(root, { recursive: true, force: true });
     }
