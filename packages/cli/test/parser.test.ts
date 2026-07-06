@@ -67,13 +67,14 @@ describe('PonsWarp CLI parser', () => {
   });
 
   it('parses coordinator product commands with json and dry-run options', () => {
-    expect(parseCliArgs(['node', 'start', '--coordinator', 'http://127.0.0.1:8787', '--workspace', 'ws', '--node-id', 'node-a', '--display-name', 'Node A', '--public-key', 'ed25519:test', '--json', '--dry-run'])).toMatchObject({
+    expect(parseCliArgs(['node', 'start', '--coordinator', 'http://127.0.0.1:8787', '--workspace', 'ws', '--node-id', 'node-a', '--display-name', 'Node A', '--public-key', 'ed25519:test', '--direct-join', 'ponswarp://join/provider', '--json', '--dry-run'])).toMatchObject({
       command: 'node-start',
       coordinator: 'http://127.0.0.1:8787',
       workspace: 'ws',
       nodeId: 'node-a',
       displayName: 'Node A',
       publicKey: 'ed25519:test',
+      directJoin: 'ponswarp://join/provider',
       json: true,
       dryRun: true
     });
@@ -96,6 +97,10 @@ describe('PonsWarp CLI parser', () => {
       outDir: 'downloads',
       json: true,
       dryRun: true
+    });
+    expect(parseCliArgs(['share', 'demo.bin', '--workspace', 'ws', '--node-id', 'node-a', '--dry-run'])).toMatchObject({
+      command: 'share',
+      coordinator: 'https://grid.ponslink.com'
     });
   });
 

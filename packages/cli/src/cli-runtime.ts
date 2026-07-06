@@ -1,11 +1,11 @@
-import { mkdir, readFile, rename } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rename, rm } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { PonsWarpEngine, type FileManifest, type PeerId, type SessionId, type TransferProgress } from '@ponswarp/core';
 import { NodeFileStorageAdapter, openNodeFileSource, type NodeFileSource } from './node-file-storage.js';
 import { NodePeerEndpointRegistry, NodeWebSocketTransport, type PeerEndpoint } from './node-websocket-transport.js';
 import { BrowserSignalingClient, type SessionFileDescriptor } from '@ponswarp/signaling';
-import type { JoinCommand, SendCommand } from './index.js';
+import type { CleanCommand, JoinCommand, SendCommand, StatusCommand } from './index.js';
 
 export interface CliSessionDescriptor {
   schemaVersion: 1;
@@ -24,6 +24,121 @@ export interface CliPeerDescriptor {
   totalPieces: number;
 }
 
+export function getCliStorageRoot(): string {
+  const configured = process.env.PONSWARP_STORAGE_DIR?.trim();
+  return configured && configured.length > 0 ? configured : join(process.cwd(), '.ponswarp-grid');
+}
+
+interface CliSessionStorageRecord {
+  role: 'owner' | 'receiver';
+  bucket: string;
+  sessionDir: string;
+  state: {
+    sessionId: string;
+    mode?: string;
+    manifests?: Array<{ name?: string; size?: number; pieceCount?: number }>;
+    pieceMaps?: Array<{ pieces?: Array<{ status?: string }> }>;
+    updatedAt?: number;
+  };
+}
+
+export async function runStatus(command: StatusCommand): Promise<void> {
+  const records = await findSessionStorageRecords(command.session);
+  if (records.length === 0) {
+    console.log(`Session: ${command.session}`);
+    console.log('Status: not_found');
+    return;
+  }
+
+  console.log(`Session: ${command.session}`);
+  console.log(`Status: found`);
+  for (const record of records) {
+    console.log(`Entry: ${record.role}/${record.bucket}`);
+    console.log(`Path: ${record.sessionDir}`);
+    console.log(`Mode: ${record.state.mode ?? 'unknown'}`);
+    for (const manifest of record.state.manifests ?? []) {
+      console.log(`File: ${manifest.name ?? 'unknown'} (${manifest.size ?? 0} bytes, ${manifest.pieceCount ?? 0} pieces)`);
+    }
+    for (const [index, map] of (record.state.pieceMaps ?? []).entries()) {
+      const pieces = map.pieces ?? [];
+      const verified = pieces.filter(piece => piece.status === 'verified').length;
+      console.log(`Progress ${index + 1}: ${verified}/${pieces.length} verified`);
+    }
+    if (record.state.updatedAt) console.log(`Updated: ${new Date(record.state.updatedAt).toISOString()}`);
+  }
+}
+
+export async function runClean(command: CleanCommand): Promise<void> {
+  const records = await findSessionStorageRecords(command.session);
+  for (const record of records) await rm(record.sessionDir, { recursive: true, force: true });
+  console.log(`Session: ${command.session}`);
+  console.log(`Cleaned: ${records.length}`);
+}
+
+async function findSessionStorageRecords(session: string): Promise<CliSessionStorageRecord[]> {
+  if (!session || session === '.' || session === '..' || session.includes('/') || session.includes('\\')) throw new Error('session must be a single safe path segment');
+  const storageRoot = getCliStorageRoot();
+  const roots: Array<{ role: 'owner' | 'receiver'; path: string }> = [
+    { role: 'owner', path: join(storageRoot, 'owners') },
+    { role: 'receiver', path: join(storageRoot, 'receivers') }
+  ];
+  const records: CliSessionStorageRecord[] = [];
+  for (const root of roots) {
+    let buckets;
+    try {
+      buckets = await readdir(root.path, { withFileTypes: true });
+    } catch (error) {
+      if (isNotFound(error)) continue;
+      throw error;
+    }
+    for (const bucket of buckets) {
+      if (!bucket.isDirectory()) continue;
+      const sessionDir = join(root.path, bucket.name, 'sessions', session);
+      try {
+        const state = parsePersistedCliSessionState(await readFile(join(sessionDir, 'state.json'), 'utf8'));
+        records.push({ role: root.role, bucket: bucket.name, sessionDir, state });
+      } catch (error) {
+        if (isNotFound(error)) continue;
+        throw error;
+      }
+    }
+  }
+  return records;
+}
+
+function parsePersistedCliSessionState(raw: string): CliSessionStorageRecord['state'] {
+  const parsed: unknown = JSON.parse(raw);
+  if (!isRecord(parsed)) throw new Error('Invalid CLI session state: expected object');
+  const sessionId = typeof parsed.sessionId === 'string' ? parsed.sessionId : '';
+  const mode = typeof parsed.mode === 'string' ? parsed.mode : undefined;
+  const updatedAt = typeof parsed.updatedAt === 'number' ? parsed.updatedAt : undefined;
+  const manifests = Array.isArray(parsed.manifests)
+    ? parsed.manifests.filter(isRecord).map(manifest => ({
+      name: typeof manifest.name === 'string' ? manifest.name : undefined,
+      size: typeof manifest.size === 'number' ? manifest.size : undefined,
+      pieceCount: typeof manifest.pieceCount === 'number' ? manifest.pieceCount : undefined
+    }))
+    : undefined;
+  const pieceMaps = Array.isArray(parsed.pieceMaps)
+    ? parsed.pieceMaps.filter(isRecord).map(pieceMap => ({
+      pieces: Array.isArray(pieceMap.pieces)
+        ? pieceMap.pieces.filter(isRecord).map(piece => ({ status: typeof piece.status === 'string' ? piece.status : undefined }))
+        : undefined
+    }))
+    : undefined;
+  return { sessionId, mode, manifests, pieceMaps, updatedAt };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function isNotFound(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT';
+}
+
+
+
 export async function runSend(command: SendCommand): Promise<void> {
   const ownerPeerId = `peer_owner_${process.pid}` as PeerId;
   const registry = new NodePeerEndpointRegistry();
@@ -31,7 +146,7 @@ export async function runSend(command: SendCommand): Promise<void> {
   const ownerEndpoint = await transport.listen();
   let source: NodeFileSource | undefined;
   try {
-    const storage = new NodeFileStorageAdapter({ rootDir: join(process.cwd(), '.ponswarp-grid', 'owners', safeStorageKey(command.session ?? String(process.pid))) });
+    const storage = new NodeFileStorageAdapter({ rootDir: join(getCliStorageRoot(), 'owners', safeStorageKey(command.session ?? String(process.pid))) });
     const engine = new PonsWarpEngine(storage, undefined, undefined, undefined, transport);
     source = await openNodeFileSource(command.file);
     const file = toBlobLikeFile(source);
@@ -71,7 +186,7 @@ export async function runJoin(command: JoinCommand): Promise<number> {
   registry.set(descriptor.ownerEndpoint);
   const transport = new NodeWebSocketTransport({ selfId: receiverPeerId, host: parseListenHost(command.listen), port: parseListenPort(command.listen), registry });
   const receiverEndpoint = await transport.listen();
-  const storage = new NodeFileStorageAdapter({ rootDir: join(process.cwd(), '.ponswarp-grid', 'receivers', safeStorageKey(`${descriptor.sessionId}:${command.outDir}`)) });
+  const storage = new NodeFileStorageAdapter({ rootDir: join(getCliStorageRoot(), 'receivers', safeStorageKey(`${descriptor.sessionId}:${command.outDir}`)) });
   const engine = new PonsWarpEngine(storage, undefined, undefined, undefined, transport);
   await engine.joinSession(descriptor.sessionId, descriptor.manifests);
   const manifest = descriptor.manifests[0];

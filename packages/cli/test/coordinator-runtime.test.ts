@@ -11,6 +11,23 @@ interface RecordedRequest {
   body: unknown;
 }
 
+function testJoinDescriptor(fileId = 'file-1', size = 9): string {
+  return `ponswarp://join/${Buffer.from(JSON.stringify({
+    schemaVersion: 1,
+    sessionId: 'sess_test',
+    ownerPeerId: 'peer_owner',
+    ownerEndpoint: { peerId: 'peer_owner', url: 'tcp://127.0.0.1:12345' },
+    manifests: [{
+      fileId,
+      name: 'demo.bin',
+      size,
+      pieceSize: 4,
+      pieceCount: Math.ceil(size / 4),
+      pieces: [{ index: 0, offset: 0, size, hash: 'test' }]
+    }]
+  })).toString('base64url')}`;
+}
+
 const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
 
 afterEach(() => {
@@ -20,9 +37,9 @@ afterEach(() => {
 describe('coordinator CLI runtime', () => {
   it('registers node start and heartbeat with the coordinator', async () => {
     const server = await startCoordinatorStub((request, response, recorded) => {
-      if (request.method === 'POST' && request.url === '/api/mesh/workspaces') return json(response, { workspaceId: (recorded.body as { workspaceId: string }).workspaceId });
-      if (request.method === 'POST' && request.url === '/api/mesh/workspaces/ws/nodes') return json(response, { registered: recorded.body });
-      if (request.method === 'POST' && request.url === '/api/mesh/workspaces/ws/nodes/node-a/heartbeat') return json(response, { heartbeat: recorded.body });
+      if (request.method === 'POST' && request.url === '/api/grid/v1/workspaces') return json(response, { workspaceId: (recorded.body as { workspaceId: string }).workspaceId });
+      if (request.method === 'POST' && request.url === '/api/grid/v1/workspaces/ws/nodes') return json(response, { registered: recorded.body });
+      if (request.method === 'POST' && request.url === '/api/grid/v1/workspaces/ws/nodes/node-a/heartbeat') return json(response, { heartbeat: recorded.body });
       return notFound(response);
     });
     try {
@@ -38,13 +55,43 @@ describe('coordinator CLI runtime', () => {
       });
 
       expect(server.requests.map(request => `${request.method} ${request.path}`)).toEqual([
-        'POST /api/mesh/workspaces',
-        'POST /api/mesh/workspaces/ws/nodes',
-        'POST /api/mesh/workspaces/ws/nodes/node-a/heartbeat'
+        'POST /api/grid/v1/workspaces',
+        'POST /api/grid/v1/workspaces/ws/nodes',
+        'POST /api/grid/v1/workspaces/ws/nodes/node-a/heartbeat'
       ]);
       expect(server.requests[0]?.body).toMatchObject({ workspaceId: 'ws', name: 'ws' });
       expect(server.requests[1]?.body).toMatchObject({ nodeId: 'node-a', displayName: 'Node A', publicKey: 'ed25519:test' });
       expect(JSON.parse(String(consoleSpy.mock.calls.at(-1)?.[0]))).toMatchObject({ ok: true, command: 'node-start' });
+      expect(server.requests[2]?.body).toMatchObject({ status: 'online', endpointHints: [] });
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('registers direct join endpoint hints for coordinator-mediated provider transfer', async () => {
+    const server = await startCoordinatorStub((request, response, recorded) => {
+      if (request.method === 'POST' && request.url === '/api/grid/v1/workspaces') return json(response, { workspaceId: 'ws' });
+      if (request.method === 'POST' && request.url === '/api/grid/v1/workspaces/ws/nodes') return json(response, { registered: recorded.body });
+      if (request.method === 'POST' && request.url === '/api/grid/v1/workspaces/ws/nodes/node-a/heartbeat') return json(response, { heartbeat: recorded.body });
+      return notFound(response);
+    });
+    try {
+      await runNodeStart({
+        command: 'node-start',
+        coordinator: server.origin,
+        workspace: 'ws',
+        nodeId: 'node-a',
+        displayName: 'Node A',
+        publicKey: 'ed25519:test',
+        directJoin: 'ponswarp://join/provider',
+        json: true,
+        dryRun: false
+      });
+
+      expect(server.requests[2]?.body).toMatchObject({
+        status: 'online',
+        endpointHints: [{ kind: 'ponswarp-join', value: 'ponswarp://join/provider' }]
+      });
     } finally {
       await server.close();
     }
@@ -110,8 +157,8 @@ describe('coordinator CLI runtime', () => {
 
   it('lists files and builds a coordinator-backed download candidate plan', async () => {
     const server = await startCoordinatorStub((request, response) => {
-      if (request.method === 'GET' && request.url === '/api/mesh/workspaces/ws/files') return json(response, { files: [{ fileId: 'file-1', name: 'demo.bin' }] });
-      if (request.method === 'GET' && request.url === '/api/mesh/workspaces/ws/files/file-1/candidates') return json(response, { candidates: [{ nodeId: 'node-a', online: true }] });
+      if (request.method === 'GET' && request.url === '/api/grid/v1/workspaces/ws/files') return json(response, { files: [{ fileId: 'file-1', name: 'demo.bin' }] });
+      if (request.method === 'GET' && request.url === '/api/grid/v1/workspaces/ws/files/file-1/candidates') return json(response, { candidates: [{ nodeId: 'node-a', online: true }] });
       return notFound(response);
     });
     try {
@@ -119,8 +166,8 @@ describe('coordinator CLI runtime', () => {
       await runDownload({ command: 'download', coordinator: server.origin, workspace: 'ws', fileId: 'file-1', outDir: 'downloads', json: true, dryRun: false });
 
       expect(server.requests.map(request => `${request.method} ${request.path}`)).toEqual([
-        'GET /api/mesh/workspaces/ws/files',
-        'GET /api/mesh/workspaces/ws/files/file-1/candidates'
+        'GET /api/grid/v1/workspaces/ws/files',
+        'GET /api/grid/v1/workspaces/ws/files/file-1/candidates'
       ]);
       const output = JSON.parse(String(consoleSpy.mock.calls.at(-1)?.[0]));
       expect(output).toMatchObject({ ok: true, command: 'download', dryRun: false, data: { fileId: 'file-1', outDir: 'downloads', status: 'planned', discovery: 'coordinator' } });
@@ -159,18 +206,18 @@ describe('coordinator CLI runtime', () => {
     const file = join(tempDir, 'demo.bin');
     await writeFile(file, Buffer.alloc(9, 3));
     const server = await startCoordinatorStub((request, response, recorded) => {
-      if (request.method === 'POST' && request.url === '/api/mesh/workspaces') return json(response, { workspaceId: (recorded.body as { workspaceId: string }).workspaceId });
-      if (request.method === 'POST' && request.url === '/api/mesh/workspaces/ws/files') return json(response, { published: recorded.body });
-      if (request.method === 'POST' && request.url === '/api/mesh/workspaces/ws/shares') return json(response, { code: '8F3K-22Q9', fileId: (recorded.body as { fileId: string }).fileId });
+      if (request.method === 'POST' && request.url === '/api/grid/v1/workspaces') return json(response, { workspaceId: (recorded.body as { workspaceId: string }).workspaceId });
+      if (request.method === 'POST' && request.url === '/api/grid/v1/workspaces/ws/files') return json(response, { published: recorded.body });
+      if (request.method === 'POST' && request.url === '/api/grid/v1/workspaces/ws/shares') return json(response, { code: '8F3K-22Q9', fileId: (recorded.body as { fileId: string }).fileId });
       return notFound(response);
     });
     try {
       await runShare({ command: 'share', coordinator: server.origin, workspace: 'ws', file, nodeId: 'node-a', pieceSize: 4, ttlSeconds: 3600, json: true, dryRun: false });
 
       expect(server.requests.map(request => `${request.method} ${request.path}`)).toEqual([
-        'POST /api/mesh/workspaces',
-        'POST /api/mesh/workspaces/ws/files',
-        'POST /api/mesh/workspaces/ws/shares'
+        'POST /api/grid/v1/workspaces',
+        'POST /api/grid/v1/workspaces/ws/files',
+        'POST /api/grid/v1/workspaces/ws/shares'
       ]);
       expect(server.requests[1]?.body).toMatchObject({ name: 'demo.bin', size: 9, pieceSize: 4, pieceCount: 3 });
       expect(server.requests[2]?.body).toMatchObject({ createdByNodeId: 'node-a', ttlSeconds: 3600 });
@@ -184,16 +231,16 @@ describe('coordinator CLI runtime', () => {
 
   it('resolves get share links to coordinator candidate plans', async () => {
     const server = await startCoordinatorStub((request, response) => {
-      if (request.method === 'GET' && request.url === '/api/mesh/shares/8F3K-22Q9') return json(response, { code: '8F3K-22Q9', fileId: 'file-1', name: 'demo.bin', sizeBytes: 9 });
-      if (request.method === 'GET' && request.url === '/api/mesh/shares/8F3K-22Q9/candidates') return json(response, { candidates: [{ nodeId: 'node-a', online: true }] });
+      if (request.method === 'GET' && request.url === '/api/grid/v1/shares/8F3K-22Q9') return json(response, { code: '8F3K-22Q9', fileId: 'file-1', name: 'demo.bin', sizeBytes: 9 });
+      if (request.method === 'GET' && request.url === '/api/grid/v1/shares/8F3K-22Q9/candidates') return json(response, { candidates: [{ nodeId: 'node-a', online: true }] });
       return notFound(response);
     });
     try {
       await runGet({ command: 'get', coordinator: server.origin, workspace: 'default', code: 'https://warp.ponslink.com/get/8f3k-22q9', outDir: 'downloads', json: true, dryRun: false });
 
       expect(server.requests.map(request => `${request.method} ${request.path}`)).toEqual([
-        'GET /api/mesh/shares/8F3K-22Q9',
-        'GET /api/mesh/shares/8F3K-22Q9/candidates'
+        'GET /api/grid/v1/shares/8F3K-22Q9',
+        'GET /api/grid/v1/shares/8F3K-22Q9/candidates'
       ]);
       const output = JSON.parse(String(consoleSpy.mock.calls.at(-1)?.[0]));
       expect(output).toMatchObject({ ok: true, command: 'get', data: { code: '8F3K-22Q9', fileId: 'file-1', outDir: 'downloads', discovery: 'coordinator' } });
@@ -209,19 +256,33 @@ describe('coordinator CLI runtime', () => {
       executed.push(command);
       return 0;
     });
+    const joinDescriptor = testJoinDescriptor('file-1', 9);
     const server = await startCoordinatorStub((request, response) => {
-      if (request.method === 'GET' && request.url === '/api/mesh/shares/8F3K-22Q9') return json(response, { code: '8F3K-22Q9', fileId: 'file-1', name: 'demo.bin', sizeBytes: 9 });
-      if (request.method === 'GET' && request.url === '/api/mesh/shares/8F3K-22Q9/candidates') return json(response, { providers: [{ nodeId: 'node-a', online: true, endpointHints: [{ kind: 'ponswarp-join', value: 'ponswarp://join/owner', peer: 'ponswarp-peer://seed' }] }] });
+      if (request.method === 'GET' && request.url === '/api/grid/v1/shares/8F3K-22Q9') return json(response, { code: '8F3K-22Q9', fileId: 'file-1', name: 'demo.bin', sizeBytes: 9 });
+      if (request.method === 'GET' && request.url === '/api/grid/v1/shares/8F3K-22Q9/candidates') return json(response, { providers: [{ nodeId: 'node-a', online: true, endpointHints: [{ kind: 'ponswarp-join', value: joinDescriptor, peer: 'ponswarp-peer://seed' }] }] });
       return notFound(response);
     });
     try {
       await runGet({ command: 'get', coordinator: server.origin, workspace: 'default', code: '8F3K-22Q9', outDir: 'downloads', json: true, dryRun: false });
 
-      expect(executed).toEqual([expect.objectContaining({ command: 'join', session: 'ponswarp://join/owner', peer: 'ponswarp-peer://seed', outDir: 'downloads' })]);
+      expect(executed).toEqual([expect.objectContaining({ command: 'join', session: joinDescriptor, peer: 'ponswarp-peer://seed', outDir: 'downloads', seedAfterComplete: false })]);
       const output = JSON.parse(String(consoleSpy.mock.calls.at(-1)?.[0]));
-      expect(output.data).toMatchObject({ code: '8F3K-22Q9', execution: 'direct-join', status: 'complete' });
+      expect(output.data).toMatchObject({ code: '8F3K-22Q9', fileId: 'file-1', name: 'demo.bin', sizeBytes: 9, outDir: 'downloads', discovery: 'coordinator', execution: 'direct-join', status: 'complete' });
     } finally {
       restoreRunner();
+      await server.close();
+    }
+  });
+
+  it('rejects coordinator provider descriptors that do not match resolved file metadata', async () => {
+    const server = await startCoordinatorStub((request, response) => {
+      if (request.method === 'GET' && request.url === '/api/grid/v1/shares/8F3K-22Q9') return json(response, { code: '8F3K-22Q9', fileId: 'file-expected', name: 'demo.bin', sizeBytes: 9 });
+      if (request.method === 'GET' && request.url === '/api/grid/v1/shares/8F3K-22Q9/candidates') return json(response, { providers: [{ nodeId: 'node-a', online: true, endpointHints: [{ kind: 'ponswarp-join', value: testJoinDescriptor('file-other', 9) }] }] });
+      return notFound(response);
+    });
+    try {
+      await expect(runGet({ command: 'get', coordinator: server.origin, workspace: 'default', code: '8F3K-22Q9', outDir: 'downloads', json: true, dryRun: false })).rejects.toThrow(/file mismatch/);
+    } finally {
       await server.close();
     }
   });
@@ -233,8 +294,8 @@ describe('coordinator CLI runtime', () => {
       return 0;
     });
     const server = await startCoordinatorStub((request, response) => {
-      if (request.method === 'GET' && request.url === '/api/mesh/shares/8F3K-22Q9') return json(response, { code: '8F3K-22Q9', fileId: 'file-1', name: 'demo.bin', sizeBytes: 9 });
-      if (request.method === 'GET' && request.url === '/api/mesh/shares/8F3K-22Q9/candidates') return json(response, { providers: [{ nodeId: 'node-a', online: true, endpointHints: [] }] });
+      if (request.method === 'GET' && request.url === '/api/grid/v1/shares/8F3K-22Q9') return json(response, { code: '8F3K-22Q9', fileId: 'file-1', name: 'demo.bin', sizeBytes: 9 });
+      if (request.method === 'GET' && request.url === '/api/grid/v1/shares/8F3K-22Q9/candidates') return json(response, { providers: [{ nodeId: 'node-a', online: true, endpointHints: [] }] });
       return notFound(response);
     });
     try {
@@ -242,7 +303,7 @@ describe('coordinator CLI runtime', () => {
 
       expect(executed).toEqual([]);
       const output = JSON.parse(String(consoleSpy.mock.calls.at(-1)?.[0]));
-      expect(output.data).toMatchObject({ code: '8F3K-22Q9', execution: 'unavailable', status: 'planned' });
+      expect(output.data).toMatchObject({ code: '8F3K-22Q9', fileId: 'file-1', name: 'demo.bin', sizeBytes: 9, outDir: 'downloads', discovery: 'coordinator', execution: 'unavailable', status: 'planned', candidates: { providers: [{ nodeId: 'node-a', online: true, endpointHints: [] }] } });
     } finally {
       restoreRunner();
       await server.close();
@@ -254,9 +315,9 @@ describe('coordinator CLI runtime', () => {
     const file = join(tempDir, 'demo.bin');
     await writeFile(file, Buffer.alloc(3, 5));
     const server = await startCoordinatorStub((request, response, recorded) => {
-      if (request.method === 'POST' && request.url === '/api/mesh/workspaces') return json(response, { workspaceId: 'default' });
-      if (request.method === 'POST' && request.url === '/api/mesh/workspaces/default/files') return json(response, { published: recorded.body });
-      if (request.method === 'POST' && request.url === '/api/mesh/workspaces/default/shares') return json(response, { code: 'ABCD-1234', fileId: (recorded.body as { fileId: string }).fileId });
+      if (request.method === 'POST' && request.url === '/api/grid/v1/workspaces') return json(response, { workspaceId: 'default' });
+      if (request.method === 'POST' && request.url === '/api/grid/v1/workspaces/default/files') return json(response, { published: recorded.body });
+      if (request.method === 'POST' && request.url === '/api/grid/v1/workspaces/default/shares') return json(response, { code: 'ABCD-1234', fileId: (recorded.body as { fileId: string }).fileId });
       return notFound(response);
     });
     try {
@@ -285,7 +346,7 @@ describe('coordinator CLI runtime', () => {
       ]
     })).toEqual({ join: 'ponswarp://join/owner', peer: 'ponswarp-peer://seed' });
 
-    expect(findDirectTransferHint({ capabilities: { directTransfer: { join: 'ponswarp://join/from-capabilities' } } }, { providers: [] })).toEqual({ join: 'ponswarp://join/from-capabilities', peer: undefined });
+    expect(findDirectTransferHint({ capabilities: { directTransfer: { join: 'ponswarp://join/from-capabilities' } } }, { providers: [] })).toBeUndefined();
   });
 });
 

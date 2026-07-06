@@ -51,6 +51,7 @@ export interface NodeStartCommand extends BaseCommand, CoordinatorOptions {
   nodeId: string;
   displayName: string;
   publicKey: string;
+  directJoin?: string;
 }
 
 export interface PublishCommand extends BaseCommand, CoordinatorOptions {
@@ -95,7 +96,7 @@ const DEFAULT_LISTEN = '127.0.0.1:0';
 const DEFAULT_PIECE_SIZE = 1024 * 1024;
 const DEFAULT_OUT_DIR = '.';
 const DEFAULT_MAX_PEERS = 8;
-const DEFAULT_COORDINATOR = 'http://127.0.0.1:8787';
+const DEFAULT_COORDINATOR = process.env.PONSWARP_COORDINATOR_URL ?? 'https://grid.ponslink.com';
 const TCP_PORT_MAX = 65535;
 
 
@@ -182,7 +183,7 @@ function parseNode(args: readonly string[]): NodeStartCommand {
   const [subcommand, ...rest] = args;
   if (subcommand !== 'start') throw new CliUsageError('node requires subcommand: start');
   const positionals: string[] = [];
-  const options = parseOptions(rest, positionals, new Set(['coordinator', 'workspace', 'node-id', 'display-name', 'public-key', 'json', 'dry-run']));
+  const options = parseOptions(rest, positionals, new Set(['coordinator', 'workspace', 'node-id', 'display-name', 'public-key', 'direct-join', 'json', 'dry-run']));
   if (positionals.length > 0) throw new CliUsageError('node start does not accept positional arguments');
   return {
     command: 'node-start',
@@ -191,6 +192,7 @@ function parseNode(args: readonly string[]): NodeStartCommand {
     nodeId: requiredStringOption(options, 'node-id'),
     displayName: stringOption(options, 'display-name', requiredStringOption(options, 'node-id')),
     publicKey: requiredStringOption(options, 'public-key'),
+    directJoin: optionalStringOption(options, 'direct-join'),
     json: booleanOption(options, 'json'),
     dryRun: booleanOption(options, 'dry-run')
   };
@@ -372,7 +374,7 @@ Usage:
   ponswarp send <file> [--signal ws://host:8787/ws] [--listen host:port] [--advertise ws://host:port] [--piece-size bytes] [--session id] [--keep-open]
   ponswarp join <session-or-url> --out <dir> [--signal ws://host:8787/ws] [--listen host:port] [--advertise ws://host:port] [--peer ponswarp-peer://...] [--seed-after-complete] [--max-peers n]
   ponswarp serve-signal [--host 0.0.0.0] [--port 8787]
-  ponswarp node start --workspace <id> --node-id <id> --public-key <key> [--coordinator http://host] [--display-name name] [--json] [--dry-run]
+  ponswarp node start --workspace <id> --node-id <id> --public-key <key> [--coordinator http://host] [--display-name name] [--direct-join ponswarp://join/...] [--json] [--dry-run]
   ponswarp publish <file> --workspace <id> --node-id <id> [--coordinator http://host] [--piece-size bytes] [--json] [--dry-run]
   ponswarp files --workspace <id> [--coordinator http://host] [--json]
   ponswarp download <file-id> --workspace <id> --out <dir> [--coordinator http://host] [--json] [--dry-run]

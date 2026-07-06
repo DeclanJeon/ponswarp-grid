@@ -1,7 +1,7 @@
 import { stat } from 'node:fs/promises';
 import { basename, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
-import { runJoin } from './cli-runtime.js';
+import { decodeJoinDescriptor, runJoin } from './cli-runtime.js';
 import { CliUsageError, type DownloadCommand, type FilesCommand, type GetCommand, type JoinCommand, type NodeStartCommand, type PublishCommand, type ShareCommand } from './index.js';
 
 interface CoordinatorEnvelope<T> {
@@ -61,6 +61,7 @@ interface MeshGetPlan {
   discovery: 'dry-run-skipped' | 'coordinator';
   execution: 'planned' | 'direct-join' | 'unavailable';
   note: string;
+  transferExitCode?: number;
 }
 
 interface DirectTransferHint {
@@ -68,7 +69,7 @@ interface DirectTransferHint {
   peer?: string;
 }
 
-const CLI_CAPABILITIES = ['node-cli', 'offset-storage', 'direct-transfer'];
+const CLI_CAPABILITIES = ['node-cli', 'offset-storage', 'direct-transfer', 'coordinator-mediated-transfer'];
 type DirectTransferRunner = (command: JoinCommand) => Promise<number>;
 let directTransferRunner: DirectTransferRunner = runJoin;
 
@@ -79,6 +80,12 @@ export function setDirectTransferRunnerForTest(runner: DirectTransferRunner): ()
 }
 
 
+function nodeEndpointHints(command: NodeStartCommand): unknown[] {
+  return command.directJoin
+    ? [{ kind: 'ponswarp-join', value: command.directJoin }]
+    : [];
+}
+
 export async function runNodeStart(command: NodeStartCommand): Promise<void> {
   const registration: MeshNodeRegistration = {
     nodeId: command.nodeId,
@@ -86,6 +93,7 @@ export async function runNodeStart(command: NodeStartCommand): Promise<void> {
     publicKey: command.publicKey,
     capabilities: CLI_CAPABILITIES
   };
+  const endpointHints = nodeEndpointHints(command);
 
   if (command.dryRun) {
     printResult(command.json, {
@@ -94,19 +102,19 @@ export async function runNodeStart(command: NodeStartCommand): Promise<void> {
       coordinator: command.coordinator,
       workspace: command.workspace,
       dryRun: true,
-      data: { workspace: { workspaceId: command.workspace, name: command.workspace }, registration, heartbeat: { status: 'online', endpointHints: [] } }
+      data: { workspace: { workspaceId: command.workspace, name: command.workspace }, registration, heartbeat: { status: 'online', endpointHints } }
     });
     return;
   }
 
   const workspace = await ensureWorkspace(command.coordinator, command.workspace);
-  const node = await coordinatorRequest<unknown>(command.coordinator, `/api/mesh/workspaces/${encodeURIComponent(command.workspace)}/nodes`, {
+  const node = await coordinatorRequest<unknown>(command.coordinator, `/api/grid/v1/workspaces/${encodeURIComponent(command.workspace)}/nodes`, {
     method: 'POST',
     body: registration
   });
-  const heartbeat = await coordinatorRequest<unknown>(command.coordinator, `/api/mesh/workspaces/${encodeURIComponent(command.workspace)}/nodes/${encodeURIComponent(command.nodeId)}/heartbeat`, {
+  const heartbeat = await coordinatorRequest<unknown>(command.coordinator, `/api/grid/v1/workspaces/${encodeURIComponent(command.workspace)}/nodes/${encodeURIComponent(command.nodeId)}/heartbeat`, {
     method: 'POST',
-    body: { status: 'online', endpointHints: [] }
+    body: { status: 'online', endpointHints }
   });
 
   printResult(command.json, {
@@ -134,7 +142,7 @@ export async function runPublish(command: PublishCommand): Promise<void> {
     return;
   }
 
-  const published = await coordinatorRequest<unknown>(command.coordinator, `/api/mesh/workspaces/${encodeURIComponent(command.workspace)}/files`, {
+  const published = await coordinatorRequest<unknown>(command.coordinator, `/api/grid/v1/workspaces/${encodeURIComponent(command.workspace)}/files`, {
     method: 'POST',
     body: payload
   });
@@ -148,7 +156,7 @@ export async function runPublish(command: PublishCommand): Promise<void> {
 }
 
 export async function runFiles(command: FilesCommand): Promise<void> {
-  const files = await coordinatorRequest<unknown>(command.coordinator, `/api/mesh/workspaces/${encodeURIComponent(command.workspace)}/files`, { method: 'GET' });
+  const files = await coordinatorRequest<unknown>(command.coordinator, `/api/grid/v1/workspaces/${encodeURIComponent(command.workspace)}/files`, { method: 'GET' });
   printResult(command.json, {
     ok: true,
     command: command.command,
@@ -161,7 +169,7 @@ export async function runFiles(command: FilesCommand): Promise<void> {
 export async function runDownload(command: DownloadCommand): Promise<void> {
   const candidates = command.dryRun
     ? { candidates: [], note: 'Dry-run skipped coordinator discovery and did not contact provider nodes.' }
-    : await coordinatorRequest<unknown>(command.coordinator, `/api/mesh/workspaces/${encodeURIComponent(command.workspace)}/files/${encodeURIComponent(command.fileId)}/candidates`, { method: 'GET' });
+    : await coordinatorRequest<unknown>(command.coordinator, `/api/grid/v1/workspaces/${encodeURIComponent(command.workspace)}/files/${encodeURIComponent(command.fileId)}/candidates`, { method: 'GET' });
   const plan: MeshDownloadPlan = {
     fileId: command.fileId,
     outDir: command.outDir,
@@ -202,11 +210,11 @@ export async function runShare(command: ShareCommand): Promise<void> {
   }
 
   await ensureWorkspace(command.coordinator, command.workspace);
-  await coordinatorRequest<unknown>(command.coordinator, `/api/mesh/workspaces/${encodeURIComponent(command.workspace)}/files`, {
+  await coordinatorRequest<unknown>(command.coordinator, `/api/grid/v1/workspaces/${encodeURIComponent(command.workspace)}/files`, {
     method: 'POST',
     body: createPublishPayload(manifest, nodeId)
   });
-  const share = await coordinatorRequest<Record<string, unknown>>(command.coordinator, `/api/mesh/workspaces/${encodeURIComponent(command.workspace)}/shares`, {
+  const share = await coordinatorRequest<Record<string, unknown>>(command.coordinator, `/api/grid/v1/workspaces/${encodeURIComponent(command.workspace)}/shares`, {
     method: 'POST',
     body: {
       fileId: manifest.fileId,
@@ -248,9 +256,15 @@ export async function runGet(command: GetCommand): Promise<void> {
     return;
   }
 
-  const resolved = await coordinatorRequest<Record<string, unknown>>(command.coordinator, `/api/mesh/shares/${encodeURIComponent(code)}`, { method: 'GET' });
-  const candidates = await coordinatorRequest<unknown>(command.coordinator, `/api/mesh/shares/${encodeURIComponent(code)}/candidates`, { method: 'GET' });
+  const resolved = await coordinatorRequest<Record<string, unknown>>(command.coordinator, `/api/grid/v1/shares/${encodeURIComponent(code)}`, { method: 'GET' });
+  const candidates = await coordinatorRequest<unknown>(command.coordinator, `/api/grid/v1/shares/${encodeURIComponent(code)}/candidates`, { method: 'GET' });
   const directTransfer = findDirectTransferHint(resolved, candidates);
+  if (directTransfer) assertDirectTransferMatchesResolvedShare(resolved, directTransfer);
+  let transferExitCode: number | undefined;
+  if (directTransfer) {
+    transferExitCode = await directTransferRunner(createCoordinatorJoinCommand(command, directTransfer));
+    if (transferExitCode !== 0) throw new Error(`Coordinator direct join failed with exit code ${transferExitCode}`);
+  }
   const plan: MeshGetPlan = {
     code,
     fileId: typeof resolved.fileId === 'string' ? resolved.fileId : undefined,
@@ -261,14 +275,14 @@ export async function runGet(command: GetCommand): Promise<void> {
     status: directTransfer ? 'complete' : 'planned',
     discovery: 'coordinator',
     execution: directTransfer ? 'direct-join' : 'unavailable',
-    note: directTransfer ? 'Share resolved; executing provider transfer via direct join descriptor.' : 'Share resolved and candidates discovered, but no direct provider join hint is online yet.'
+    transferExitCode,
+    note: directTransfer ? 'Share resolved and direct join transfer completed.' : 'Share resolved and candidates discovered, but no direct provider join hint is online yet.'
   };
-  if (directTransfer) await directTransferRunner(createCoordinatorJoinCommand(command, directTransfer));
   printResult(command.json, { ok: true, command: command.command, coordinator: command.coordinator, workspace: command.workspace, data: plan });
 }
 
 async function ensureWorkspace(coordinator: string, workspace: string): Promise<unknown> {
-  return coordinatorRequest<unknown>(coordinator, '/api/mesh/workspaces', {
+  return coordinatorRequest<unknown>(coordinator, '/api/grid/v1/workspaces', {
     method: 'POST',
     body: { workspaceId: workspace, name: workspace }
   });
@@ -356,9 +370,7 @@ function parseShareCode(value: string): string {
 }
 
 
-export function findDirectTransferHint(resolved: unknown, candidates: unknown): DirectTransferHint | undefined {
-  const resolvedHint = findHintInValue((resolved as { capabilities?: unknown } | null)?.capabilities);
-  if (resolvedHint?.join) return resolvedHint;
+export function findDirectTransferHint(_resolved: unknown, candidates: unknown): DirectTransferHint | undefined {
   const collections = [
     (candidates as { providers?: unknown[] } | null)?.providers,
     (candidates as { candidates?: unknown[] } | null)?.candidates
@@ -402,6 +414,19 @@ function extractPeerHint(record: Record<string, unknown>): string | undefined {
     if (typeof value === 'string' && value.startsWith('ponswarp-peer://')) return value;
   }
   return undefined;
+}
+
+function assertDirectTransferMatchesResolvedShare(resolved: Record<string, unknown>, hint: DirectTransferHint): void {
+  const descriptor = decodeJoinDescriptor(hint.join);
+  const manifest = descriptor.manifests[0];
+  const resolvedFileId = typeof resolved.fileId === 'string' ? resolved.fileId : undefined;
+  const resolvedSize = typeof resolved.sizeBytes === 'number' ? resolved.sizeBytes : undefined;
+  if (resolvedFileId && manifest?.fileId !== resolvedFileId) {
+    throw new Error(`Coordinator candidate descriptor file mismatch: expected ${resolvedFileId}, got ${manifest?.fileId ?? 'missing'}`);
+  }
+  if (resolvedSize !== undefined && manifest?.size !== resolvedSize) {
+    throw new Error(`Coordinator candidate descriptor size mismatch: expected ${resolvedSize}, got ${manifest?.size ?? 'missing'}`);
+  }
 }
 
 function createCoordinatorJoinCommand(command: GetCommand, hint: DirectTransferHint): JoinCommand {

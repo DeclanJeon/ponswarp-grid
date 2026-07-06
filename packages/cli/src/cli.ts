@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { createSignalingHttpServer } from '@ponswarp/signaling/server';
 import { CliUsageError, parseCliArgs, usage } from './index.js';
-import { runJoin, runSend } from './cli-runtime.js';
+import { runClean, runJoin, runSend, runStatus } from './cli-runtime.js';
 import { runDownload, runFiles, runGet, runNodeStart, runPublish, runShare } from './coordinator-runtime.js';
 
 async function main(argv: readonly string[]): Promise<number> {
@@ -41,8 +41,11 @@ async function main(argv: readonly string[]): Promise<number> {
       await runGet(command);
       return 0;
     case 'status':
+      await runStatus(command);
+      return 0;
     case 'clean':
-      throw new CliUsageError(`${command.command} session management is not available in this build yet`);
+      await runClean(command);
+      return 0;
   }
 }
 
