@@ -1100,6 +1100,12 @@ function App() {
           text-decoration: none;
           font-weight: 650;
         }
+        .how-pill { transition: background 160ms ease, border-color 160ms ease, color 160ms ease; }
+        .how-pill:hover {
+          background: rgba(7, 20, 50, 0.82);
+          border-color: rgba(166, 206, 255, 0.42);
+          color: #fff;
+        }
         .hero {
           position: relative;
           min-height: 384px;
@@ -1109,7 +1115,7 @@ function App() {
         .hero h1 {
           margin: 0;
           font-size: clamp(58px, 7.1vw, 96px);
-          line-height: 0.97;
+          line-height: 1.05;
           letter-spacing: -0.075em;
           text-shadow: 0 14px 56px rgba(0,0,0,0.3);
         }
@@ -1266,7 +1272,7 @@ function App() {
         .action-card {
           min-height: 348px;
           border: 1px solid rgba(146, 203, 255, 0.28);
-          border-radius: 28px;
+          border-radius: 24px;
           padding: 28px 34px;
           background: linear-gradient(145deg, rgba(11, 39, 88, 0.9), rgba(5, 20, 52, 0.62));
           box-shadow: inset 0 1px 0 rgba(255,255,255,0.11), 0 24px 70px rgba(0,0,0,0.28), 0 0 44px rgba(42, 136, 255, 0.1);
@@ -1344,6 +1350,9 @@ function App() {
           box-shadow: 0 12px 30px rgba(25, 107, 255, 0.42), inset 0 1px 0 rgba(255,255,255,0.28);
           cursor: pointer;
         }
+        .primary-button { transition: transform 80ms ease, filter 80ms ease; }
+        .primary-button:hover { transform: translateY(-1px); filter: brightness(1.05); }
+        .primary-button:active { transform: translateY(0); filter: brightness(0.97); }
         .primary-button:disabled { opacity: 0.64; cursor: wait; }
         .share-result {
           margin-top: 18px;
@@ -1364,6 +1373,11 @@ function App() {
           background: rgba(13, 35, 80, 0.72);
           overflow: hidden;
           box-shadow: inset 0 1px 0 rgba(255,255,255,0.08);
+        }
+        .receive-form:focus-within {
+          border-color: rgba(37, 217, 255, 0.72);
+          box-shadow: 0 0 0 3px rgba(37, 217, 255, 0.18);
+          transition: border-color 160ms ease, box-shadow 160ms ease;
         }
         .receive-input {
           min-width: 0;
@@ -1387,7 +1401,10 @@ function App() {
           background: linear-gradient(135deg, #43d9ff, #1776e7);
           cursor: pointer;
           box-shadow: -12px 0 30px rgba(37,217,255,0.18);
+          transition: filter 100ms ease, transform 100ms ease;
         }
+        .arrow-button:hover { filter: brightness(1.12); }
+        .arrow-button:active { filter: brightness(0.95); transform: scale(0.97); }
         .or-line {
           display: grid;
           grid-template-columns: 1fr auto 1fr;
@@ -1454,7 +1471,7 @@ function App() {
           max-width: 1280px;
           margin: 0 auto;
           border: 1px solid rgba(135, 198, 255, 0.28);
-          border-radius: 23px;
+          border-radius: 24px;
           background: linear-gradient(135deg, rgba(9, 35, 82, 0.82), rgba(5, 22, 58, 0.64));
           box-shadow: inset 0 1px 0 rgba(255,255,255,0.08), 0 20px 60px rgba(0,0,0,0.22);
           backdrop-filter: blur(18px);
@@ -1464,7 +1481,7 @@ function App() {
           display: grid;
           grid-template-columns: 62px 1fr;
           gap: 15px;
-          align-items: center;
+          align-items: start;
           padding: 20px 25px;
           min-height: 92px;
           border-left: 1px solid rgba(135, 198, 255, 0.18);
@@ -1480,6 +1497,7 @@ function App() {
           background: rgba(255,255,255,0.04);
           color: #e7f4ff;
           font-size: 27px;
+          padding-top: 2px;
         }
         .trust-title { margin: 0; color: #fff; font-size: 18px; font-weight: 820; }
         .trust-copy { margin: 3px 0 0; color: #c4d4f0; font-size: 13px; line-height: 1.25; }
