@@ -12,6 +12,17 @@
     "type-check": "tsc -b packages/core packages/webrtc packages/signaling packages/react packages/cli apps/demo --pretty false",
     "dev:signal": "pnpm --filter @ponswarp/signaling start",
     "perf:500mb": "node scripts/perf-500mb.mjs",
+    "turn:diagnose": "node scripts/turn-diagnostics.mjs",
+    "turn:fetch-ice": "node scripts/fetch-turn-ice.mjs",
+    "mesh:postgres-drill": "node scripts/mesh-postgres-drill.mjs",
+    "grid:multi-provider-qa": "node scripts/multi-provider-grid-qa.mjs",
+    "grid:network-matrix": "node scripts/network-matrix-qa.mjs",
+    "deploy:validate-grid": "node scripts/validate-grid-deployment-config.mjs",
+    "deploy:validate-security": "node scripts/validate-grid-security-release.mjs",
+    "deploy:validate-db": "node scripts/validate-grid-db-readiness.mjs",
+    "deploy:validate-onboarding": "node scripts/validate-grid-onboarding-docs.mjs",
+    "deploy:validate-private-beta": "node scripts/validate-grid-private-beta-package.mjs",
+    "grid:version": "node scripts/generate-grid-version.mjs",
     "clean": "node -e \"import('node:fs/promises').then(fs=>fs.rm('dist',{recursive:true,force:true}))\""
   },
   "devDependencies": {
