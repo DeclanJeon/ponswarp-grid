@@ -1,0 +1,14 @@
+[Unit]
+Description=PonsWarp Grid static web for grid.ponslink.com
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/declan/ponswarp-grid-web/current
+ExecStart=/usr/bin/python3 -m http.server 4180 --bind 127.0.0.1
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

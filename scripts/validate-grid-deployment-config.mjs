@@ -30,7 +30,8 @@ function assertTrue(id, condition, evidence, failure) {
 
 const env = await readFile('deploy/grid.ponslink.env.example', 'utf8');
 const nginx = await readFile('deploy/grid.ponslink.nginx.conf', 'utf8');
-const systemd = await readFile('deploy/ponswarp-grid-coordinator.service', 'utf8');
+const coordinatorSystemd = await readFile('deploy/ponswarp-grid-coordinator.service', 'utf8');
+const webSystemd = await readFile('deploy/ponswarp-grid-web.service', 'utf8');
 const cliIndex = await readFile('packages/cli/src/index.ts', 'utf8');
 const signalingServer = await readFile('packages/signaling/src/server.ts', 'utf8');
 
@@ -67,10 +68,17 @@ includesAll('nginx-security-cache', nginx, [
   'Cache-Control "public, max-age=31536000, immutable"',
   'Cache-Control "no-cache"'
 ]);
-includesAll('systemd-isolated-service', systemd, [
+includesAll('systemd-isolated-service', coordinatorSystemd, [
   'Description=PonsWarp Grid Coordinator for grid.ponslink.com',
   'EnvironmentFile=/etc/ponswarp/grid.ponslink.env',
   '--port 8788',
+  'Restart=on-failure',
+  'NoNewPrivileges=true'
+]);
+includesAll('systemd-web-static-service', webSystemd, [
+  'Description=PonsWarp Grid static web for grid.ponslink.com',
+  'WorkingDirectory=/home/declan/ponswarp-grid-web/current',
+  'ExecStart=/usr/bin/python3 -m http.server 4180 --bind 127.0.0.1',
   'Restart=on-failure',
   'NoNewPrivileges=true'
 ]);
