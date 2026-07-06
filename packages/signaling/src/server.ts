@@ -40,7 +40,7 @@ export interface SignalingServerConfig {
 export const DEFAULT_SIGNALING_SERVER_CONFIG: SignalingServerConfig = {
   host: '0.0.0.0',
   port: 8787,
-  publicBaseUrl: 'http://localhost:5173',
+  publicBaseUrl: process.env.PONSWARP_PUBLIC_BASE_URL ?? '',
   sessionTtlMs: 60 * 60 * 1000,
   peerTtlMs: 30 * 1000,
   maxPeersPerSession: 16,
@@ -49,7 +49,7 @@ export const DEFAULT_SIGNALING_SERVER_CONFIG: SignalingServerConfig = {
   stalePeerTimeoutMs: 5 * 60 * 1000,
   allowedOrigins: [],
   serviceName: 'ponswarp-signaling',
-  deploymentDomain: 'localhost',
+  deploymentDomain: process.env.PONSWARP_DEPLOYMENT_DOMAIN ?? '',
   legacyDomain: 'warp.ponslink.com',
   version: process.env.npm_package_version ?? '0.1.0',
   commitSha: process.env.PONSWARP_BUILD_SHA ?? 'dev',

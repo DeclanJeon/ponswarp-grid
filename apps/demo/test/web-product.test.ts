@@ -18,13 +18,15 @@ describe('web product helpers', () => {
     expect(formatBytes(5 * 1024 ** 3)).toBe('5.0 GB');
   });
 
-  it('uses deterministic human-readable demo share codes in tests', () => {
-    expect(createShareCode(Number.parseInt('zzzz', 36))).toBe('DEMO-ZZZZ');
+  it('generates share codes in XXXX-XXXX format without demo prefix', () => {
+    const code = createShareCode();
+    expect(code).toMatch(/^[A-Z2-9]{4}-[A-Z2-9]{4}$/);
+    expect(code).not.toContain('DEMO');
   });
 
   it('allows the browser MVP to distinguish local downloadable shares from remote planning states', () => {
-    expect(isLocalShareMatch('DEMO-ABCD', 'demo-abcd')).toBe(true);
-    expect(isLocalShareMatch('DEMO-ABCD', 'DEMO-WXYZ')).toBe(false);
-    expect(isLocalShareMatch(undefined, 'DEMO-WXYZ')).toBe(false);
+    expect(isLocalShareMatch('ABCD-EFGH', 'abcd-efgh')).toBe(true);
+    expect(isLocalShareMatch('ABCD-EFGH', 'WXYZ-9999')).toBe(false);
+    expect(isLocalShareMatch(undefined, 'WXYZ-9999')).toBe(false);
   });
 });

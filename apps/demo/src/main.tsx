@@ -38,7 +38,7 @@ class BroadcastDemoTransport implements Transport {
   private readonly binaryHandlers = new Set<(peerId: PeerId, frame: ArrayBuffer) => void>();
 
   constructor(readonly selfId: PeerId, sessionId: SessionId) {
-    this.channel = new BroadcastChannel(`ponswarp-grid-demo-${sessionId}`);
+    this.channel = new BroadcastChannel(`ponswarp-grid-${sessionId}`);
     this.channel.onmessage = event => {
       const envelope = event.data as { to?: PeerId; from?: PeerId; kind?: 'message' | 'binary'; message?: TransportMessage; frame?: ArrayBuffer };
       if (envelope.to !== this.selfId || !envelope.from) return;
@@ -152,11 +152,7 @@ function signalingUrl(): string {
   const explicit = new URLSearchParams(location.search).get('signal');
   if (explicit) return explicit;
   const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const port = location.port || (location.protocol === 'https:' ? '443' : '80');
-  const defaultPort = location.protocol === 'https:' ? '443' : '80';
-  const host = port === defaultPort ? location.hostname : `${location.hostname}:${port}`;
-  const localDevPort = location.hostname === 'localhost' || location.hostname === '127.0.0.1' ? ':8787' : '';
-  return localDevPort ? `${scheme}//${location.hostname}${localDevPort}/ws` : `${scheme}//${host}/ws`;
+  return `${scheme}//${location.host}/ws`;
 }
 let runtimeRtcConfig: RTCConfiguration | null = null;
 
@@ -412,7 +408,7 @@ function App() {
 
 
   async function createWebShareLink(): Promise<void> {
-    const file = selectedFile ?? namedBlob('PonsWarp Web-first demo payload', 'demo.txt');
+    const file = selectedFile ?? namedBlob('PonsWarp Grid sample payload', 'sample.txt');
     setWebShare({ status: 'creating' });
     setState({ status: 'running', logs: ['Creating a phone-ready WebRTC share link.'] });
     try {
@@ -446,7 +442,7 @@ function App() {
         sessionId,
         link,
         qrDataUrl,
-        fileName: file.name ?? 'demo.txt',
+        fileName: file.name ?? 'sample.txt',
         sizeBytes: file.size,
         expiresAt: Date.now() + 24 * 60 * 60 * 1000,
         downloads: 0,
@@ -518,7 +514,7 @@ function App() {
       const receiverTransport = new DemoTransport(receiverPeerId);
       ownerTransport.link(receiverPeerId, receiverTransport);
       receiverTransport.link(ownerPeerId, ownerTransport);
-      await runEngineTransfer({ sessionId, ownerPeerId, receiverPeerId, ownerTransport, receiverTransport, file: selectedFile ?? namedBlob('PonsWarp Grid demo payload', 'demo.txt'), logPrefix: 'Transferred', initialLog: 'Receiver joined session and loaded manifest.' });
+      await runEngineTransfer({ sessionId, ownerPeerId, receiverPeerId, ownerTransport, receiverTransport, file: selectedFile ?? namedBlob('PonsWarp Grid sample payload', 'sample.txt'), logPrefix: 'Transferred', initialLog: 'Receiver joined session and loaded manifest.' });
     } catch (error) { setState(current => ({ ...current, status: 'error', error: error instanceof Error ? error.message : String(error) })); }
   }
 
@@ -545,7 +541,7 @@ function App() {
       await receiverPc.setRemoteDescription(answer);
       await waitForTransportChannel(ownerTransport, receiverPeerId);
       await waitForTransportChannel(receiverTransport, ownerPeerId);
-      await runEngineTransfer({ sessionId, ownerPeerId, receiverPeerId, ownerTransport, receiverTransport, file: selectedFile ?? namedBlob('PonsWarp Grid WebRTC payload', 'webrtc-demo.txt'), logPrefix: 'WebRTC transferred', initialLog: 'WebRTC DataChannel open; receiver joined WebRTC session and loaded manifest.' });
+      await runEngineTransfer({ sessionId, ownerPeerId, receiverPeerId, ownerTransport, receiverTransport, file: selectedFile ?? namedBlob('PonsWarp Grid sample payload', 'sample.txt'), logPrefix: 'WebRTC transferred', initialLog: 'WebRTC DataChannel open; receiver joined WebRTC session and loaded manifest.' });
     } catch (error) { setState(current => ({ ...current, status: 'error', error: error instanceof Error ? error.message : String(error) })); }
   }
 
@@ -571,7 +567,7 @@ function App() {
       const receiverBStorage = new MemoryStorageAdapter();
       const receiverA = new PonsWarpEngine(receiverAStorage, undefined, undefined, undefined, receiverATransport);
       const receiverB = new PonsWarpEngine(receiverBStorage, undefined, undefined, undefined, receiverBTransport);
-      const file = selectedFile ?? namedBlob('PonsWarp Grid peer availability demo payload', 'grid-demo.txt');
+      const file = selectedFile ?? namedBlob('PonsWarp Grid sample payload', 'sample.txt');
       const session = await owner.createSession({ sessionId, files: [file], pieceSize: demoPieceSize(file) });
       const manifest = session.manifests[0];
       pushLog(`Sender created ${manifest.pieceCount} pieces for ${manifest.name}.`);
@@ -803,7 +799,7 @@ function App() {
       const transport = new WebRTCTransport();
       const storage = new MemoryStorageAdapter();
       const engine = new PonsWarpEngine(storage, undefined, undefined, undefined, transport);
-      const file = selectedFile ?? namedBlob('PonsWarp Grid signaled payload', 'signaled-demo.txt');
+      const file = selectedFile ?? namedBlob('PonsWarp Grid sample payload', 'sample.txt');
       const session = await engine.createSession({ sessionId, files: [file], pieceSize: demoPieceSize(file) });
       const manifest = session.manifests[0];
       const client = new BrowserSignalingClient({ url: signalingUrl() });
@@ -1697,7 +1693,7 @@ function App() {
           <summary>Developer and QA controls</summary>
           <section aria-label="Sender panel">
             <h2>Sender</h2>
-            <p>Selected: {selectedFile?.name ?? 'Built-in demo.txt sample'}</p>
+            <p>Selected: {selectedFile?.name ?? 'Built-in sample file'}</p>
             <button onClick={() => void runLocalDemo()} disabled={state.status === 'running'}>Run local transfer + resume demo</button>
             <button onClick={() => void runWebRtcLoopbackDemo()} disabled={state.status === 'running'}>Run real WebRTC loopback demo</button>
             <button onClick={() => void runLocalGridSchedulerDemo()} disabled={state.status === 'running'}>Run 3-peer grid scheduler demo</button>

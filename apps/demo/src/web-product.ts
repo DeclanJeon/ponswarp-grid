@@ -11,8 +11,10 @@ export function formatBytes(bytes: number): string {
   return `${bytes} bytes`;
 }
 
-export function createShareCode(now = Date.now()): string {
-  return `DEMO-${now.toString(36).slice(-4).toUpperCase()}`;
+export function createShareCode(): string {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const rand = (n: number) => Array.from({ length: n }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
+  return `${rand(4)}-${rand(4)}`;
 }
 
 export function isLocalShareMatch(activeCode: string | undefined, requestedCode: string): boolean {
