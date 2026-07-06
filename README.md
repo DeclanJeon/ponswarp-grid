@@ -2,6 +2,68 @@
 
 Reusable browser P2P file-transfer engine extracted from PonsWarp. The MVP target is piece-based file transfer over WebRTC DataChannel with WebSocket signaling, local resume state, and SHA-256 integrity checks.
 
+## grid.ponslink.com quickstart
+
+`https://grid.ponslink.com` is the public-beta product surface for PonsWarp Grid. It is intentionally separate from `https://warp.ponslink.com`: Grid uses its own web UI, coordinator API, signaling paths, database namespace, metrics, and rollback path.
+
+### First-time Web use
+
+Sender:
+
+1. Open `https://grid.ponslink.com/`.
+2. Choose **Share a file**, select the file, and create a share link.
+3. Send the displayed code or link to the receiver.
+4. Keep the sender tab open until the receiver finishes; the original file is served from the sender device, not uploaded to the coordinator.
+
+Receiver:
+
+1. Open the received `https://grid.ponslink.com/...` link, or open `https://grid.ponslink.com/` and paste the code.
+2. Confirm the file metadata shown by the page.
+3. Start the download. If direct WebRTC cannot connect, the client may use the configured TURN relay.
+
+For large files, offline/resume-heavy transfers, or restrictive networks, use the CLI instead of relying on browser memory and tab lifetime.
+
+### CLI install and use
+
+Install dependencies and build this workspace from source:
+
+```bash
+pnpm install
+pnpm build
+```
+
+The Grid coordinator default is:
+
+```text
+https://grid.ponslink.com
+```
+
+Product commands should use that coordinator by default; local development and staging may override it:
+
+```bash
+PONSWARP_COORDINATOR_URL=http://127.0.0.1:8787 node packages/cli/dist/cli.js node start --workspace my-workspace --node-id node-a --public-key ed25519:dev
+```
+
+Share metadata from the CLI and print a share code/link:
+```bash
+node packages/cli/dist/cli.js share ./file.zip --workspace my-workspace --node-id node-a
+```
+
+Receive from the CLI by share code or link:
+```bash
+node packages/cli/dist/cli.js get <share-code-or-link> --out ./downloads
+```
+
+The installed package exposes both `ponswarp` and `ponswarp-grid` bin names. From this source tree, use `node packages/cli/dist/cli.js ...`; after package installation/linking, the equivalent command is `ponswarp-grid get <share-code-or-link> --out ./downloads`.
+
+Current coordinator `share/get` performs metadata registration, discovery, candidate planning, and direct-join execution only when an online provider advertises a direct transfer hint. Until coordinator-mediated provider byte transport is fully enabled for every provider, the direct `send`/`join` commands remain the reliable byte-transfer fallback for LAN/local QA and large-file engine validation.
+
+Detailed operational docs:
+
+- User guide: [`docs/15-grid-user-guide.md`](docs/15-grid-user-guide.md)
+- Privacy and abuse policy: [`deploy/grid-privacy-abuse-policy.md`](deploy/grid-privacy-abuse-policy.md)
+- Incident runbook: [`deploy/grid-ops-incident-runbook.md`](deploy/grid-ops-incident-runbook.md)
+
 ## Workspace
 
 - `packages/core`: UI-free manifest, piece, storage, scheduler, integrity, events, and protocol-domain types.
@@ -99,7 +161,7 @@ Receiver B prints `Non-owner provider pieces: N`; a value greater than zero prov
 
 ## Node CLI coordinator product surface
 
-The direct `send`/`join` commands stay available as low-level transfer primitives and QA fallback. The product MVP command surface can also talk to a Workspace Coordinator that exposes `/api/mesh/*`:
+The direct `send`/`join` commands stay available as low-level transfer primitives and QA fallback. The product MVP command surface can also talk to a Workspace Coordinator that exposes `/api/grid/v1/*`:
 
 ```bash
 node packages/cli/dist/cli.js node start \
@@ -128,6 +190,43 @@ node packages/cli/dist/cli.js download <file-id> \
 ```
 
 `--dry-run` prints the exact coordinator registration/publish/download plan without mutating server state. `node start` ensures the named workspace exists before registering the node. `download` currently performs coordinator discovery and candidate planning; byte transfer execution remains on the direct `send`/`join` primitive until coordinator-mediated provider transport is enabled.
+
+## Staging / production-readiness QA status
+
+The current public staging path used for pre-production QA is isolated from the existing production `/ws` service:
+
+- QA app: `https://warp.ponslink.com/grid-qa-1783162817/`
+- QA signaling: `wss://warp.ponslink.com/grid-qa-ws`
+- Existing production health remains `ponswarp-signaling-rs` on `https://warp.ponslink.com/health`
+- Rollback backup on `ponslink`: `/home/declan/nginx-warp-ponslink-before-grid-qa-ws.conf`
+
+Validated before production cutover:
+
+- LTE-hotspot sender ↔ Wi-Fi `home` receiver over public staging.
+- WebRTC strict relay with `stun=none`, `relay=1`, and TURN REST credentials.
+- UDP TURN relay selected pair: `local=relay/udp remote=relay/udp`.
+- 10MiB browser strict-relay transfer: `160/160` pieces verified, resume restored, assembled `10,485,760` bytes.
+- CLI local/direct 64MiB capacity transfer with SHA-256 match.
+- 240s staging soak with signaling reconnect recovery.
+- QA service health, production health/readiness, Nginx syntax, and rollback artifacts.
+
+Known limits before public production claims:
+
+- TCP/TLS TURN URLs are valid and small transfers complete, but Chrome selected UDP relay candidates in testing. True TCP-only fallback still needs a UDP-blocked maintenance-window test.
+- Browser TURN relay large-file behavior is currently bounded by relay throughput/coturn budget. Treat 10MiB as validated; route larger/offline/resume-heavy workflows to CLI/native paths until 100MiB+ relay tests pass.
+- Coordinator-mediated provider byte transfer is still planned; current coordinator CLI covers metadata/planning, while direct `send`/`join` remains the byte-transfer primitive.
+
+Pre-production QA evidence:
+
+- `artifacts/predeploy-g001-turn-tcp-tls-report.md`
+- `artifacts/predeploy-g002-capacity-report.md`
+- `artifacts/predeploy-g003-soak-ops-report.md`
+- `artifacts/remaining-network-qa-report.md`
+## Production-hardening status
+
+The current repo is an MVP engine/demo/CLI workspace, not a production-ready public mesh service. The coordinator-facing CLI surface can exercise `/api/grid/v1/*` planning and registration flows, but production enablement still depends on persistence, auth/authorization, rate limiting, observability, cleanup/retention jobs, restart/DR drills, and real multi-device release QA.
+
+Operational hardening design is tracked in `docs/08-production-hardening-design.md` and `docs/09-final-production-architecture-summary.md`. Executable release checklists and report templates live in `docs/10-release-qa-gates.md` and `docs/11-multi-device-qa-report-template.md`; use those before staging/private-beta/public-beta decisions instead of treating local demo success as production readiness.
 
 ## API quickstart
 

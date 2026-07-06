@@ -1,0 +1,22 @@
+[Unit]
+Description=PonsWarp Grid Coordinator for grid.ponslink.com
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ponswarp
+Group=ponswarp
+WorkingDirectory=/opt/ponswarp/ponswarp-signaling-rs
+EnvironmentFile=/etc/ponswarp/grid.ponslink.env
+ExecStart=/opt/ponswarp/ponswarp-signaling-rs/target/release/mesh_api --host 127.0.0.1 --port 8788
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/ponswarp-grid /var/log/ponswarp-grid
+
+[Install]
+WantedBy=multi-user.target
