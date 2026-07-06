@@ -91,7 +91,7 @@ export class CliUsageError extends Error {
   constructor(message: string) { super(message); this.name = 'CliUsageError'; }
 }
 
-const DEFAULT_SIGNAL = 'ws://127.0.0.1:8787/ws';
+const DEFAULT_SIGNAL = 'auto';
 const DEFAULT_LISTEN = '127.0.0.1:0';
 const DEFAULT_PIECE_SIZE = 1024 * 1024;
 const DEFAULT_OUT_DIR = '.';
@@ -371,8 +371,8 @@ export function usage(): string {
   return `PonsWarp Grid CLI
 
 Usage:
-  ponswarp send <file> [--signal ws://host:8787/ws] [--listen host:port] [--advertise ws://host:port] [--piece-size bytes] [--session id] [--keep-open]
-  ponswarp join <session-or-url> --out <dir> [--signal ws://host:8787/ws] [--listen host:port] [--advertise ws://host:port] [--peer ponswarp-peer://...] [--seed-after-complete] [--max-peers n]
+  ponswarp send <file> [--signal auto|ws://host:port/ws] [--listen host:port] [--advertise ws://host:port] [--piece-size bytes] [--session id] [--keep-open]
+  ponswarp join <session-or-url> --out <dir> [--signal auto|ws://host:port/ws] [--listen host:port] [--advertise ws://host:port] [--peer ponswarp-peer://...] [--seed-after-complete] [--max-peers n]
   ponswarp serve-signal [--host 0.0.0.0] [--port 8787]
   ponswarp node start --workspace <id> --node-id <id> --public-key <key> [--coordinator http://host] [--display-name name] [--direct-join ponswarp://join/...] [--json] [--dry-run]
   ponswarp publish <file> --workspace <id> --node-id <id> [--coordinator http://host] [--piece-size bytes] [--json] [--dry-run]

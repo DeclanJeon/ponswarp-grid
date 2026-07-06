@@ -11,7 +11,7 @@ async function main(argv: readonly string[]): Promise<number> {
       console.log(usage());
       return 0;
     case 'version':
-      console.log('0.1.0');
+      console.log(process.env.npm_package_version ?? '0.1.0');
       return 0;
     case 'serve-signal': {
       await runServeSignal(command.host, command.port);

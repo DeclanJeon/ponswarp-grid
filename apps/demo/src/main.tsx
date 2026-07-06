@@ -17,43 +17,9 @@ import {
 import { BrowserSignalingClient, SIGNALING_PROTOCOL, PROTOCOL_VERSION, type SignalingEnvelope } from '@ponswarp/signaling';
 import { WebRTCTransport } from '@ponswarp/webrtc';
 import { createShareCode, formatBytes, isLocalShareMatch, parseShareCode } from './web-product';
+import { DEFAULT_STUN_URL, SHARE_EXPIRY_MS, PIECE_PROGRESS_TIMEOUT_MS, PROGRESS_POLL_INTERVAL_MS, DEFAULT_SAMPLE_FILE_NAME, DEFAULT_SAMPLE_PAYLOAD, calculatePieceSize } from './constants';
+import { DemoTransport, BroadcastDemoTransport } from './demo-transports';
 
-class DemoTransport implements Transport {
-  private readonly peers = new Map<PeerId, DemoTransport>();
-  private readonly messageHandlers = new Set<(peerId: PeerId, message: TransportMessage) => void>();
-  private readonly binaryHandlers = new Set<(peerId: PeerId, frame: ArrayBuffer) => void>();
-  constructor(readonly selfId: PeerId) {}
-  link(peerId: PeerId, peer: DemoTransport): void { this.peers.set(peerId, peer); }
-  async connect(): Promise<void> {}
-  async send(peerId: PeerId, message: TransportMessage): Promise<void> { this.peers.get(peerId)?.messageHandlers.forEach(handler => handler(this.selfId, message)); }
-  async sendBinary(peerId: PeerId, frame: BinaryFrame): Promise<void> { const data = frame instanceof ArrayBuffer ? frame : copyArrayBufferView(frame); this.peers.get(peerId)?.binaryHandlers.forEach(handler => handler(this.selfId, data)); }
-  onMessage(handler: (peerId: PeerId, message: TransportMessage) => void): () => void { this.messageHandlers.add(handler); return () => this.messageHandlers.delete(handler); }
-  onBinary(handler: (peerId: PeerId, frame: ArrayBuffer) => void): () => void { this.binaryHandlers.add(handler); return () => this.binaryHandlers.delete(handler); }
-  async close(): Promise<void> {}
-}
-
-class BroadcastDemoTransport implements Transport {
-  private readonly channel: BroadcastChannel;
-  private readonly messageHandlers = new Set<(peerId: PeerId, message: TransportMessage) => void>();
-  private readonly binaryHandlers = new Set<(peerId: PeerId, frame: ArrayBuffer) => void>();
-
-  constructor(readonly selfId: PeerId, sessionId: SessionId) {
-    this.channel = new BroadcastChannel(`ponswarp-grid-${sessionId}`);
-    this.channel.onmessage = event => {
-      const envelope = event.data as { to?: PeerId; from?: PeerId; kind?: 'message' | 'binary'; message?: TransportMessage; frame?: ArrayBuffer };
-      if (envelope.to !== this.selfId || !envelope.from) return;
-      if (envelope.kind === 'message') this.messageHandlers.forEach(handler => handler(envelope.from!, envelope.message));
-      if (envelope.kind === 'binary' && envelope.frame) this.binaryHandlers.forEach(handler => handler(envelope.from!, envelope.frame!));
-    };
-  }
-
-  async connect(): Promise<void> {}
-  async send(peerId: PeerId, message: TransportMessage): Promise<void> { this.channel.postMessage({ to: peerId, from: this.selfId, kind: 'message', message }); }
-  async sendBinary(peerId: PeerId, frame: BinaryFrame): Promise<void> { const data = frame instanceof ArrayBuffer ? frame : copyArrayBufferView(frame); this.channel.postMessage({ to: peerId, from: this.selfId, kind: 'binary', frame: data }); }
-  onMessage(handler: (peerId: PeerId, message: TransportMessage) => void): () => void { this.messageHandlers.add(handler); return () => this.messageHandlers.delete(handler); }
-  onBinary(handler: (peerId: PeerId, frame: ArrayBuffer) => void): () => void { this.binaryHandlers.add(handler); return () => this.binaryHandlers.delete(handler); }
-  async close(): Promise<void> { this.channel.close(); }
-}
 
 interface DemoState {
   status: 'idle' | 'running' | 'restoring_local_state' | 'local_state_restored' | 'reconnecting_signaling' | 'validating_remote_manifest' | 'resuming_transfer' | 'ready' | 'complete' | 'error' | 'resume_manifest_mismatch' | 'resume_state_corrupt' | 'storage_unavailable' | 'session_expired';
@@ -108,7 +74,6 @@ type ReceiverRuntime = {
   completed: boolean;
 };
 
-function copyArrayBufferView(view: ArrayBufferView): ArrayBuffer { const copy = new Uint8Array(view.byteLength); copy.set(new Uint8Array(view.buffer, view.byteOffset, view.byteLength)); return copy.buffer; }
 function namedBlob(text: string, name: string, type = 'text/plain'): Blob & { name: string; type: string } { const blob = new Blob([text], { type }) as Blob & { name: string; type: string }; Object.defineProperty(blob, 'name', { value: name }); return blob; }
 declare global {
   interface PromiseConstructor {
@@ -127,10 +92,10 @@ function delay(ms: number): Promise<void> {
 }
 
 async function waitForPieceProgress(engine: PonsWarpEngine, fileId: FileManifest['fileId'], previousVerifiedPieces: number): Promise<TransferProgress> {
-  const deadline = Date.now() + 30_000;
+  const deadline = Date.now() + PIECE_PROGRESS_TIMEOUT_MS;
   let progress = engine.getProgress(fileId);
   while (Date.now() < deadline && progress.verifiedPieces <= previousVerifiedPieces) {
-    await delay(100);
+    await delay(PROGRESS_POLL_INTERVAL_MS);
     progress = engine.getProgress(fileId);
   }
   if (progress.verifiedPieces <= previousVerifiedPieces) throw new Error(`Timed out waiting for piece progress beyond ${previousVerifiedPieces}/${progress.totalPieces}`);
@@ -139,14 +104,6 @@ async function waitForPieceProgress(engine: PonsWarpEngine, fileId: FileManifest
 async function createPersistentStorage(sessionId: SessionId): Promise<{ adapter: StorageAdapter; kind: string; warnings: string[] }> {
   const result = await createBrowserStorageAdapter({ sessionId });
   return { adapter: result.adapter, kind: result.kind, warnings: result.warnings.map(warning => `${warning.kind}:${warning.code}`) };
-}
-function demoPieceSize(file: Blob): number {
-  const explicit = Number(new URLSearchParams(location.search).get('pieceSize'));
-  if (Number.isSafeInteger(explicit) && explicit > 0) return explicit;
-  if (file.size <= 1024 * 1024) return 8;
-  if (file.size <= 16 * 1024 * 1024) return 1024 * 1024;
-  if (file.size <= 128 * 1024 * 1024) return 2 * 1024 * 1024;
-  return 4 * 1024 * 1024;
 }
 function signalingUrl(): string {
   const explicit = new URLSearchParams(location.search).get('signal');
@@ -161,7 +118,7 @@ function rtcConfigFromUrl(): RTCConfiguration | null {
   const turn = params.get('turn');
   const stunParam = params.get('stun');
   if (!turn && stunParam === null && params.get('relay') !== '1') return null;
-  const iceServers: RTCIceServer[] = stunParam === 'none' ? [] : [{ urls: stunParam ?? 'stun:stun.l.google.com:19302' }];
+  const iceServers: RTCIceServer[] = stunParam === 'none' ? [] : [{ urls: stunParam ?? DEFAULT_STUN_URL }];
   const turnUsername = params.get('turnUser');
   const turnCredential = params.get('turnCredential');
   if (turn) iceServers.push({ urls: turn, username: turnUsername ?? undefined, credential: turnCredential ?? undefined });
@@ -175,7 +132,7 @@ async function ensureRtcConfig(): Promise<RTCConfiguration> {
     return explicit;
   }
   if (runtimeRtcConfig) return runtimeRtcConfig;
-  const fallback: RTCConfiguration = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }], iceTransportPolicy: 'all' };
+  const fallback: RTCConfiguration = { iceServers: [{ urls: DEFAULT_STUN_URL }], iceTransportPolicy: 'all' };
   if (location.protocol !== 'https:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
     runtimeRtcConfig = fallback;
     return fallback;
@@ -192,7 +149,7 @@ async function ensureRtcConfig(): Promise<RTCConfiguration> {
 }
 
 function rtcConfig(): RTCConfiguration {
-  return runtimeRtcConfig ?? rtcConfigFromUrl() ?? { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }], iceTransportPolicy: 'all' };
+  return runtimeRtcConfig ?? rtcConfigFromUrl() ?? { iceServers: [{ urls: DEFAULT_STUN_URL }], iceTransportPolicy: 'all' };
 }
 function currentJoinUrl(sessionId: SessionId): string { return `${location.origin}${location.pathname}${location.search}#/join/${sessionId}`; }
 function currentGetUrl(code: string, sessionId: SessionId): string { return `${location.origin}${location.pathname}${location.search}#/get/${encodeURIComponent(code)}?session=${encodeURIComponent(sessionId)}`; }
@@ -408,7 +365,7 @@ function App() {
 
 
   async function createWebShareLink(): Promise<void> {
-    const file = selectedFile ?? namedBlob('PonsWarp Grid sample payload', 'sample.txt');
+    const file = selectedFile ?? namedBlob(DEFAULT_SAMPLE_PAYLOAD, DEFAULT_SAMPLE_FILE_NAME);
     setWebShare({ status: 'creating' });
     setState({ status: 'running', logs: ['Creating a phone-ready WebRTC share link.'] });
     try {
@@ -419,7 +376,7 @@ function App() {
       const transport = new WebRTCTransport();
       const storage = new MemoryStorageAdapter();
       const engine = new PonsWarpEngine(storage, undefined, undefined, undefined, transport);
-      const session = await engine.createSession({ sessionId, files: [file], pieceSize: demoPieceSize(file) });
+      const session = await engine.createSession({ sessionId, files: [file], pieceSize: calculatePieceSize(file) });
       const manifest = session.manifests[0];
       const client = new BrowserSignalingClient({ url: signalingUrl() });
       const runtime: OwnerRuntime = { peerId: ownerPeerId, sessionId, client, transport, engine, peerConnections: new Map() };
@@ -442,9 +399,9 @@ function App() {
         sessionId,
         link,
         qrDataUrl,
-        fileName: file.name ?? 'sample.txt',
+        fileName: file.name ?? DEFAULT_SAMPLE_FILE_NAME,
         sizeBytes: file.size,
-        expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+        expiresAt: Date.now() + SHARE_EXPIRY_MS,
         downloads: 0,
         devicesOnline: 1
       });
@@ -514,7 +471,7 @@ function App() {
       const receiverTransport = new DemoTransport(receiverPeerId);
       ownerTransport.link(receiverPeerId, receiverTransport);
       receiverTransport.link(ownerPeerId, ownerTransport);
-      await runEngineTransfer({ sessionId, ownerPeerId, receiverPeerId, ownerTransport, receiverTransport, file: selectedFile ?? namedBlob('PonsWarp Grid sample payload', 'sample.txt'), logPrefix: 'Transferred', initialLog: 'Receiver joined session and loaded manifest.' });
+      await runEngineTransfer({ sessionId, ownerPeerId, receiverPeerId, ownerTransport, receiverTransport, file: selectedFile ?? namedBlob(DEFAULT_SAMPLE_PAYLOAD, DEFAULT_SAMPLE_FILE_NAME), logPrefix: 'Transferred', initialLog: 'Receiver joined session and loaded manifest.' });
     } catch (error) { setState(current => ({ ...current, status: 'error', error: error instanceof Error ? error.message : String(error) })); }
   }
 
@@ -541,7 +498,7 @@ function App() {
       await receiverPc.setRemoteDescription(answer);
       await waitForTransportChannel(ownerTransport, receiverPeerId);
       await waitForTransportChannel(receiverTransport, ownerPeerId);
-      await runEngineTransfer({ sessionId, ownerPeerId, receiverPeerId, ownerTransport, receiverTransport, file: selectedFile ?? namedBlob('PonsWarp Grid sample payload', 'sample.txt'), logPrefix: 'WebRTC transferred', initialLog: 'WebRTC DataChannel open; receiver joined WebRTC session and loaded manifest.' });
+      await runEngineTransfer({ sessionId, ownerPeerId, receiverPeerId, ownerTransport, receiverTransport, file: selectedFile ?? namedBlob(DEFAULT_SAMPLE_PAYLOAD, DEFAULT_SAMPLE_FILE_NAME), logPrefix: 'WebRTC transferred', initialLog: 'WebRTC DataChannel open; receiver joined WebRTC session and loaded manifest.' });
     } catch (error) { setState(current => ({ ...current, status: 'error', error: error instanceof Error ? error.message : String(error) })); }
   }
 
@@ -567,8 +524,8 @@ function App() {
       const receiverBStorage = new MemoryStorageAdapter();
       const receiverA = new PonsWarpEngine(receiverAStorage, undefined, undefined, undefined, receiverATransport);
       const receiverB = new PonsWarpEngine(receiverBStorage, undefined, undefined, undefined, receiverBTransport);
-      const file = selectedFile ?? namedBlob('PonsWarp Grid sample payload', 'sample.txt');
-      const session = await owner.createSession({ sessionId, files: [file], pieceSize: demoPieceSize(file) });
+      const file = selectedFile ?? namedBlob(DEFAULT_SAMPLE_PAYLOAD, DEFAULT_SAMPLE_FILE_NAME);
+      const session = await owner.createSession({ sessionId, files: [file], pieceSize: calculatePieceSize(file) });
       const manifest = session.manifests[0];
       pushLog(`Sender created ${manifest.pieceCount} pieces for ${manifest.name}.`);
       await receiverA.joinSession(sessionId, [manifest]);
@@ -638,7 +595,7 @@ function App() {
       for (let index = 0; index < payload.byteLength; index += 1) payload[index] = index % 251;
       const file = new Blob([payload], { type: 'application/octet-stream' }) as Blob & { name: string; type: string };
       Object.defineProperty(file, 'name', { value: 'grid-10mb.bin' });
-      const session = await engine.createSession({ sessionId, files: [file], pieceSize: demoPieceSize(file) });
+      const session = await engine.createSession({ sessionId, files: [file], pieceSize: calculatePieceSize(file) });
       const manifest = session.manifests[0];
       localStorage.setItem(CROSS_TAB_SESSION_KEY, JSON.stringify({ sessionId, ownerPeerId, receiverAPeerId: 'peer_receiver_a', receiverBPeerId: 'peer_receiver_b', manifest }));
       crossTabRuntimes.current.push({ transport, engine, storage });
@@ -799,8 +756,8 @@ function App() {
       const transport = new WebRTCTransport();
       const storage = new MemoryStorageAdapter();
       const engine = new PonsWarpEngine(storage, undefined, undefined, undefined, transport);
-      const file = selectedFile ?? namedBlob('PonsWarp Grid sample payload', 'sample.txt');
-      const session = await engine.createSession({ sessionId, files: [file], pieceSize: demoPieceSize(file) });
+      const file = selectedFile ?? namedBlob(DEFAULT_SAMPLE_PAYLOAD, DEFAULT_SAMPLE_FILE_NAME);
+      const session = await engine.createSession({ sessionId, files: [file], pieceSize: calculatePieceSize(file) });
       const manifest = session.manifests[0];
       const client = new BrowserSignalingClient({ url: signalingUrl() });
       const runtime: OwnerRuntime = { peerId: ownerPeerId, sessionId, client, transport, engine, peerConnections: new Map() };
@@ -981,7 +938,7 @@ function App() {
     const receiverStorage = new MemoryStorageAdapter();
     const owner = new PonsWarpEngine(ownerStorage, undefined, undefined, undefined, input.ownerTransport);
     const receiver = new PonsWarpEngine(receiverStorage, undefined, undefined, undefined, input.receiverTransport);
-    const session = await owner.createSession({ sessionId: input.sessionId, files: [input.file], pieceSize: demoPieceSize(input.file) });
+    const session = await owner.createSession({ sessionId: input.sessionId, files: [input.file], pieceSize: calculatePieceSize(input.file) });
     const manifest = session.manifests[0];
     pushLog(`Sender created ${manifest.pieceCount} pieces for ${manifest.name}.`);
     await receiver.joinSession(session.sessionId, [manifest]);

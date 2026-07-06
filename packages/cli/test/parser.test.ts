@@ -13,7 +13,7 @@ describe('PonsWarp CLI parser', () => {
     expect(parseCliArgs(['send', 'demo.bin'])).toMatchObject({
       command: 'send',
       file: 'demo.bin',
-      signal: 'ws://127.0.0.1:8787/ws',
+      signal: 'auto',
       listen: '127.0.0.1:0',
       pieceSize: 1024 * 1024,
       keepOpen: false
