@@ -222,12 +222,13 @@ export async function runJoin(command: JoinCommand): Promise<number> {
       const scheduled = await engine.requestNextGridPiece(manifest.fileId, { ownerPeerId: descriptor.ownerPeerId, candidatePeers: [peerDescriptor.peerId, descriptor.ownerPeerId] });
       if (scheduled.type !== 'scheduled') throw new Error(`No piece scheduled for CLI grid transfer: ${scheduled.reason}`);
       scheduledPeerId = scheduled.peerId;
+      providerPieces.set(scheduledPeerId, (providerPieces.get(scheduledPeerId) ?? 0) + 1);
     } else {
-      const scheduled = await engine.requestNextPiece(descriptor.ownerPeerId, manifest.fileId);
-      if (!scheduled) throw new Error('No piece scheduled for CLI direct transfer');
-      scheduledPeerId = scheduled.peerId;
+      const scheduled = await engine.requestPieceWindow(descriptor.ownerPeerId, manifest.fileId, { maxInFlight: command.transferWindow });
+      if (scheduled.length === 0 && engine.getOutstandingRequestCount(manifest.fileId, descriptor.ownerPeerId) === 0) throw new Error('No piece scheduled for CLI direct transfer');
+      scheduledPeerId = descriptor.ownerPeerId;
+      if (scheduled.length > 0) providerPieces.set(scheduledPeerId, (providerPieces.get(scheduledPeerId) ?? 0) + scheduled.length);
     }
-    providerPieces.set(scheduledPeerId, (providerPieces.get(scheduledPeerId) ?? 0) + 1);
     progress = await waitForProgress(engine, manifest.fileId, before);
     renderProgress(progress);
   }
@@ -333,12 +334,18 @@ function safeStorageKey(value: string): string {
 }
 
 async function bestEffortCreateSignalingRoom(signalUrl: string, ownerPeerId: PeerId, sessionId: SessionId, files: SessionFileDescriptor[]): Promise<void> {
-  await withTimeout(async () => {
-    const client = new BrowserSignalingClient({ url: resolveSignalUrl(signalUrl), reconnectDelaysMs: [] });
-    await client.connect();
-    client.createSession({ sessionId, ownerPeerId, files, mode: 'grid' });
-    await client.close();
-  }, 250).catch(() => undefined);
+  if (signalUrl === 'auto') return;
+  const client = new BrowserSignalingClient({ url: resolveSignalUrl(signalUrl), reconnectDelaysMs: [] });
+  try {
+    await withTimeout(async () => {
+      await client.connect();
+      client.createSession({ sessionId, ownerPeerId, files, mode: 'grid' });
+    }, 250);
+  } catch {
+    // Signaling is best-effort for direct CLI descriptors.
+  } finally {
+    await client.close().catch(() => undefined);
+  }
 }
 
 function resolveSignalUrl(signalUrl: string): string {
@@ -350,12 +357,18 @@ function resolveSignalUrl(signalUrl: string): string {
 }
 
 async function bestEffortJoinSignalingRoom(signalUrl: string, sessionId: SessionId, peerId: PeerId): Promise<void> {
-  await withTimeout(async () => {
-    const client = new BrowserSignalingClient({ url: resolveSignalUrl(signalUrl), reconnectDelaysMs: [] });
-    await client.connect();
-    client.joinSession({ sessionId, peerId, role: 'receiver' });
-    await client.close();
-  }, 250).catch(() => undefined);
+  if (signalUrl === 'auto') return;
+  const client = new BrowserSignalingClient({ url: resolveSignalUrl(signalUrl), reconnectDelaysMs: [] });
+  try {
+    await withTimeout(async () => {
+      await client.connect();
+      client.joinSession({ sessionId, peerId, role: 'receiver' });
+    }, 250);
+  } catch {
+    // Signaling is best-effort for direct CLI descriptors.
+  } finally {
+    await client.close().catch(() => undefined);
+  }
 }
 
 async function withTimeout<T>(operation: () => Promise<T>, timeoutMs: number): Promise<T> {

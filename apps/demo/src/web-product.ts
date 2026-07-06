@@ -20,3 +20,15 @@ export function createShareCode(): string {
 export function isLocalShareMatch(activeCode: string | undefined, requestedCode: string): boolean {
   return Boolean(activeCode && activeCode.toUpperCase() === requestedCode.toUpperCase());
 }
+
+export interface ReceiveMetadataCandidate {
+  fileName?: string;
+  sizeBytes?: number;
+}
+
+export function resolveReceiveDisplayMetadata(localShare: ReceiveMetadataCandidate | null | undefined, coordinatorShare: ReceiveMetadataCandidate | null | undefined): { fileName: string; sizeBytes?: number } {
+  return {
+    fileName: localShare?.fileName ?? coordinatorShare?.fileName ?? 'Shared file',
+    sizeBytes: localShare?.sizeBytes ?? coordinatorShare?.sizeBytes
+  };
+}

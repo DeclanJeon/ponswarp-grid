@@ -59,6 +59,16 @@ describe('PonsWarp CLI parser', () => {
     });
   });
 
+  it('parses explicit join transfer windows and rejects non-positive windows', () => {
+    expect(parseCliArgs(['join', 'sess_1', '--transfer-window', '3'])).toMatchObject({
+      command: 'join',
+      session: 'sess_1',
+      transferWindow: 3
+    });
+
+    expect(() => parseCliArgs(['join', 'sess_1', '--transfer-window', '0'])).toThrow(/positive integer/);
+  });
+
   it('parses serve-signal status and clean', () => {
     expect(parseCliArgs(['serve-signal'])).toEqual({ command: 'serve-signal', host: '0.0.0.0', port: 8787 });
     expect(parseCliArgs(['serve-signal', '--host', '127.0.0.1', '--port', '9999'])).toEqual({ command: 'serve-signal', host: '127.0.0.1', port: 9999 });

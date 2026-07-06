@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto';
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import type { IncomingMessage, Server as HttpServer, ServerResponse } from 'node:http';
 import { createServer as createHttpsServer } from 'node:https';
 import { readFileSync } from 'node:fs';
-import type { Socket } from 'node:net';
+import { createServer as createTcpServer, type Server as TcpServer, type Socket } from 'node:net';
 import type { BinaryFrame, PeerId, Transport, TransportMessage, TransportMessageHandler, BinaryFrameHandler, Unsubscribe } from '@ponswarp/core';
 
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
@@ -64,7 +64,7 @@ export class NodeWebSocketTransport implements Transport {
   private readonly messageHandlers = new Set<TransportMessageHandler>();
   private readonly binaryHandlers = new Set<BinaryFrameHandler>();
   private readonly connections = new Map<PeerId, PeerConnection>();
-  private server: Server | null = null;
+  private server: HttpServer | TcpServer | null = null;
   private endpointUrl: string | null = null;
 
   constructor(options: NodeWebSocketTransportOptions) {
@@ -81,14 +81,14 @@ export class NodeWebSocketTransport implements Transport {
       response.writeHead(404);
       response.end('PonsWarp peer data endpoint');
     };
-    const server = this.options.tls
+    const server: HttpServer | TcpServer = this.options.tls
       ? createHttpsServer({
           cert: readFileSync(this.options.tls.cert, 'utf-8'),
           key: readFileSync(this.options.tls.key, 'utf-8'),
           ca: this.options.tls.ca ? readFileSync(this.options.tls.ca, 'utf-8') : undefined
         }, handler)
-      : createServer(handler);
-    server.on('upgrade', (request, socket) => this.handleUpgrade(request, socket as Socket));
+      : createTcpServer(socket => this.handleRawSocket(socket));
+    if (this.options.tls) server.on('upgrade', (request, socket) => this.handleUpgrade(request, socket as Socket));
     await new Promise<void>((resolve, reject) => {
       server.once('error', reject);
       server.listen(this.requestedPort, this.host, () => {
@@ -175,6 +175,29 @@ export class NodeWebSocketTransport implements Transport {
       socket.destroy();
       return;
     }
+    this.acceptSocketConnection(from, key, socket);
+  }
+
+  private handleRawSocket(socket: Socket): void {
+    let pending = Buffer.alloc(0);
+    const onHandshakeData = (chunk: Buffer): void => {
+      pending = Buffer.concat([pending, chunk]);
+      const headerEnd = pending.indexOf('\r\n\r\n');
+      if (headerEnd === -1) return;
+      socket.removeListener('data', onHandshakeData);
+      const handshake = parseRawUpgradeRequest(pending.subarray(0, headerEnd).toString('utf8'));
+      if (!handshake.from || !handshake.key) {
+        socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      this.acceptSocketConnection(handshake.from, handshake.key, socket, pending.subarray(headerEnd + 4));
+    };
+    socket.on('data', onHandshakeData);
+    socket.on('error', () => socket.destroy());
+  }
+
+  private acceptSocketConnection(from: PeerId, key: string, socket: Socket, initialData = Buffer.alloc(0)): void {
     const accept = createHash('sha1').update(`${key}${WS_GUID}`).digest('base64');
     socket.write([
       'HTTP/1.1 101 Switching Protocols',
@@ -185,18 +208,29 @@ export class NodeWebSocketTransport implements Transport {
     ].join('\r\n'));
     const connection: SocketConnection = { kind: 'socket', socket, open: true };
     this.connections.set(from, connection);
-    let pending = Buffer.alloc(0);
+    let pending = Buffer.from(initialData);
+    const parsePending = (): void => {
+      const parsed = parseFrames(pending);
+      pending = Buffer.from(parsed.remaining);
+      for (const frame of parsed.frames) this.dispatchFrame(from, frame.opcode, frame.payload);
+    };
     socket.on('data', chunk => {
       try {
         pending = Buffer.concat([pending, chunk]);
-        const parsed = parseFrames(pending);
-        pending = Buffer.from(parsed.remaining);
-        for (const frame of parsed.frames) this.dispatchFrame(from, frame.opcode, frame.payload);
+        parsePending();
       } catch {
         pending = Buffer.alloc(0);
         void this.close(from);
       }
     });
+    if (pending.byteLength > 0) {
+      try {
+        parsePending();
+      } catch {
+        pending = Buffer.alloc(0);
+        void this.close(from);
+      }
+    }
     socket.on('close', () => {
       connection.open = false;
       if (this.connections.get(from) === connection) this.connections.delete(from);
@@ -235,6 +269,7 @@ export class NodeWebSocketTransport implements Transport {
     }
   }
 
+
   private dispatchFrame(peerId: PeerId, opcode: number, payload: Buffer): void {
     if (opcode === 0x8) {
       void this.close(peerId);
@@ -261,6 +296,21 @@ export class NodeWebSocketTransport implements Transport {
     if (!this.endpointUrl) throw new Error('NodeWebSocketTransport.listen() must be called first');
     return this.endpointUrl;
   }
+}
+
+function parseRawUpgradeRequest(header: string): { from?: PeerId; key?: string } {
+  const [requestLine = '', ...lines] = header.split('\r\n');
+  const [, target = '/'] = requestLine.split(' ');
+  const headers = new Map<string, string>();
+  for (const line of lines) {
+    const separator = line.indexOf(':');
+    if (separator === -1) continue;
+    headers.set(line.slice(0, separator).trim().toLowerCase(), line.slice(separator + 1).trim());
+  }
+  const host = headers.get('host') ?? '127.0.0.1';
+  const url = new URL(target, `http://${host}`);
+  const from = url.searchParams.get('from') as PeerId | null;
+  return { from: from ?? undefined, key: headers.get('sec-websocket-key') };
 }
 
 function readPeerIdFromRequest(request: IncomingMessage): PeerId | undefined {

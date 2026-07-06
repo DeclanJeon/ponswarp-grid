@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { createShareCode, formatBytes, isLocalShareMatch, parseShareCode } from '../src/web-product';
+import { createShareCode, formatBytes, isLocalShareMatch, parseShareCode, resolveReceiveDisplayMetadata } from '../src/web-product';
 
 describe('web product helpers', () => {
   it('extracts a share code from links and custom URLs', () => {
@@ -9,6 +9,26 @@ describe('web product helpers', () => {
     expect(parseShareCode('DEMO-1A2B')).toBe('DEMO-1A2B');
     expect(parseShareCode('not-a-code')).toBe('');
     expect(parseShareCode('')).toBe('');
+  });
+
+  it('keeps QR get links parseable when they include an embedded session query', () => {
+    const qrLink = 'https://grid.ponslink.com/#/get/C0DE-1234?session=sess_signal_123';
+
+    expect(parseShareCode(qrLink)).toBe('C0DE-1234');
+  });
+
+  it('uses only real receive metadata instead of fabricated archive details', () => {
+    expect(resolveReceiveDisplayMetadata(null, null)).toEqual({
+      fileName: 'Shared file',
+      sizeBytes: undefined
+    });
+    expect(resolveReceiveDisplayMetadata(null, {
+      fileName: 'field-recording.mov',
+      sizeBytes: 734_003_200
+    })).toEqual({
+      fileName: 'field-recording.mov',
+      sizeBytes: 734_003_200
+    });
   });
 
   it('formats small and large file sizes for the share/get cards', () => {

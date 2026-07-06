@@ -91,7 +91,7 @@ describe('ponswarp CLI direct transfer', () => {
 
       firstReceiver = spawnCli(['join', joinUrl, '--out', outDir], repo);
       const firstOutput = collect(firstReceiver);
-      await waitForLine(firstOutput.stdout, /^Progress: 1\//);
+      await waitForLine(firstOutput.stdout, /^Progress: [1-9]\d*\//);
       firstReceiver.kill('SIGTERM');
       await waitForExit(firstReceiver).catch(() => null);
 

@@ -27,6 +27,11 @@ const fileId = 'file_1' as FileId;
 const sessionId = 'sess_1' as SessionId;
 const ownerPeerId = 'peer_owner' as PeerId;
 
+interface FakeTransportOptions {
+  maxBinaryFrameBytes?: number;
+  beforeDeliverBinary?: (frame: ArrayBuffer) => Promise<void> | void;
+}
+
 class FakeTransport implements Transport {
   private readonly messageHandlers = new Set<(peerId: PeerId, message: TransportMessage) => void>();
   private readonly binaryHandlers = new Set<(peerId: PeerId, frame: ArrayBuffer) => void>();
@@ -35,7 +40,7 @@ class FakeTransport implements Transport {
   readonly sentBinary: ArrayBuffer[] = [];
   readonly maxBinaryFrameBytes?: number;
 
-  constructor(readonly selfId: PeerId, options: { maxBinaryFrameBytes?: number } = {}) {
+  constructor(readonly selfId: PeerId, private readonly options: FakeTransportOptions = {}) {
     this.maxBinaryFrameBytes = options.maxBinaryFrameBytes;
   }
 
@@ -56,6 +61,7 @@ class FakeTransport implements Transport {
       throw new Error(`Binary frame ${buffer.byteLength} exceeds transport limit ${this.maxBinaryFrameBytes}`);
     }
     this.sentBinary.push(buffer);
+    await this.options.beforeDeliverBinary?.(buffer);
     this.peers.get(peerId)?.emitBinary(this.selfId, buffer);
   }
 
@@ -567,6 +573,75 @@ describe('core engine foundations', () => {
         maxRetries: 3
       }
     ]);
+  });
+
+  it('tops up a direct request window without verifying outstanding pieces', async () => {
+    const receiverPeerId = 'peer_receiver_window' as PeerId;
+    const receiverTransport = new FakeTransport(receiverPeerId);
+    const receiverStorage = new MemoryStorageAdapter();
+    const receiver = new PonsWarpEngine(receiverStorage, undefined, undefined, undefined, receiverTransport);
+    const manifest = await new ManifestGenerator().create(new Blob(['abcdef']), { pieceSize: 2, fileId });
+    await receiver.joinSession(sessionId, [manifest]);
+
+    const scheduled = await receiver.requestPieceWindow(ownerPeerId, manifest.fileId, { maxInFlight: 2 });
+    expect(scheduled.map(item => item.piece.index)).toEqual([0, 1]);
+    expect(sentMessagesOfType<{ type: 'PIECE_REQUEST'; pieceIndex: number }>(receiverTransport, 'PIECE_REQUEST').map(message => message.pieceIndex)).toEqual([0, 1]);
+    expect(receiver.getProgress(manifest.fileId)).toMatchObject({
+      verifiedPieces: 0,
+      bytesTransferred: 0,
+      totalPieces: 3
+    });
+    expect(await receiverStorage.hasPiece(manifest.fileId, 0)).toBe(false);
+    expect(await receiverStorage.hasPiece(manifest.fileId, 1)).toBe(false);
+
+    const alreadyFull = await receiver.requestPieceWindow(ownerPeerId, manifest.fileId, { maxInFlight: 2 });
+    expect(alreadyFull).toEqual([]);
+    expect(sentMessagesOfType<{ type: 'PIECE_REQUEST' }>(receiverTransport, 'PIECE_REQUEST')).toHaveLength(2);
+  });
+
+  it('completes same-peer pipelined requests without invalid chunk rejection', async () => {
+    let releaseFirstBinary!: () => void;
+    const firstBinaryGate = new Promise<void>(resolve => {
+      releaseFirstBinary = resolve;
+    });
+    let heldFirstBinary = false;
+    const ownerTransport = new FakeTransport(ownerPeerId, {
+      beforeDeliverBinary: async () => {
+        if (heldFirstBinary) return;
+        heldFirstBinary = true;
+        await firstBinaryGate;
+      }
+    });
+    const receiverPeerId = 'peer_receiver_window_chunks' as PeerId;
+    const receiverTransport = new FakeTransport(receiverPeerId);
+    ownerTransport.link(receiverPeerId, receiverTransport);
+    receiverTransport.link(ownerPeerId, ownerTransport);
+
+    const payload = new TextEncoder().encode('abc');
+    const owner = new PonsWarpEngine(new MemoryStorageAdapter(), undefined, undefined, undefined, ownerTransport);
+    const receiverStorage = new MemoryStorageAdapter();
+    const receiver = new PonsWarpEngine(receiverStorage, undefined, undefined, undefined, receiverTransport);
+    const session = await owner.createSession({ sessionId, files: [new Blob([payload])], pieceSize: 2 });
+    const manifest = session.manifests[0];
+    await receiver.joinSession(sessionId, [manifest]);
+
+    const scheduled = await receiver.requestPieceWindow(ownerPeerId, manifest.fileId, { maxInFlight: 2 });
+    expect(scheduled.map(item => item.piece.index)).toEqual([0, 1]);
+    await flushAsync();
+
+    releaseFirstBinary();
+    await flushAsync();
+
+    expect(sentMessagesOfType<{ type: 'PIECE_REJECT'; reason: string }>(receiverTransport, 'PIECE_REJECT')).toEqual([]);
+    expect(sentMessagesOfType<{ type: 'PIECE_ACK' }>(receiverTransport, 'PIECE_ACK')).toHaveLength(2);
+    expect(receiver.getProgress(manifest.fileId)).toMatchObject({
+      verifiedPieces: 2,
+      totalPieces: 2,
+      bytesTransferred: payload.byteLength,
+      progress: 100
+    });
+    expect(await receiverStorage.hasPiece(manifest.fileId, 0)).toBe(true);
+    expect(await receiverStorage.hasPiece(manifest.fileId, 1)).toBe(true);
   });
 
   it('runs request, chunk, ACK, storage, and resume flow over a transport', async () => {

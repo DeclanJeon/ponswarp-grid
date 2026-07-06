@@ -16,8 +16,8 @@ import {
 } from '@ponswarp/core';
 import { BrowserSignalingClient, SIGNALING_PROTOCOL, PROTOCOL_VERSION, type SignalingEnvelope } from '@ponswarp/signaling';
 import { WebRTCTransport } from '@ponswarp/webrtc';
-import { createShareCode, formatBytes, isLocalShareMatch, parseShareCode } from './web-product';
-import { DEFAULT_STUN_URL, SHARE_EXPIRY_MS, PIECE_PROGRESS_TIMEOUT_MS, PROGRESS_POLL_INTERVAL_MS, DEFAULT_SAMPLE_FILE_NAME, DEFAULT_SAMPLE_PAYLOAD, calculatePieceSize } from './constants';
+import { createShareCode, formatBytes, isLocalShareMatch, parseShareCode, resolveReceiveDisplayMetadata } from './web-product';
+import { DEFAULT_STUN_URL, SHARE_EXPIRY_MS, PIECE_PROGRESS_TIMEOUT_MS, PROGRESS_POLL_INTERVAL_MS, DEFAULT_BROWSER_TRANSFER_WINDOW, MAX_BROWSER_TRANSFER_WINDOW, DEFAULT_SAMPLE_FILE_NAME, DEFAULT_SAMPLE_PAYLOAD, calculatePieceSize } from './constants';
 import { DemoTransport, BroadcastDemoTransport } from './demo-transports';
 
 
@@ -46,7 +46,7 @@ type WebShareState =
 type WebGetState =
   | { status: 'idle'; input: string }
   | { status: 'resolving'; input: string }
-  | { status: 'ready'; code: string; fileName: string; sizeBytes: number; devicesOnline: number; helpText: string; sessionId?: SessionId }
+  | { status: 'ready'; code: string; fileName: string; sizeBytes?: number; devicesOnline: number; helpText: string; sessionId?: SessionId }
   | { status: 'downloading'; code: string; fileName: string; progress: number; speedBps: number; securityLabel: string }
   | { status: 'complete'; code: string; outputName: string; verificationLabel: 'fully verified' | 'secure transfer complete'; downloadUrl?: string }
   | { status: 'error'; input: string; code: string; message: string; suggestedAction?: string };
@@ -110,6 +110,12 @@ function signalingUrl(): string {
   if (explicit) return explicit;
   const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
   return `${scheme}//${location.host}/ws`;
+}
+
+function transferWindowSize(): number {
+  const explicit = Number(new URLSearchParams(location.search).get('transferWindow'));
+  if (!Number.isSafeInteger(explicit) || explicit <= 0) return DEFAULT_BROWSER_TRANSFER_WINDOW;
+  return Math.min(explicit, MAX_BROWSER_TRANSFER_WINDOW);
 }
 let runtimeRtcConfig: RTCConfiguration | null = null;
 
@@ -309,7 +315,7 @@ function App() {
   useEffect(() => () => { if (webDownloadUrl.current) URL.revokeObjectURL(webDownloadUrl.current); }, []);
   useEffect(() => {
     const match = location.hash.match(/^#\/get\/(.+)$/);
-    if (match?.[1]) setWebGet({ status: 'idle', input: parseShareCode(match[1]) || match[1] });
+    if (match?.[1]) setWebGet({ status: 'idle', input: `${location.origin}${location.pathname}${location.search}${location.hash}` });
   }, []);
   useEffect(() => {
     const match = location.hash.match(/^#\/join\/(.+)$/);
@@ -425,11 +431,11 @@ function App() {
     setWebGet({ status: 'resolving', input });
     await delay(120);
     const localShare = webShare.status === 'serving' && isLocalShareMatch(webShare.code, code) ? webShare : null;
-    const coordinatorShare = !localShare && !embeddedSessionId ? await resolveCoordinatorBrowserShare(code) : null;
+    const coordinatorShare = !localShare ? await resolveCoordinatorBrowserShare(code) : null;
     const sessionId = embeddedSessionId ?? localShare?.sessionId ?? coordinatorShare?.sessionId;
-    const fileName = localShare?.fileName ?? coordinatorShare?.fileName ?? 'shared-file.zip';
-    const sizeBytes = localShare?.sizeBytes ?? coordinatorShare?.sizeBytes ?? 4_200_000_000;
-    const helpText = sessionId ? 'Ready for a real browser WebRTC transfer with verified resume/download.' : 'Remote source planning state. The app path handles very large files and offline resume.';
+    const metadata = resolveReceiveDisplayMetadata(localShare, coordinatorShare);
+    const { fileName, sizeBytes } = metadata;
+    const helpText = sessionId ? 'Ready for a real browser WebRTC transfer with verified resume/download. File details will be verified with the sender before download starts.' : 'Remote source planning state. The app path handles very large files and offline resume.';
     setWebGet({ status: 'ready', code, fileName, sizeBytes, devicesOnline: localShare?.devicesOnline ?? coordinatorShare?.devicesOnline ?? 1, helpText, sessionId });
   }
 
@@ -872,12 +878,13 @@ function App() {
     if (!manifest) throw new Error('Receiver did not receive a manifest');
     const joined = await runtime.engine.joinSession(runtime.sessionId, [manifest]);
     let progress = runtime.engine.getProgress(manifest.fileId);
+    const transferWindow = transferWindowSize();
     while (progress.verifiedPieces < progress.totalPieces) {
       const before = progress.verifiedPieces;
-      const scheduled = await runtime.engine.requestNextPiece(runtime.ownerPeerId, manifest.fileId);
-      if (!scheduled) throw new Error(`No provider scheduled piece after ${progress.verifiedPieces}/${progress.totalPieces} verified`);
+      const scheduled = await runtime.engine.requestPieceWindow(runtime.ownerPeerId, manifest.fileId, { maxInFlight: transferWindow });
+      if (scheduled.length === 0 && runtime.engine.getOutstandingRequestCount(manifest.fileId, runtime.ownerPeerId) === 0) throw new Error(`No provider scheduled piece after ${progress.verifiedPieces}/${progress.totalPieces} verified`);
       progress = await waitForPieceProgress(runtime.engine, manifest.fileId, before);
-      pushLog(`Signaled WebRTC transferred piece ${progress.verifiedPieces}/${progress.totalPieces} verified.`);
+      pushLog(`Signaled WebRTC transferred piece ${progress.verifiedPieces}/${progress.totalPieces} verified (${scheduled.length} request(s) queued, window ${transferWindow}).`);
       if (globalThis.localStorage?.getItem('ponswarp-partial-resume') === '1' && progress.verifiedPieces >= Math.ceil(progress.totalPieces / 2)) {
         setState(current => ({ ...current, status: 'ready', manifest, progress, restoredProgress: progress, storageKind: storageKinds.current.get(runtime.sessionId), shareUrl: currentJoinUrl(runtime.sessionId), logs: [...current.logs, `Partial resume seed persisted at ${progress.verifiedPieces}/${progress.totalPieces} pieces.`] }));
         return;
@@ -944,12 +951,13 @@ function App() {
     await receiver.joinSession(session.sessionId, [manifest]);
     pushLog(input.initialLog);
     let progress = receiver.getProgress(manifest.fileId);
+    const transferWindow = transferWindowSize();
     while (progress.verifiedPieces < progress.totalPieces) {
       const before = progress.verifiedPieces;
-      const scheduled = await receiver.requestNextPiece(input.ownerPeerId, manifest.fileId);
-      if (!scheduled) break;
+      const scheduled = await receiver.requestPieceWindow(input.ownerPeerId, manifest.fileId, { maxInFlight: transferWindow });
+      if (scheduled.length === 0 && receiver.getOutstandingRequestCount(manifest.fileId, input.ownerPeerId) === 0) break;
       progress = await waitForPieceProgress(receiver, manifest.fileId, before);
-      pushLog(`${input.logPrefix} piece ${progress.verifiedPieces}/${progress.totalPieces} verified.`);
+      pushLog(`${input.logPrefix} piece ${progress.verifiedPieces}/${progress.totalPieces} verified (${scheduled.length} request(s) queued, window ${transferWindow}).`);
     }
     const restoredReceiver = new PonsWarpEngine(receiverStorage);
     await restoredReceiver.joinSession(session.sessionId);
@@ -1620,7 +1628,7 @@ function App() {
             )}
             {webGet.status === 'ready' && (
               <div data-testid="receive-ready" className="status-card">
-                <p><strong>{webGet.fileName}</strong> · {formatBytes(webGet.sizeBytes)}</p>
+                <p><strong>{webGet.fileName}</strong> · {typeof webGet.sizeBytes === 'number' ? formatBytes(webGet.sizeBytes) : 'size verifying with sender'}</p>
                 <p style={{ color: '#8fe9ff' }}>{webGet.devicesOnline} device online · secure transfer</p>
                 {webGet.helpText.startsWith('Remote') ? (
                   <p style={{ borderRadius: 16, padding: '14px 16px', background: 'rgba(37, 126, 255, 0.18)', color: '#d9f4ff', fontWeight: 800 }}>Open the app or CLI with this code to continue.</p>

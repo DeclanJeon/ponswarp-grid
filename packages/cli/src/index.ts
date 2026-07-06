@@ -26,6 +26,7 @@ export interface JoinCommand extends BaseCommand {
   outDir: string;
   seedAfterComplete: boolean;
   maxPeers: number;
+  transferWindow: number;
 }
 
 export interface ServeSignalCommand extends BaseCommand {
@@ -96,6 +97,7 @@ const DEFAULT_LISTEN = '127.0.0.1:0';
 const DEFAULT_PIECE_SIZE = 1024 * 1024;
 const DEFAULT_OUT_DIR = '.';
 const DEFAULT_MAX_PEERS = 8;
+const DEFAULT_TRANSFER_WINDOW = 1;
 const DEFAULT_COORDINATOR = process.env.PONSWARP_COORDINATOR_URL ?? 'https://grid.ponslink.com';
 const TCP_PORT_MAX = 65535;
 
@@ -141,7 +143,7 @@ function parseSend(args: readonly string[]): SendCommand {
 
 function parseJoin(args: readonly string[]): JoinCommand {
   const positionals: string[] = [];
-  const options = parseOptions(args, positionals, new Set(['signal', 'listen', 'advertise', 'out', 'peer', 'seed-after-complete', 'max-peers']));
+  const options = parseOptions(args, positionals, new Set(['signal', 'listen', 'advertise', 'out', 'peer', 'seed-after-complete', 'max-peers', 'transfer-window']));
   const session = positionals[0];
   if (!session) throw new CliUsageError('join requires <session-or-url>');
   if (positionals.length > 1) throw new CliUsageError(`join accepts one session, got ${positionals.length}`);
@@ -154,7 +156,8 @@ function parseJoin(args: readonly string[]): JoinCommand {
     outDir: stringOption(options, 'out', DEFAULT_OUT_DIR),
     peer: optionalStringOption(options, 'peer'),
     seedAfterComplete: booleanOption(options, 'seed-after-complete'),
-    maxPeers: positiveIntegerOption(options, 'max-peers', DEFAULT_MAX_PEERS)
+    maxPeers: positiveIntegerOption(options, 'max-peers', DEFAULT_MAX_PEERS),
+    transferWindow: positiveIntegerOption(options, 'transfer-window', DEFAULT_TRANSFER_WINDOW)
   };
 }
 
@@ -372,7 +375,7 @@ export function usage(): string {
 
 Usage:
   ponswarp send <file> [--signal auto|ws://host:port/ws] [--listen host:port] [--advertise ws://host:port] [--piece-size bytes] [--session id] [--keep-open]
-  ponswarp join <session-or-url> --out <dir> [--signal auto|ws://host:port/ws] [--listen host:port] [--advertise ws://host:port] [--peer ponswarp-peer://...] [--seed-after-complete] [--max-peers n]
+  ponswarp join <session-or-url> --out <dir> [--signal auto|ws://host:port/ws] [--listen host:port] [--advertise ws://host:port] [--peer ponswarp-peer://...] [--seed-after-complete] [--max-peers n] [--transfer-window n]
   ponswarp serve-signal [--host 0.0.0.0] [--port 8787]
   ponswarp node start --workspace <id> --node-id <id> --public-key <key> [--coordinator http://host] [--display-name name] [--direct-join ponswarp://join/...] [--json] [--dry-run]
   ponswarp publish <file> --workspace <id> --node-id <id> [--coordinator http://host] [--piece-size bytes] [--json] [--dry-run]

@@ -253,6 +253,10 @@ export interface GridScheduleOptions {
   now?: number;
 }
 
+export interface PieceWindowOptions {
+  maxInFlight?: number;
+}
+
 export type GridScheduleResult =
   | { type: 'scheduled'; pieceIndex: number; peerId: PeerId; requestId: string; reason: 'rarest_first' | 'fastest_peer' | 'owner_fallback' | 'resume_missing' | 'retry_after_reject' }
   | { type: 'idle'; reason: 'complete' | 'no_missing_piece' | 'no_available_peer' | 'parallel_limit' }
@@ -812,6 +816,7 @@ export class PonsWarpEngine {
   private readonly pendingChunks = new Map<PeerId, PieceChunkHeaderMessage>();
   private readonly incomingChunks = new Map<string, IncomingChunkAssembly>();
   private readonly outstandingRequests = new Map<string, { fileId: FileId; pieceIndex: number; peerId: PeerId; requestedAt: number; gridOptions?: GridScheduleOptions }>();
+  private readonly pieceSendQueues = new Map<PeerId, Promise<void>>();
   private readonly availability = new PieceAvailabilityTable();
   private readonly peerHealth = new PeerHealthTable();
   private readonly localPieceMapGenerations = new Map<FileId, number>();
@@ -893,6 +898,22 @@ export class PonsWarpEngine {
     await this.sendPieceRequest(peerId, fileId, scheduled.piece.index, requestId);
     await this.persistState();
     return scheduled;
+  }
+
+  async requestPieceWindow(peerId: PeerId, fileId: FileId, options: PieceWindowOptions = {}): Promise<ScheduledPiece[]> {
+    const maxInFlight = options.maxInFlight ?? 1;
+    assertPositiveSafeInteger(maxInFlight, 'maxInFlight');
+    const scheduled: ScheduledPiece[] = [];
+    while (this.countOutstandingRequests(fileId, peerId) < maxInFlight) {
+      const next = await this.requestNextPiece(peerId, fileId);
+      if (!next) break;
+      scheduled.push(next);
+    }
+    return scheduled;
+  }
+
+  getOutstandingRequestCount(fileId: FileId, peerId?: PeerId): number {
+    return this.countOutstandingRequests(fileId, peerId);
   }
 
   exportPieceMapBroadcast(fileId: FileId): PieceMapBroadcast {
@@ -1117,7 +1138,7 @@ export class PonsWarpEngine {
     this.knownPeers.add(peerId);
     const type = message.type;
     if (type === 'PIECE_REQUEST') {
-      await this.sendRequestedPiece(peerId, this.parsePieceRequest(message));
+      await this.queueRequestedPiece(peerId, this.parsePieceRequest(message));
       return;
     }
     if (type === 'PIECE_MAP') {
@@ -1255,6 +1276,17 @@ export class PonsWarpEngine {
     await this.persistState();
   }
 
+  private async queueRequestedPiece(peerId: PeerId, request: PieceRequestMessage): Promise<void> {
+    const previous = this.pieceSendQueues.get(peerId) ?? Promise.resolve();
+    const next = previous.catch(() => undefined).then(() => this.sendRequestedPiece(peerId, request));
+    this.pieceSendQueues.set(peerId, next);
+    try {
+      await next;
+    } finally {
+      if (this.pieceSendQueues.get(peerId) === next) this.pieceSendQueues.delete(peerId);
+    }
+  }
+
   private async sendRequestedPiece(peerId: PeerId, request: PieceRequestMessage): Promise<void> {
     const manifest = this.requireManifest(request.fileId);
     const piece = manifest.pieces[request.pieceIndex];
@@ -1386,6 +1418,14 @@ export class PonsWarpEngine {
 
   private createRequestId(fileId: FileId, pieceIndex: number): string {
     return `req_${fileId}_${pieceIndex}_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  }
+
+  private countOutstandingRequests(fileId: FileId, peerId?: PeerId): number {
+    let count = 0;
+    for (const request of this.outstandingRequests.values()) {
+      if (request.fileId === fileId && (!peerId || request.peerId === peerId)) count += 1;
+    }
+    return count;
   }
 
   private registerManifest(manifest: FileManifest): void {
