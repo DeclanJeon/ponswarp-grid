@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   CORE_PROTOCOL_VERSION,
   EventBus,
@@ -33,8 +33,11 @@ class FakeTransport implements Transport {
   private readonly peers = new Map<PeerId, FakeTransport>();
   readonly sentMessages: TransportMessage[] = [];
   readonly sentBinary: ArrayBuffer[] = [];
+  readonly maxBinaryFrameBytes?: number;
 
-  constructor(readonly selfId: PeerId) {}
+  constructor(readonly selfId: PeerId, options: { maxBinaryFrameBytes?: number } = {}) {
+    this.maxBinaryFrameBytes = options.maxBinaryFrameBytes;
+  }
 
   link(peerId: PeerId, peer: FakeTransport): void {
     this.peers.set(peerId, peer);
@@ -49,6 +52,9 @@ class FakeTransport implements Transport {
 
   async sendBinary(peerId: PeerId, frame: BinaryFrame): Promise<void> {
     const buffer = frame instanceof ArrayBuffer ? frame : frame.buffer.slice(frame.byteOffset, frame.byteOffset + frame.byteLength);
+    if (this.maxBinaryFrameBytes !== undefined && buffer.byteLength > this.maxBinaryFrameBytes) {
+      throw new Error(`Binary frame ${buffer.byteLength} exceeds transport limit ${this.maxBinaryFrameBytes}`);
+    }
     this.sentBinary.push(buffer);
     this.peers.get(peerId)?.emitBinary(this.selfId, buffer);
   }
@@ -76,6 +82,18 @@ class FakeTransport implements Transport {
 
 async function flushAsync(): Promise<void> {
   for (let i = 0; i < 5; i += 1) await new Promise(resolve => setTimeout(resolve, 0));
+}
+
+function makeSyntheticBytes(size: number): Uint8Array {
+  const bytes = new Uint8Array(size);
+  for (let index = 0; index < bytes.length; index += 1) bytes[index] = (index * 31 + 17) & 0xff;
+  return bytes;
+}
+
+function sentMessagesOfType<T extends { type: string }>(transport: FakeTransport, type: T['type']): T[] {
+  return transport.sentMessages.filter((message): message is T =>
+    typeof message === 'object' && message !== null && 'type' in message && message.type === type
+  );
 }
 
 describe('workspace bootstrap core reuse', () => {
@@ -344,6 +362,213 @@ describe('core engine foundations', () => {
     expect(events).toEqual(['write:0:2', 'resume:1:0']);
   });
 
+  it('emits measured transfer speed telemetry for verified piece receives', async () => {
+    const providerPeerId = 'peer_speed_provider' as PeerId;
+    const receiverPeerId = 'peer_speed_receiver' as PeerId;
+    const receiverTransport = new FakeTransport(receiverPeerId);
+    const payload = new TextEncoder().encode('abcdefghij');
+    const manifest = await new ManifestGenerator().create(new Blob([payload]), { pieceSize: payload.byteLength, fileId });
+    const receiver = new PonsWarpEngine(new MemoryStorageAdapter(), undefined, undefined, undefined, receiverTransport);
+    const speedEvents: Array<{
+      type: 'transfer:speed';
+      fileId: FileId;
+      pieceIndex: number;
+      peerId: PeerId;
+      bytes: number;
+      bps: number;
+      windowMs: number;
+    }> = [];
+    receiver.on('performance', event => {
+      if (event.type === 'transfer:speed') speedEvents.push(event);
+    });
+    await receiver.joinSession(sessionId, [manifest]);
+
+    const scheduled = await receiver.requestNextGridPiece(manifest.fileId, {
+      ownerPeerId: providerPeerId,
+      candidatePeers: [providerPeerId],
+      requestLeaseMs: 10_000,
+      now: 1_000
+    });
+    if (scheduled.type !== 'scheduled') throw new Error('expected scheduled grid request');
+
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(1_250);
+    try {
+      const ack = await receiver.receivePiece({
+        fileId: manifest.fileId,
+        pieceIndex: scheduled.pieceIndex,
+        requestId: scheduled.requestId,
+        data: payload.buffer
+      });
+      expect(ack).toMatchObject({ type: 'PIECE_ACK', requestId: scheduled.requestId });
+    } finally {
+      clock.mockRestore();
+    }
+
+    expect(speedEvents).toEqual([
+      {
+        type: 'transfer:speed',
+        fileId: manifest.fileId,
+        pieceIndex: scheduled.pieceIndex,
+        peerId: providerPeerId,
+        bytes: payload.byteLength,
+        windowMs: 250,
+        bps: 40
+      }
+    ]);
+  });
+
+  it('emits retry telemetry when corrupt pieces and expired requests become retryable', async () => {
+    const corruptProviderPeerId = 'peer_retry_corrupt_provider' as PeerId;
+    const corruptReceiverPeerId = 'peer_retry_corrupt_receiver' as PeerId;
+    const corruptReceiverTransport = new FakeTransport(corruptReceiverPeerId);
+    const corruptPayload = new TextEncoder().encode('good');
+    const corruptManifest = await new ManifestGenerator().create(new Blob([corruptPayload]), { pieceSize: corruptPayload.byteLength, fileId });
+    const corruptReceiver = new PonsWarpEngine(new MemoryStorageAdapter(), undefined, undefined, undefined, corruptReceiverTransport);
+    const corruptRetryEvents: Array<{
+      type: 'transfer:retry';
+      fileId: FileId;
+      pieceIndex: number;
+      peerId: PeerId;
+      requestId: string;
+      reason: string;
+      retryCount: number;
+      maxRetries: number;
+    }> = [];
+    corruptReceiver.on('performance', event => {
+      if (event.type === 'transfer:retry') corruptRetryEvents.push(event);
+    });
+    await corruptReceiver.joinSession(sessionId, [corruptManifest]);
+
+    const corruptScheduled = await corruptReceiver.requestNextGridPiece(corruptManifest.fileId, {
+      ownerPeerId: corruptProviderPeerId,
+      candidatePeers: [corruptProviderPeerId],
+      requestLeaseMs: 10_000,
+      now: 2_000
+    });
+    if (corruptScheduled.type !== 'scheduled') throw new Error('expected scheduled grid request');
+    const reject = await corruptReceiver.receivePiece({
+      fileId: corruptManifest.fileId,
+      pieceIndex: corruptScheduled.pieceIndex,
+      requestId: corruptScheduled.requestId,
+      data: new TextEncoder().encode('xxxx').buffer
+    });
+    expect(reject).toMatchObject({ type: 'PIECE_REJECT', reason: 'hash_mismatch', requestId: corruptScheduled.requestId });
+    expect(corruptRetryEvents).toEqual([
+      {
+        type: 'transfer:retry',
+        fileId: corruptManifest.fileId,
+        pieceIndex: corruptScheduled.pieceIndex,
+        peerId: corruptProviderPeerId,
+        requestId: corruptScheduled.requestId,
+        reason: 'hash_mismatch',
+        retryCount: 1,
+        maxRetries: 3
+      }
+    ]);
+
+    const timeoutProviderPeerId = 'peer_retry_timeout_provider' as PeerId;
+    const timeoutReceiverPeerId = 'peer_retry_timeout_receiver' as PeerId;
+    const timeoutReceiverTransport = new FakeTransport(timeoutReceiverPeerId);
+    const timeoutPayload = new TextEncoder().encode('slow');
+    const timeoutManifest = await new ManifestGenerator().create(new Blob([timeoutPayload]), { pieceSize: timeoutPayload.byteLength, fileId });
+    const timeoutReceiver = new PonsWarpEngine(new MemoryStorageAdapter(), undefined, undefined, undefined, timeoutReceiverTransport);
+    const timeoutRetryEvents: Array<{
+      type: 'transfer:retry';
+      fileId: FileId;
+      pieceIndex: number;
+      peerId: PeerId;
+      requestId: string;
+      reason: string;
+      retryCount: number;
+      maxRetries: number;
+    }> = [];
+    timeoutReceiver.on('performance', event => {
+      if (event.type === 'transfer:retry') timeoutRetryEvents.push(event);
+    });
+    await timeoutReceiver.joinSession(sessionId, [timeoutManifest]);
+
+    const timeoutScheduled = await timeoutReceiver.requestNextGridPiece(timeoutManifest.fileId, {
+      ownerPeerId: timeoutProviderPeerId,
+      candidatePeers: [timeoutProviderPeerId],
+      requestLeaseMs: 10,
+      now: 3_000
+    });
+    if (timeoutScheduled.type !== 'scheduled') throw new Error('expected scheduled grid request');
+    timeoutReceiver.expireRequestLeases(3_011);
+
+    expect(timeoutRetryEvents).toEqual([
+      {
+        type: 'transfer:retry',
+        fileId: timeoutManifest.fileId,
+        pieceIndex: timeoutScheduled.pieceIndex,
+        peerId: timeoutProviderPeerId,
+        requestId: timeoutScheduled.requestId,
+        reason: 'request_timeout',
+        retryCount: 1,
+        maxRetries: 3
+      }
+    ]);
+
+    const invalidProviderPeerId = 'peer_retry_invalid_provider' as PeerId;
+    const invalidReceiverPeerId = 'peer_retry_invalid_receiver' as PeerId;
+    const invalidProviderTransport = new FakeTransport(invalidProviderPeerId);
+    const invalidReceiverTransport = new FakeTransport(invalidReceiverPeerId);
+    invalidProviderTransport.link(invalidReceiverPeerId, invalidReceiverTransport);
+    invalidReceiverTransport.link(invalidProviderPeerId, invalidProviderTransport);
+    const invalidPayload = new TextEncoder().encode('data');
+    const invalidManifest = await new ManifestGenerator().create(new Blob([invalidPayload]), { pieceSize: invalidPayload.byteLength, fileId });
+    const invalidReceiver = new PonsWarpEngine(new MemoryStorageAdapter(), undefined, undefined, undefined, invalidReceiverTransport);
+    const invalidRetryEvents: Array<{
+      type: 'transfer:retry';
+      fileId: FileId;
+      pieceIndex: number;
+      peerId: PeerId;
+      requestId: string;
+      reason: string;
+      retryCount: number;
+      maxRetries: number;
+    }> = [];
+    invalidReceiver.on('performance', event => {
+      if (event.type === 'transfer:retry') invalidRetryEvents.push(event);
+    });
+    await invalidReceiver.joinSession(sessionId, [invalidManifest]);
+
+    const invalidScheduled = await invalidReceiver.requestNextGridPiece(invalidManifest.fileId, {
+      ownerPeerId: invalidProviderPeerId,
+      candidatePeers: [invalidProviderPeerId],
+      requestLeaseMs: 10_000,
+      now: 4_000
+    });
+    if (invalidScheduled.type !== 'scheduled') throw new Error('expected scheduled grid request');
+    await invalidProviderTransport.send(invalidReceiverPeerId, {
+      type: 'PIECE_CHUNK_HEADER',
+      fileId: invalidManifest.fileId,
+      pieceIndex: invalidScheduled.pieceIndex,
+      chunkIndex: 0,
+      totalChunks: 1,
+      requestId: invalidScheduled.requestId,
+      payloadSize: invalidPayload.byteLength
+    });
+    await invalidProviderTransport.sendBinary(invalidReceiverPeerId, new TextEncoder().encode('xx').buffer);
+    await flushAsync();
+
+    expect(sentMessagesOfType<{ type: 'PIECE_REJECT'; requestId: string; reason: string }>(invalidReceiverTransport, 'PIECE_REJECT')).toEqual([
+      expect.objectContaining({ requestId: invalidScheduled.requestId, reason: 'invalid_chunk' })
+    ]);
+    expect(invalidRetryEvents).toEqual([
+      {
+        type: 'transfer:retry',
+        fileId: invalidManifest.fileId,
+        pieceIndex: invalidScheduled.pieceIndex,
+        peerId: invalidProviderPeerId,
+        requestId: invalidScheduled.requestId,
+        reason: 'invalid_chunk',
+        retryCount: 1,
+        maxRetries: 3
+      }
+    ]);
+  });
+
   it('runs request, chunk, ACK, storage, and resume flow over a transport', async () => {
     const ownerTransport = new FakeTransport(ownerPeerId);
     const receiverPeerId = 'peer_receiver' as PeerId;
@@ -509,5 +734,158 @@ describe('core engine foundations', () => {
     expect(receiver.getProgress(manifest.fileId).verifiedPieces).toBe(0);
     const requestCountAfterReject = receiverTransport.sentMessages.filter(message => typeof message === 'object' && message !== null && 'type' in message && message.type === 'PIECE_REQUEST').length;
     expect(requestCountAfterReject).toBeGreaterThan(requestCountBeforeReject);
+  });
+
+  it('transfers a 1 MiB piece as multiple bounded binary frames before verifying progress', async () => {
+    const maxBinaryFrameBytes = 64 * 1024;
+    const ownerTransport = new FakeTransport(ownerPeerId, { maxBinaryFrameBytes });
+    const receiverPeerId = 'peer_receiver_multichunk' as PeerId;
+    const receiverTransport = new FakeTransport(receiverPeerId);
+    ownerTransport.link(receiverPeerId, receiverTransport);
+    receiverTransport.link(ownerPeerId, ownerTransport);
+
+    const payload = makeSyntheticBytes(1024 * 1024 + 13);
+    const owner = new PonsWarpEngine(new MemoryStorageAdapter(), undefined, undefined, undefined, ownerTransport);
+    const receiverStorage = new MemoryStorageAdapter();
+    const receiver = new PonsWarpEngine(receiverStorage, undefined, undefined, undefined, receiverTransport);
+    const session = await owner.createSession({ sessionId, files: [new Blob([payload])], pieceSize: payload.byteLength });
+    const manifest = session.manifests[0];
+    await receiver.joinSession(sessionId, [manifest]);
+
+    const scheduled = await receiver.requestNextPiece(ownerPeerId, manifest.fileId);
+    expect(scheduled).toMatchObject({ peerId: ownerPeerId, piece: { index: 0 } });
+    await flushAsync();
+
+    const sentSizes = ownerTransport.sentBinary.map(frame => frame.byteLength);
+    expect(sentSizes.length).toBeGreaterThan(1);
+    expect(sentSizes.every(size => size <= maxBinaryFrameBytes)).toBe(true);
+    expect(sentMessagesOfType<{ type: 'PIECE_ACK'; requestId: string }>(receiverTransport, 'PIECE_ACK')).toHaveLength(1);
+    expect(receiver.getProgress(manifest.fileId)).toMatchObject({
+      verifiedPieces: 1,
+      totalPieces: 1,
+      bytesTransferred: payload.byteLength,
+      progress: 100
+    });
+    const stored = await receiverStorage.readPiece(manifest.fileId, 0);
+    expect(stored?.byteLength).toBe(payload.byteLength);
+    expect(await new IntegrityChecker().verifyPiece(stored!, manifest.pieces[0])).toBe(true);
+  });
+
+  it('waits for all chunks before rejecting a corrupt assembled payload and retrying', async () => {
+    const providerPeerId = 'peer_provider_multichunk_corrupt' as PeerId;
+    const receiverPeerId = 'peer_receiver_multichunk_corrupt' as PeerId;
+    const providerTransport = new FakeTransport(providerPeerId);
+    const receiverTransport = new FakeTransport(receiverPeerId);
+    providerTransport.link(receiverPeerId, receiverTransport);
+    receiverTransport.link(providerPeerId, providerTransport);
+
+    const payload = makeSyntheticBytes(128 * 1024 + 5);
+    const manifest = await new ManifestGenerator().create(new Blob([payload]), { pieceSize: payload.byteLength, fileId });
+    const receiverStorage = new MemoryStorageAdapter();
+    const receiver = new PonsWarpEngine(receiverStorage, undefined, undefined, undefined, receiverTransport);
+    await receiver.joinSession(sessionId, [manifest]);
+
+    const scheduled = await receiver.requestNextGridPiece(manifest.fileId, {
+      ownerPeerId: providerPeerId,
+      candidatePeers: [providerPeerId],
+      requestLeaseMs: 10_000,
+      now: 1_000
+    });
+    if (scheduled.type !== 'scheduled') throw new Error('expected scheduled grid request');
+    const requestCountBeforeReject = sentMessagesOfType<{ type: 'PIECE_REQUEST' }>(receiverTransport, 'PIECE_REQUEST').length;
+
+    const firstChunk = payload.slice(0, 64 * 1024);
+    await providerTransport.send(receiverPeerId, {
+      type: 'PIECE_CHUNK_HEADER',
+      fileId: manifest.fileId,
+      pieceIndex: scheduled.pieceIndex,
+      chunkIndex: 0,
+      totalChunks: 2,
+      requestId: scheduled.requestId,
+      payloadSize: firstChunk.byteLength
+    });
+    await providerTransport.sendBinary(receiverPeerId, firstChunk.buffer);
+    await flushAsync();
+
+    expect(sentMessagesOfType<{ type: 'PIECE_REJECT' }>(receiverTransport, 'PIECE_REJECT')).toEqual([]);
+    expect(receiver.getProgress(manifest.fileId).verifiedPieces).toBe(0);
+
+    const secondChunk = payload.slice(64 * 1024);
+    secondChunk[secondChunk.byteLength - 1] ^= 0xff;
+    await providerTransport.send(receiverPeerId, {
+      type: 'PIECE_CHUNK_HEADER',
+      fileId: manifest.fileId,
+      pieceIndex: scheduled.pieceIndex,
+      chunkIndex: 1,
+      totalChunks: 2,
+      requestId: scheduled.requestId,
+      payloadSize: secondChunk.byteLength
+    });
+    await providerTransport.sendBinary(receiverPeerId, secondChunk.buffer);
+    await flushAsync();
+
+    expect(sentMessagesOfType<{ type: 'PIECE_REJECT'; requestId: string; reason: string }>(receiverTransport, 'PIECE_REJECT')).toEqual([
+      expect.objectContaining({ requestId: scheduled.requestId, reason: 'hash_mismatch' })
+    ]);
+    expect(receiver.getProgress(manifest.fileId).verifiedPieces).toBe(0);
+    expect(await receiverStorage.hasPiece(manifest.fileId, scheduled.pieceIndex)).toBe(false);
+    const requestCountAfterReject = sentMessagesOfType<{ type: 'PIECE_REQUEST' }>(receiverTransport, 'PIECE_REQUEST').length;
+    expect(requestCountAfterReject).toBeGreaterThan(requestCountBeforeReject);
+  });
+
+  it('keeps incomplete chunk sequences unverified until lease timeout permits retry', async () => {
+    const providerPeerId = 'peer_provider_multichunk_timeout' as PeerId;
+    const receiverPeerId = 'peer_receiver_multichunk_timeout' as PeerId;
+    const providerTransport = new FakeTransport(providerPeerId);
+    const receiverTransport = new FakeTransport(receiverPeerId);
+    providerTransport.link(receiverPeerId, receiverTransport);
+    receiverTransport.link(providerPeerId, providerTransport);
+
+    const payload = makeSyntheticBytes(96 * 1024 + 9);
+    const manifest = await new ManifestGenerator().create(new Blob([payload]), { pieceSize: payload.byteLength, fileId });
+    const receiverStorage = new MemoryStorageAdapter();
+    const receiver = new PonsWarpEngine(receiverStorage, undefined, undefined, undefined, receiverTransport);
+    const timedOutRequestIds: string[] = [];
+    receiver.on('requestTimedOut', event => timedOutRequestIds.push(event.requestId));
+    await receiver.joinSession(sessionId, [manifest]);
+
+    const scheduled = await receiver.requestNextGridPiece(manifest.fileId, {
+      ownerPeerId: providerPeerId,
+      candidatePeers: [providerPeerId],
+      requestLeaseMs: 10,
+      now: 1_000
+    });
+    if (scheduled.type !== 'scheduled') throw new Error('expected scheduled grid request');
+    const requestCountBeforeTimeout = sentMessagesOfType<{ type: 'PIECE_REQUEST' }>(receiverTransport, 'PIECE_REQUEST').length;
+
+    const firstChunk = payload.slice(0, 32 * 1024);
+    await providerTransport.send(receiverPeerId, {
+      type: 'PIECE_CHUNK_HEADER',
+      fileId: manifest.fileId,
+      pieceIndex: scheduled.pieceIndex,
+      chunkIndex: 0,
+      totalChunks: 3,
+      requestId: scheduled.requestId,
+      payloadSize: firstChunk.byteLength
+    });
+    await providerTransport.sendBinary(receiverPeerId, firstChunk.buffer);
+    await flushAsync();
+
+    expect(sentMessagesOfType<{ type: 'PIECE_ACK' }>(receiverTransport, 'PIECE_ACK')).toEqual([]);
+    expect(sentMessagesOfType<{ type: 'PIECE_REJECT' }>(receiverTransport, 'PIECE_REJECT')).toEqual([]);
+    expect(receiver.getProgress(manifest.fileId).verifiedPieces).toBe(0);
+    expect(await receiverStorage.hasPiece(manifest.fileId, scheduled.pieceIndex)).toBe(false);
+
+    receiver.expireRequestLeases(1_011);
+    expect(timedOutRequestIds).toEqual([scheduled.requestId]);
+
+    const retry = await receiver.requestNextGridPiece(manifest.fileId, {
+      ownerPeerId: providerPeerId,
+      candidatePeers: [providerPeerId],
+      requestLeaseMs: 10,
+      now: 1_012
+    });
+    expect(retry).toMatchObject({ type: 'scheduled', pieceIndex: scheduled.pieceIndex, peerId: providerPeerId });
+    expect(sentMessagesOfType<{ type: 'PIECE_REQUEST' }>(receiverTransport, 'PIECE_REQUEST').length).toBeGreaterThan(requestCountBeforeTimeout);
   });
 });

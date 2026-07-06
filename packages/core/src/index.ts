@@ -51,7 +51,8 @@ export type FileHashPolicy =
 
 export type PerformanceEvent =
   | { type: 'hash:progress'; fileId?: FileId; bytesProcessed: number; totalBytes: number }
-  | { type: 'transfer:speed'; fileId: FileId; bps: number; windowMs: number }
+  | { type: 'transfer:speed'; fileId: FileId; pieceIndex: number; peerId: PeerId; bytes: number; bps: number; windowMs: number }
+  | { type: 'transfer:retry'; fileId: FileId; pieceIndex: number; peerId: PeerId; requestId: string; reason: string; retryCount: number; maxRetries: number }
   | { type: 'buffer:watermark'; peerId: PeerId; bufferedAmount: number }
   | { type: 'storage:write'; fileId: FileId; pieceIndex: number; bytes: number; durationMs: number }
   | { type: 'resume:restored'; fileId: FileId; verifiedPieces: number; discardedPieces: number; durationMs: number };
@@ -82,6 +83,8 @@ export interface TransferProgress {
 }
 
 export const CORE_PROTOCOL_VERSION = 'ponswarp-grid/1.0.0' as const;
+
+const DEFAULT_TRANSFER_CHUNK_BYTES = 64 * 1024;
 
 export interface PersistedPeerState {
   peerId: PeerId;
@@ -172,7 +175,7 @@ export interface PieceAckMessage {
   hash?: string;
 }
 
-export type PieceRejectReason = 'hash_mismatch' | 'missing_piece' | 'storage_read_failed' | 'unauthorized' | 'busy';
+export type PieceRejectReason = 'hash_mismatch' | 'missing_piece' | 'storage_read_failed' | 'unauthorized' | 'busy' | 'invalid_chunk';
 export interface PieceRejectMessage {
   type: 'PIECE_REJECT';
   fileId: FileId;
@@ -265,6 +268,14 @@ export type EngineTransferMessage =
 export interface PendingChunk {
   peerId: PeerId;
   header: PieceChunkHeaderMessage;
+}
+
+interface IncomingChunkAssembly {
+  peerId: PeerId;
+  header: PieceChunkHeaderMessage;
+  chunks: Array<ArrayBuffer | undefined>;
+  receivedBytes: number;
+  receivedChunks: number;
 }
 
 export interface ResumeRestoreResult {
@@ -799,6 +810,7 @@ export class PonsWarpEngine {
   private readonly managers = new Map<FileId, PieceManager>();
   private readonly ownerSources = new Map<FileId, Blob>();
   private readonly pendingChunks = new Map<PeerId, PieceChunkHeaderMessage>();
+  private readonly incomingChunks = new Map<string, IncomingChunkAssembly>();
   private readonly outstandingRequests = new Map<string, { fileId: FileId; pieceIndex: number; peerId: PeerId; requestedAt: number; gridOptions?: GridScheduleOptions }>();
   private readonly availability = new PieceAvailabilityTable();
   private readonly peerHealth = new PeerHealthTable();
@@ -994,12 +1006,28 @@ export class PonsWarpEngine {
       const outstanding = this.outstandingRequests.get(request.requestId);
       if (!outstanding) continue;
       this.outstandingRequests.delete(request.requestId);
+      this.incomingChunks.delete(request.requestId);
       const manager = this.requireManager(outstanding.fileId);
       manager.markFailed(outstanding.pieceIndex, 'request_timeout');
       manager.resetFailedToMissing(outstanding.pieceIndex);
       this.peerHealth.markTimeout(outstanding.peerId);
+      this.emitRetryPerformance({ fileId: outstanding.fileId, pieceIndex: outstanding.pieceIndex, peerId: outstanding.peerId, requestId: request.requestId, reason: 'request_timeout' });
       this.events.emit('requestTimedOut', { fileId: outstanding.fileId, pieceIndex: outstanding.pieceIndex, peerId: outstanding.peerId, requestId: request.requestId });
     }
+  }
+
+  private emitRetryPerformance(input: { fileId: FileId; pieceIndex: number; peerId: PeerId; requestId: string; reason: string }): void {
+    const retryCount = this.managers.get(input.fileId)?.getPieceState(input.pieceIndex).retryCount ?? 0;
+    this.events.emit('performance', {
+      type: 'transfer:retry',
+      fileId: input.fileId,
+      pieceIndex: input.pieceIndex,
+      peerId: input.peerId,
+      requestId: input.requestId,
+      reason: input.reason,
+      retryCount,
+      maxRetries: this.maxRetries
+    });
   }
 
   async receivePiece(input: { fileId: FileId; pieceIndex: number; requestId: string; data: ArrayBuffer }): Promise<PieceReceiveResult> {
@@ -1014,6 +1042,7 @@ export class PonsWarpEngine {
       this.outstandingRequests.delete(input.requestId);
       if (outstanding) this.peerHealth.markReject(outstanding.peerId);
       manager.markFailed(input.pieceIndex, 'hash_mismatch');
+      if (outstanding) this.emitRetryPerformance({ fileId: input.fileId, pieceIndex: input.pieceIndex, peerId: outstanding.peerId, requestId: input.requestId, reason: 'hash_mismatch' });
       await this.storage.deletePiece(input.fileId, input.pieceIndex);
       this.events.emit('pieceRejected', { fileId: input.fileId, pieceIndex: input.pieceIndex, reason: 'hash_mismatch' });
       this.events.emit('progress', manager.getProgress());
@@ -1028,7 +1057,19 @@ export class PonsWarpEngine {
     const outstanding = this.outstandingRequests.get(input.requestId);
     this.availability.release(input.fileId, input.pieceIndex, input.requestId);
     this.outstandingRequests.delete(input.requestId);
-    if (outstanding) this.peerHealth.markSuccess(outstanding.peerId, input.data.byteLength, Math.max(1, Date.now() - outstanding.requestedAt));
+    if (outstanding) {
+      const windowMs = Math.max(1, Date.now() - outstanding.requestedAt);
+      this.peerHealth.markSuccess(outstanding.peerId, input.data.byteLength, windowMs);
+      this.events.emit('performance', {
+        type: 'transfer:speed',
+        fileId: input.fileId,
+        pieceIndex: input.pieceIndex,
+        peerId: outstanding.peerId,
+        bytes: input.data.byteLength,
+        bps: (input.data.byteLength / windowMs) * 1000,
+        windowMs
+      });
+    }
     if (this.knownPeers.size > 0) await this.broadcastPieceMap(input.fileId, [...this.knownPeers]);
     this.events.emit('pieceVerified', { fileId: input.fileId, pieceIndex: input.pieceIndex });
     this.events.emit('progress', manager.getProgress());
@@ -1105,7 +1146,9 @@ export class PonsWarpEngine {
         this.availability.release(outstanding.fileId, outstanding.pieceIndex, requestId);
         this.peerHealth.markReject(outstanding.peerId);
         const manager = this.requireManager(outstanding.fileId);
-        manager.markFailed(outstanding.pieceIndex, requireStringField(message, 'reason'));
+        const reason = requireStringField(message, 'reason');
+        manager.markFailed(outstanding.pieceIndex, reason);
+        this.emitRetryPerformance({ fileId: outstanding.fileId, pieceIndex: outstanding.pieceIndex, peerId: outstanding.peerId, requestId, reason });
         if (manager.getPieceState(outstanding.pieceIndex).retryCount <= this.maxRetries) {
           manager.resetFailedToMissing(outstanding.pieceIndex);
           if (outstanding.gridOptions) await this.requestNextGridPiece(outstanding.fileId, outstanding.gridOptions);
@@ -1119,8 +1162,12 @@ export class PonsWarpEngine {
     const header = this.pendingChunks.get(peerId);
     if (!header) throw new PonsWarpError('transport:unexpected_binary', `No chunk header for binary frame from ${peerId}`, { category: 'transport', recoverable: true });
     this.pendingChunks.delete(peerId);
+
+    const assembled = await this.appendIncomingChunk(peerId, header, frame);
+    if (!assembled) return;
+
     const outstanding = this.outstandingRequests.get(header.requestId);
-    const result = await this.receivePiece({ fileId: header.fileId, pieceIndex: header.pieceIndex, requestId: header.requestId, data: frame });
+    const result = await this.receivePiece({ fileId: header.fileId, pieceIndex: header.pieceIndex, requestId: header.requestId, data: assembled });
     const response: PieceAckMessage | PieceRejectMessage = result.type === 'PIECE_ACK'
       ? { type: 'PIECE_ACK', fileId: result.fileId, pieceIndex: result.pieceIndex, requestId: result.requestId, status: 'verified', hash: result.hash }
       : { type: 'PIECE_REJECT', fileId: result.fileId, pieceIndex: result.pieceIndex, requestId: result.requestId, reason: (result.reason === 'hash_mismatch' ? 'hash_mismatch' : 'missing_piece'), expectedHash: result.hash };
@@ -1133,6 +1180,79 @@ export class PonsWarpEngine {
         else await this.requestNextPiece(peerId, result.fileId);
       }
     }
+  }
+
+  private async appendIncomingChunk(peerId: PeerId, header: PieceChunkHeaderMessage, frame: ArrayBuffer): Promise<ArrayBuffer | null> {
+    const reject = async (): Promise<null> => {
+      await this.rejectIncomingChunk(peerId, header);
+      return null;
+    };
+    if (header.totalChunks <= 0 || !Number.isSafeInteger(header.totalChunks)) return reject();
+    if (header.chunkIndex < 0 || header.chunkIndex >= header.totalChunks || !Number.isSafeInteger(header.chunkIndex)) return reject();
+    if (header.payloadSize !== frame.byteLength) return reject();
+
+    let assembly = this.incomingChunks.get(header.requestId);
+    if (!assembly) {
+      assembly = {
+        peerId,
+        header,
+        chunks: Array.from({ length: header.totalChunks }),
+        receivedBytes: 0,
+        receivedChunks: 0
+      };
+      this.incomingChunks.set(header.requestId, assembly);
+    }
+
+    if (
+      assembly.peerId !== peerId ||
+      assembly.header.fileId !== header.fileId ||
+      assembly.header.pieceIndex !== header.pieceIndex ||
+      assembly.header.totalChunks !== header.totalChunks ||
+      assembly.chunks[header.chunkIndex]
+    ) return reject();
+
+    assembly.chunks[header.chunkIndex] = frame;
+    assembly.receivedBytes += frame.byteLength;
+    assembly.receivedChunks += 1;
+    if (assembly.receivedChunks < header.totalChunks) return null;
+
+    this.incomingChunks.delete(header.requestId);
+    const assembled = new Uint8Array(assembly.receivedBytes);
+    let offset = 0;
+    for (const chunk of assembly.chunks) {
+      if (!chunk) return reject();
+      assembled.set(new Uint8Array(chunk), offset);
+      offset += chunk.byteLength;
+    }
+    return assembled.buffer;
+  }
+
+  private async rejectIncomingChunk(peerId: PeerId, header: PieceChunkHeaderMessage): Promise<void> {
+    const outstanding = this.outstandingRequests.get(header.requestId);
+    this.incomingChunks.delete(header.requestId);
+    this.outstandingRequests.delete(header.requestId);
+    this.availability.release(header.fileId, header.pieceIndex, header.requestId);
+    const manager = this.managers.get(header.fileId);
+    if (manager) manager.markFailed(header.pieceIndex, 'invalid_chunk');
+    this.peerHealth.markReject(peerId);
+    if (manager) this.emitRetryPerformance({ fileId: header.fileId, pieceIndex: header.pieceIndex, peerId, requestId: header.requestId, reason: 'invalid_chunk' });
+    await this.requireTransport().send(peerId, {
+      type: 'PIECE_REJECT',
+      fileId: header.fileId,
+      pieceIndex: header.pieceIndex,
+      requestId: header.requestId,
+      reason: 'invalid_chunk'
+    } satisfies PieceRejectMessage);
+    this.events.emit('pieceRejected', { fileId: header.fileId, pieceIndex: header.pieceIndex, reason: 'invalid_chunk' });
+    if (manager) {
+      this.events.emit('progress', manager.getProgress());
+      if (manager.getPieceState(header.pieceIndex).retryCount <= this.maxRetries) {
+        manager.resetFailedToMissing(header.pieceIndex);
+        if (outstanding?.gridOptions) await this.requestNextGridPiece(header.fileId, outstanding.gridOptions);
+        else await this.requestNextPiece(peerId, header.fileId);
+      }
+    }
+    await this.persistState();
   }
 
   private async sendRequestedPiece(peerId: PeerId, request: PieceRequestMessage): Promise<void> {
@@ -1164,16 +1284,22 @@ export class PonsWarpEngine {
       return;
     }
 
-    await this.requireTransport().send(peerId, {
-      type: 'PIECE_CHUNK_HEADER',
-      fileId: request.fileId,
-      pieceIndex: request.pieceIndex,
-      chunkIndex: 0,
-      totalChunks: 1,
-      requestId: request.requestId,
-      payloadSize: data.byteLength
-    } satisfies PieceChunkHeaderMessage);
-    await this.requireTransport().sendBinary(peerId, data);
+    const chunkSize = Math.min(DEFAULT_TRANSFER_CHUNK_BYTES, data.byteLength || DEFAULT_TRANSFER_CHUNK_BYTES);
+    const totalChunks = Math.max(1, Math.ceil(data.byteLength / chunkSize));
+    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
+      const offset = chunkIndex * chunkSize;
+      const chunk = new Uint8Array(data, offset, Math.min(chunkSize, data.byteLength - offset));
+      await this.requireTransport().send(peerId, {
+        type: 'PIECE_CHUNK_HEADER',
+        fileId: request.fileId,
+        pieceIndex: request.pieceIndex,
+        chunkIndex,
+        totalChunks,
+        requestId: request.requestId,
+        payloadSize: chunk.byteLength
+      } satisfies PieceChunkHeaderMessage);
+      await this.requireTransport().sendBinary(peerId, chunk);
+    }
   }
 
   private parsePieceRequest(message: Record<string, unknown>): PieceRequestMessage {
