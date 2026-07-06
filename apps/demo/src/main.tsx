@@ -21,7 +21,7 @@ import { DEFAULT_STUN_URL, SHARE_EXPIRY_MS, PIECE_PROGRESS_TIMEOUT_MS, PROGRESS_
 import { DemoTransport, BroadcastDemoTransport } from './demo-transports';
 
 
-interface DemoState {
+interface AppState {
   status: 'idle' | 'running' | 'restoring_local_state' | 'local_state_restored' | 'reconnecting_signaling' | 'validating_remote_manifest' | 'resuming_transfer' | 'ready' | 'complete' | 'error' | 'resume_manifest_mismatch' | 'resume_state_corrupt' | 'storage_unavailable' | 'session_expired';
   logs: string[];
   manifest?: FileManifest;
@@ -294,7 +294,7 @@ function Icon({ name, size = 24, strokeWidth = 1.8, className }: { name: IconNam
 
 function App() {
   const [selectedFile, setSelectedFile] = useState<(Blob & { name?: string; type?: string }) | null>(null);
-  const [state, setState] = useState<DemoState>({ status: 'idle', logs: ['Ready. Select a file or run the built-in sample.'] });
+  const [state, setState] = useState<AppState>({ status: 'idle', logs: ['Ready. Select a file or run the built-in sample.'] });
   const ownerRuntime = useRef<OwnerRuntime | null>(null);
   const receiverRuntime = useRef<ReceiverRuntime | null>(null);
   const storageKinds = useRef(new Map<SessionId, string>());
@@ -1652,7 +1652,7 @@ function App() {
           <summary>Developer and QA controls</summary>
           <section aria-label="Sender panel">
             <h2>Sender</h2>
-            <p>Selected: {selectedFile?.name ?? 'Built-in sample file'}</p>
+            <p>Selected: {selectedFile?.name ?? 'No file selected'}</p>
             <button onClick={() => void runLocalDemo()} disabled={state.status === 'running'}>Run local transfer + resume demo</button>
             <button onClick={() => void runWebRtcLoopbackDemo()} disabled={state.status === 'running'}>Run real WebRTC loopback demo</button>
             <button onClick={() => void runLocalGridSchedulerDemo()} disabled={state.status === 'running'}>Run 3-peer grid scheduler demo</button>
