@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from 'node:http';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomUUID } from 'node:crypto';
 import type { Socket } from 'node:net';
 import {
   PROTOCOL_VERSION,
@@ -25,6 +25,16 @@ export interface SignalingServerConfig {
   heartbeatIntervalMs: number;
   stalePeerTimeoutMs: number;
   allowedOrigins: string[];
+  serviceName: string;
+  deploymentDomain: string;
+  legacyDomain: string;
+  version: string;
+  commitSha: string;
+  readinessChecks: Record<string, 'ok' | 'degraded' | 'disabled'>;
+  turnStaticAuthSecret?: string;
+  turnRealm: string;
+  turnUrls: string[];
+  turnTtlSeconds: number;
 }
 
 export const DEFAULT_SIGNALING_SERVER_CONFIG: SignalingServerConfig = {
@@ -37,7 +47,17 @@ export const DEFAULT_SIGNALING_SERVER_CONFIG: SignalingServerConfig = {
   maxSessions: 1024,
   heartbeatIntervalMs: 10 * 1000,
   stalePeerTimeoutMs: 5 * 60 * 1000,
-  allowedOrigins: []
+  allowedOrigins: [],
+  serviceName: 'ponswarp-signaling',
+  deploymentDomain: 'localhost',
+  legacyDomain: 'warp.ponslink.com',
+  version: process.env.npm_package_version ?? '0.1.0',
+  commitSha: process.env.PONSWARP_BUILD_SHA ?? 'dev',
+  readinessChecks: {},
+  turnStaticAuthSecret: process.env.PONSWARP_TURN_STATIC_AUTH_SECRET,
+  turnRealm: process.env.PONSWARP_TURN_REALM ?? 'ponslink.com',
+  turnUrls: (process.env.PONSWARP_TURN_URLS ?? '').split(',').map(url => url.trim()).filter(Boolean),
+  turnTtlSeconds: Number(process.env.PONSWARP_TURN_TTL_SECONDS ?? 600)
 };
 
 export type SignalingGatewayEvent =
@@ -270,7 +290,7 @@ export interface SignalingHttpServer {
 export function createSignalingHttpServer(input: { config?: Partial<SignalingServerConfig>; roomManager?: RoomManager } = {}): SignalingHttpServer {
   const config = { ...DEFAULT_SIGNALING_SERVER_CONFIG, ...input.config };
   const gateway = new SignalingGateway(input.roomManager ?? new RoomManager(), config);
-  const server = createServer((request, response) => handleHttpRequest(request, response));
+  const server = createServer((request, response) => handleHttpRequest(request, response, config));
   const interval = setInterval(() => gateway.cleanupStalePeers(), config.heartbeatIntervalMs);
   interval.unref?.();
 
@@ -280,7 +300,7 @@ export function createSignalingHttpServer(input: { config?: Partial<SignalingSer
       socket.destroy();
       return;
     }
-    if (request.url !== '/ws') {
+    if (!isGridWebSocketPath(request.url)) {
       socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
       socket.destroy();
       return;
@@ -313,14 +333,88 @@ export function createSignalingHttpServer(input: { config?: Partial<SignalingSer
   };
 }
 
-function handleHttpRequest(request: IncomingMessage, response: ServerResponse): void {
+function handleHttpRequest(request: IncomingMessage, response: ServerResponse, config: SignalingServerConfig): void {
   if (request.url === '/healthz') {
-    response.writeHead(200, { 'content-type': 'application/json' });
-    response.end(JSON.stringify({ ok: true }));
+    writeJson(response, 200, {
+      status: 'ok',
+      service: config.serviceName,
+      version: config.version,
+      commitSha: config.commitSha
+    });
+    return;
+  }
+  if (request.url === '/readyz') {
+    const checks = {
+      process: 'ok',
+      websocket: 'ok',
+      ...config.readinessChecks
+    };
+    const ready = Object.entries(checks).every(([name, status]) => status === 'ok' || (name === 'cleanupScheduler' && status === 'disabled'));
+    writeJson(response, ready ? 200 : 503, {
+      status: ready ? 'ready' : 'not_ready',
+      service: config.serviceName,
+      version: config.version,
+      commitSha: config.commitSha,
+      domain: config.deploymentDomain,
+      legacyDomain: config.legacyDomain,
+      checks
+    });
+    return;
+  }
+  if (request.url === '/version.json') {
+    writeJson(response, 200, {
+      service: config.serviceName,
+      version: config.version,
+      commitSha: config.commitSha,
+      domain: config.deploymentDomain,
+      legacyDomain: config.legacyDomain
+    }, { 'cache-control': 'no-cache' });
+    return;
+  }
+  if (request.url === '/api/grid/v1/ice') {
+    writeJson(response, 200, createIceResponse(config), { 'cache-control': 'no-cache' });
+    return;
+  }
+  if (request.url?.startsWith('/api/grid/v1/shares') || request.url?.startsWith('/api/grid/v1/workspaces')) {
+    writeJson(response, 501, {
+      error: 'not_implemented',
+      service: config.serviceName,
+      message: 'This TypeScript signaling server exposes ICE and WebSocket signaling only; production coordinator share/workspace APIs are served by the external grid coordinator.',
+      expectedExternalService: 'ponswarp-grid-coordinator'
+    });
     return;
   }
   response.writeHead(404, { 'content-type': 'application/json' });
   response.end(JSON.stringify({ error: 'not_found' }));
+}
+
+function createIceResponse(config: SignalingServerConfig): { iceServers: RTCIceServerLike[]; ttlSeconds: number; relayPolicyRecommended: boolean } {
+  const ttlSeconds = Number.isFinite(config.turnTtlSeconds) && config.turnTtlSeconds > 0 ? config.turnTtlSeconds : 600;
+  const iceServers: RTCIceServerLike[] = [];
+  const stunUrl = process.env.PONSWARP_STUN_URL ?? 'stun:turn.ponslink.com:3478';
+  if (stunUrl) iceServers.push({ urls: [stunUrl] });
+  if (config.turnStaticAuthSecret && config.turnUrls.length > 0) {
+    const expiresAt = Math.floor(Date.now() / 1000) + ttlSeconds;
+    const username = `${expiresAt}:grid`;
+    const credential = createHmac('sha1', config.turnStaticAuthSecret).update(username).digest('base64');
+    iceServers.push({ urls: config.turnUrls, username, credential });
+  }
+  return { iceServers, ttlSeconds, relayPolicyRecommended: false };
+}
+
+interface RTCIceServerLike {
+  urls: string[];
+  username?: string;
+  credential?: string;
+}
+
+function writeJson(response: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
+  response.writeHead(status, { 'content-type': 'application/json', ...headers });
+  response.end(JSON.stringify(body));
+}
+
+function isGridWebSocketPath(url: string | undefined): boolean {
+  return url === '/ws' || url === '/ws/' || url === '/ws/grid' || url === '/ws/grid/';
 }
 
 function isOriginAllowed(origin: string | undefined, allowedOrigins: string[]): boolean {

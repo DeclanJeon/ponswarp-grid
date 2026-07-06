@@ -1,4 +1,10 @@
-import { createConnection } from 'node:net';
+import { spawn } from 'node:child_process';
+import { createHmac } from 'node:crypto';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { createConnection, type Socket } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
   BrowserSignalingClient,
@@ -15,12 +21,14 @@ import {
   type TransferEnvelope,
   type WebSocketLike
 } from '../src/index';
-import { SignalingGateway, createSignalingHttpServer, type GatewayPeerConnection } from '../src/server';
+import { DEFAULT_SIGNALING_SERVER_CONFIG, SignalingGateway, createSignalingHttpServer, type GatewayPeerConnection } from '../src/server';
 import type { FileId, PeerId, SessionId } from '@ponswarp/core';
 
 const sessionId = 'sess_1' as SessionId;
 const ownerPeerId = 'owner' as PeerId;
 const receiverPeerId = 'receiver' as PeerId;
+const repoRoot = fileURLToPath(new URL('../../..', import.meta.url));
+
 
 const signaling = (overrides: Partial<SignalingEnvelope> = {}): SignalingEnvelope => ({
   protocol: SIGNALING_PROTOCOL,
@@ -238,7 +246,13 @@ describe('SignalingGateway server runtime', () => {
       maxSessions: 10,
       heartbeatIntervalMs: 1000,
       stalePeerTimeoutMs: 1000,
-      allowedOrigins: []
+      allowedOrigins: [],
+      serviceName: DEFAULT_SIGNALING_SERVER_CONFIG.serviceName,
+      deploymentDomain: DEFAULT_SIGNALING_SERVER_CONFIG.deploymentDomain,
+      legacyDomain: DEFAULT_SIGNALING_SERVER_CONFIG.legacyDomain,
+      version: DEFAULT_SIGNALING_SERVER_CONFIG.version,
+      commitSha: DEFAULT_SIGNALING_SERVER_CONFIG.commitSha,
+      readinessChecks: {}
     }, () => 1000);
     const owner = new GatewayConnection();
     const receiver = new GatewayConnection();
@@ -275,6 +289,90 @@ describe('SignalingGateway server runtime', () => {
     expect(owner.sent.at(-1)).toMatchObject({ type: 'PEER_LEFT', payload: { peerId: receiverPeerId } });
   });
 
+  it('accepts legacy and grid WebSocket upgrade paths with valid handshakes', async () => {
+    const runtime = createSignalingHttpServer({ config: { host: '127.0.0.1', port: 0, publicBaseUrl: 'http://localhost:5173', heartbeatIntervalMs: 1000 } });
+    await runtime.listen();
+    const sockets: WebSocket[] = [];
+    try {
+      const address = runtime.server.address();
+      if (!address || typeof address !== 'object') throw new Error('server address unavailable');
+
+      for (const path of ['/ws', '/ws/grid']) {
+        const socket = await openWebSocket(`ws://127.0.0.1:${address.port}${path}`);
+        sockets.push(socket);
+        expect(socket.readyState).toBe(WebSocket.OPEN);
+      }
+    } finally {
+      await Promise.all(sockets.map(socket => closeWebSocket(socket)));
+      await runtime.close();
+    }
+  });
+
+  it('serves grid ICE configuration from /api/grid/v1/ice with configured TURN credentials', async () => {
+    const runtime = createSignalingHttpServer({
+      config: {
+        host: '127.0.0.1',
+        port: 0,
+        publicBaseUrl: 'http://localhost:5173',
+        heartbeatIntervalMs: 1000,
+        turnStaticAuthSecret: 'test-turn-secret',
+        turnUrls: ['turn:turn.example.test:3478?transport=tcp'],
+        turnTtlSeconds: 42
+      }
+    });
+    await runtime.listen();
+    try {
+      const address = runtime.server.address();
+      if (!address || typeof address !== 'object') throw new Error('server address unavailable');
+      const before = Math.floor(Date.now() / 1000);
+
+      const response = await fetch(`http://127.0.0.1:${address.port}/api/grid/v1/ice`);
+      const after = Math.floor(Date.now() / 1000);
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get('cache-control')).toBe('no-cache');
+      const body = await response.json() as { iceServers: Array<{ urls: string[]; username?: string; credential?: string }>; ttlSeconds: number; relayPolicyRecommended: boolean };
+      const turnServer = body.iceServers.find(server => server.urls.includes('turn:turn.example.test:3478?transport=tcp'));
+      expect(body.ttlSeconds).toBe(42);
+      expect(body.relayPolicyRecommended).toBe(false);
+      expect(turnServer).toBeDefined();
+      const username = turnServer?.username ?? '';
+      const expiresAt = Number(username.split(':')[0]);
+      expect(username).toMatch(/^\d+:grid$/);
+      expect(expiresAt).toBeGreaterThanOrEqual(before + 42);
+      expect(expiresAt).toBeLessThanOrEqual(after + 42);
+      expect(turnServer?.credential).toBe(createHmac('sha1', 'test-turn-secret').update(username).digest('base64'));
+    } finally {
+      await runtime.close();
+    }
+  });
+
+  it('returns structured not-implemented responses for unsupported coordinator share routes', async () => {
+    const runtime = createSignalingHttpServer({ config: { host: '127.0.0.1', port: 0, publicBaseUrl: 'http://localhost:5173', heartbeatIntervalMs: 1000 } });
+    await runtime.listen();
+    try {
+      const address = runtime.server.address();
+      if (!address || typeof address !== 'object') throw new Error('server address unavailable');
+      const cases = [
+        { method: 'POST', path: '/api/grid/v1/workspaces/demo/shares', body: { fileId: 'file_1' } },
+        { method: 'GET', path: '/api/grid/v1/shares/ABCD-1234' },
+        { method: 'GET', path: '/api/grid/v1/shares/ABCD-1234/candidates' }
+      ];
+
+      for (const route of cases) {
+        const response = await fetch(`http://127.0.0.1:${address.port}${route.path}`, {
+          method: route.method,
+          headers: route.body ? { 'content-type': 'application/json' } : undefined,
+          body: route.body ? JSON.stringify(route.body) : undefined
+        });
+        expect(response.status).toBe(501);
+        expect(await response.json()).toMatchObject({ error: 'not_implemented' });
+      }
+    } finally {
+      await runtime.close();
+    }
+  });
+
   it('rejects malformed WebSocket handshakes and oversized frames without killing health endpoint', async () => {
     const runtime = createSignalingHttpServer({ config: { host: '127.0.0.1', port: 0, publicBaseUrl: 'http://localhost:5173', heartbeatIntervalMs: 1000 } });
     await runtime.listen();
@@ -293,7 +391,7 @@ describe('SignalingGateway server runtime', () => {
     expect(malformedHandshake).toContain('400 Bad Request');
 
     const oversized = createConnection({ host: '127.0.0.1', port });
-    await new Promise<void>(resolve => oversized.once('connect', resolve));
+    await waitForSocketEvent(oversized, 'connect');
     oversized.write([
       'GET /ws HTTP/1.1',
       'Host: 127.0.0.1',
@@ -304,16 +402,223 @@ describe('SignalingGateway server runtime', () => {
       '',
       ''
     ].join('\r\n'));
-    await new Promise(resolve => oversized.once('data', resolve));
+    await waitForSocketEvent(oversized, 'data');
     oversized.write(Buffer.from([0x81, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0]));
-    await new Promise(resolve => oversized.once('close', resolve));
+    await waitForSocketEvent(oversized, 'close');
 
     const health = await fetch(`http://127.0.0.1:${port}/healthz`);
     expect(health.status).toBe(200);
-    expect(await health.json()).toMatchObject({ ok: true });
+    expect(await health.json()).toMatchObject({ status: 'ok', service: 'ponswarp-signaling' });
+
+    const ready = await fetch(`http://127.0.0.1:${port}/readyz`);
+    expect(ready.status).toBe(200);
+    expect(await ready.json()).toMatchObject({ status: 'ready', checks: { process: 'ok', websocket: 'ok' } });
+
+    const version = await fetch(`http://127.0.0.1:${port}/version.json`);
+    expect(version.status).toBe(200);
+    expect(version.headers.get('cache-control')).toBe('no-cache');
+    expect(await version.json()).toMatchObject({ service: 'ponswarp-signaling', legacyDomain: 'warp.ponslink.com' });
     await runtime.close();
   });
 });
+  it('returns not-ready when required readiness checks are degraded while health stays alive', async () => {
+    const runtime = createSignalingHttpServer({
+      config: {
+        host: '127.0.0.1',
+        port: 0,
+        publicBaseUrl: 'http://localhost:5173',
+        heartbeatIntervalMs: 1000,
+        readinessChecks: { db: 'degraded', migrations: 'ok', rateLimitStore: 'disabled' }
+      }
+    });
+    await runtime.listen();
+    const address = runtime.server.address();
+    if (!address || typeof address !== 'object') throw new Error('server address unavailable');
+    const port = address.port;
+
+    const health = await fetch(`http://127.0.0.1:${port}/healthz`);
+    expect(health.status).toBe(200);
+
+    const ready = await fetch(`http://127.0.0.1:${port}/readyz`);
+    expect(ready.status).toBe(503);
+    expect(await ready.json()).toMatchObject({ status: 'not_ready', checks: { db: 'degraded', migrations: 'ok', rateLimitStore: 'disabled' } });
+
+    await runtime.close();
+  });
+  it('allows only optional cleanupScheduler to be disabled in readiness checks', async () => {
+    const runtime = createSignalingHttpServer({
+      config: {
+        host: '127.0.0.1',
+        port: 0,
+        publicBaseUrl: 'http://localhost:5173',
+        heartbeatIntervalMs: 1000,
+        readinessChecks: { db: 'ok', migrations: 'ok', rateLimitStore: 'ok', cleanupScheduler: 'disabled' }
+      }
+    });
+    await runtime.listen();
+    const address = runtime.server.address();
+    if (!address || typeof address !== 'object') throw new Error('server address unavailable');
+
+    const ready = await fetch(`http://127.0.0.1:${address.port}/readyz`);
+    expect(ready.status).toBe(200);
+    expect(await ready.json()).toMatchObject({ status: 'ready', checks: { cleanupScheduler: 'disabled' } });
+
+    await runtime.close();
+  });
+describe('grid deployment validator', () => {
+  it('passes when nginx, systemd, CLI, and coordinator server fixtures expose the grid route contract', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ponswarp-grid-deploy-validator-'));
+    try {
+      await writeDeploymentFixture(root, { signalingServer: signalingServerFixture({ includeGridRoutes: true }) });
+
+      const result = await runDeploymentValidator(root);
+
+      expect(result.code).toBe(0);
+      expect(result.report.verdict).toBe('passed');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('fails when deployment config advertises grid routes that the coordinator server fixture does not expose', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'ponswarp-grid-deploy-validator-'));
+    try {
+      await writeDeploymentFixture(root, { signalingServer: signalingServerFixture({ includeGridRoutes: false }) });
+
+      const result = await runDeploymentValidator(root);
+
+      expect(result.code).toBe(1);
+      expect(result.report.verdict).toBe('failed');
+      const failures = result.report.checks.filter(check => check.status === 'failed').map(check => `${check.id}: ${check.evidence}`).join('\n');
+      expect(failures).toContain('/ws/grid');
+      expect(failures).toContain('/api/grid/v1/ice');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+
+function openWebSocket(url: string): Promise<WebSocket> {
+  return new Promise((resolve, reject) => {
+    const socket = new WebSocket(url);
+    socket.addEventListener('open', () => resolve(socket), { once: true });
+    socket.addEventListener('error', () => reject(new Error(`WebSocket failed to open ${url}`)), { once: true });
+  });
+}
+
+function closeWebSocket(socket: WebSocket): Promise<void> {
+  if (socket.readyState === WebSocket.CLOSED) return Promise.resolve();
+  return new Promise(resolve => {
+    socket.addEventListener('close', () => resolve(), { once: true });
+    socket.close();
+  });
+}
+
+interface DeploymentValidatorReport {
+  verdict: 'passed' | 'failed';
+  checks: Array<{ id: string; status: 'passed' | 'failed'; evidence: string }>;
+}
+
+interface DeploymentValidatorResult {
+  code: number | null;
+  stdout: string;
+  stderr: string;
+  report: DeploymentValidatorReport;
+}
+
+async function runDeploymentValidator(cwd: string): Promise<DeploymentValidatorResult> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [join(repoRoot, 'scripts/validate-grid-deployment-config.mjs'), '--out', 'validator-report.json'], { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', chunk => { stdout += chunk; });
+    child.stderr.on('data', chunk => { stderr += chunk; });
+    child.on('error', reject);
+    child.on('close', code => {
+      readFile(join(cwd, 'validator-report.json'), 'utf8')
+        .then(raw => {
+          const report = JSON.parse(raw) as DeploymentValidatorReport;
+          resolve({ code, stdout, stderr, report });
+        })
+        .catch(reject);
+    });
+  });
+}
+
+async function writeDeploymentFixture(root: string, input: { signalingServer: string }): Promise<void> {
+  await mkdir(join(root, 'deploy'), { recursive: true });
+  await mkdir(join(root, 'packages/cli/src'), { recursive: true });
+  await mkdir(join(root, 'packages/signaling/src'), { recursive: true });
+  await writeFile(join(root, 'deploy/grid.ponslink.env.example'), [
+    'PONSWARP_MESH_PUBLIC_BASE_URL=https://grid.ponslink.com',
+    'PONSWARP_MESH_LEGACY_BASE_URL=https://warp.ponslink.com',
+    'PONSWARP_MESH_DB_SCHEMA=grid',
+    'PONSWARP_WEB_SHOW_QA_CONTROLS=false',
+    'PONSWARP_MESH_ADMIN_API_TOKEN=REPLACE_WITH_SECRET',
+    'PONSWARP_NODE_TOKEN_PEPPER=REPLACE_WITH_SECRET',
+    'PONSWARP_TURN_STATIC_AUTH_SECRET=REPLACE_WITH_SECRET',
+    ''
+  ].join('\n'));
+  await writeFile(join(root, 'deploy/grid.ponslink.nginx.conf'), [
+    'server {',
+    '  server_name grid.ponslink.com;',
+    '  add_header Strict-Transport-Security "max-age=31536000" always;',
+    '  add_header Content-Security-Policy "default-src self" always;',
+    '  add_header X-Content-Type-Options "nosniff" always;',
+    '  add_header Referrer-Policy "no-referrer" always;',
+    '  location /api/grid/v1/ { proxy_pass http://ponswarp_grid_coordinator/api/grid/v1/; add_header Cache-Control "no-cache" always; }',
+    '  location /ws/grid/ { proxy_pass http://ponswarp_grid_coordinator/ws/grid/; }',
+    '  location = /healthz { proxy_pass http://ponswarp_grid_coordinator/healthz; }',
+    '  location = /readyz { proxy_pass http://ponswarp_grid_coordinator/readyz; }',
+    '  location /assets/ { add_header Cache-Control "public, max-age=31536000, immutable" always; }',
+    '}',
+    ''
+  ].join('\n'));
+  await writeFile(join(root, 'deploy/ponswarp-grid-coordinator.service'), [
+    '[Unit]',
+    'Description=PonsWarp Grid Coordinator for grid.ponslink.com',
+    '[Service]',
+    'EnvironmentFile=/etc/ponswarp/grid.ponslink.env',
+    'ExecStart=/opt/ponswarp/ponswarp-signaling-rs/target/release/mesh_api --host 127.0.0.1 --port 8788',
+    'Restart=on-failure',
+    'NoNewPrivileges=true',
+    ''
+  ].join('\n'));
+  await writeFile(join(root, 'packages/cli/src/index.ts'), "const coordinator = process.env.PONSWARP_COORDINATOR_URL ?? 'https://grid.ponslink.com';\n");
+  await writeFile(join(root, 'packages/cli/src/coordinator-runtime.ts'), [
+    "const workspacePath = '/api/grid/v1/workspaces';",
+    "const sharePath = '/api/grid/v1/shares';",
+    ''
+  ].join('\n'));
+  await writeFile(join(root, 'packages/signaling/src/server.ts'), input.signalingServer);
+}
+
+function signalingServerFixture(input: { includeGridRoutes: boolean }): string {
+  const gridRoutes = input.includeGridRoutes ? [
+    "function isGridWebSocketPath(url) { return url === '/ws' || url === '/ws/grid'; }",
+    "if (request.url === '/api/grid/v1/ice') return writeJson(response, 200, {});",
+    "if (request.url?.startsWith('/api/grid/v1/shares')) return writeJson(response, 501, { error: 'not_implemented', expectedExternalService: 'ponswarp-grid-coordinator' });",
+    "if (isGridWebSocketPath(request.url)) return acceptWebSocket(request, socket);",
+    "return url === '/ws/grid';"
+  ] : [];
+  return [
+    "if (request.url === '/healthz') return writeJson(response, 200, {});",
+    "if (request.url === '/readyz') { const ready = true; return writeJson(response, ready ? 200 : 503, { status: ready ? 'ready' : 'not_ready' }); }",
+    "if (request.url === '/version.json') return writeJson(response, 200, { legacyDomain: 'warp.ponslink.com' });",
+    "const metadata = { legacyDomain: 'warp.ponslink.com', status: ready ? 'ready' : 'not_ready' };",
+    ...gridRoutes,
+    ''
+  ].join('\n');
+}
+
+function waitForSocketEvent(socket: Socket, event: 'connect' | 'data' | 'close'): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    socket.once(event, resolve);
+    socket.once('error', reject);
+  });
+}
+
 function rawSocketExchange(port: number, payload: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const socket = createConnection({ host: '127.0.0.1', port });
