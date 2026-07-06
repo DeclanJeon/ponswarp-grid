@@ -5,6 +5,7 @@ describe('web product helpers', () => {
   it('extracts a share code from links and custom URLs', () => {
     expect(parseShareCode('https://warp.ponslink.com/get/8f3k-22q9')).toBe('8F3K-22Q9');
     expect(parseShareCode('ponswarp://get/abcd-1234')).toBe('ABCD-1234');
+    expect(parseShareCode('https://grid.ponslink.com/#/get/demo-1a2b?session=sess_signal_1')).toBe('DEMO-1A2B');
     expect(parseShareCode('DEMO-1A2B')).toBe('DEMO-1A2B');
     expect(parseShareCode('not-a-code')).toBe('');
     expect(parseShareCode('')).toBe('');

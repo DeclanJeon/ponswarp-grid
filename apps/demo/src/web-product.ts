@@ -1,6 +1,6 @@
 export function parseShareCode(value: string): string {
   const trimmed = value.trim();
-  const match = trimmed.match(/(?:\/get\/|ponswarp:\/\/get\/)?([A-Z0-9]{4}-[A-Z0-9]{4})$/i);
+  const match = trimmed.match(/(?:\/get\/|ponswarp:\/\/get\/)?([A-Z0-9]{4}-[A-Z0-9]{4})(?:[?#].*)?$/i);
   return match?.[1].toUpperCase() ?? '';
 }
 

@@ -3,14 +3,23 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "scripts": { "build": "tsc -p tsconfig.json && vite build", "dev": "vite" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && vite build",
+    "dev": "vite"
+  },
   "dependencies": {
     "@ponswarp/core": "workspace:*",
     "@ponswarp/react": "workspace:*",
     "@ponswarp/signaling": "workspace:*",
     "@ponswarp/webrtc": "workspace:*",
+    "qrcode": "^1.5.4",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
   },
-  "devDependencies": { "@vitejs/plugin-react": "^5.1.1", "vite": "^7.2.4", "typescript": "~5.9.3" }
+  "devDependencies": {
+    "@types/qrcode": "^1.5.6",
+    "@vitejs/plugin-react": "^5.1.1",
+    "typescript": "~5.9.3",
+    "vite": "^7.2.4"
+  }
 }

@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "kind": "ponswarp-grid-web-version",
+  "name": "ponswarp-grid",
+  "version": "0.1.0",
+  "commitSha": "dev",
+  "coordinator": "https://grid.ponslink.com",
+  "generatedAt": "2026-07-04T21:37:34.562Z"
+}
