@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createServer as createHttpsServer } from 'node:https';
+import { readFileSync } from 'node:fs';
 import type { Socket } from 'node:net';
 import type { BinaryFrame, PeerId, Transport, TransportMessage, TransportMessageHandler, BinaryFrameHandler, Unsubscribe } from '@ponswarp/core';
 
@@ -39,11 +41,18 @@ interface WebSocketConnection {
 
 type PeerConnection = SocketConnection | WebSocketConnection;
 
+export interface TlsOptions {
+  cert: string;
+  key: string;
+  ca?: string;
+}
+
 export interface NodeWebSocketTransportOptions {
   selfId: PeerId;
   host?: string;
   port?: number;
   registry?: NodePeerEndpointRegistry;
+  tls?: TlsOptions;
 }
 
 export class NodeWebSocketTransport implements Transport {
@@ -51,6 +60,7 @@ export class NodeWebSocketTransport implements Transport {
   private readonly host: string;
   private readonly requestedPort: number;
   private readonly registry: NodePeerEndpointRegistry;
+  private readonly options: NodeWebSocketTransportOptions;
   private readonly messageHandlers = new Set<TransportMessageHandler>();
   private readonly binaryHandlers = new Set<BinaryFrameHandler>();
   private readonly connections = new Map<PeerId, PeerConnection>();
@@ -58,6 +68,7 @@ export class NodeWebSocketTransport implements Transport {
   private endpointUrl: string | null = null;
 
   constructor(options: NodeWebSocketTransportOptions) {
+    this.options = options;
     this.selfId = options.selfId;
     this.host = options.host ?? '127.0.0.1';
     this.requestedPort = options.port ?? 0;
@@ -66,10 +77,17 @@ export class NodeWebSocketTransport implements Transport {
 
   async listen(): Promise<PeerEndpoint> {
     if (this.server) return { peerId: this.selfId, url: this.requireEndpointUrl() };
-    const server = createServer((_request: IncomingMessage, response: ServerResponse) => {
+    const handler = (_request: IncomingMessage, response: ServerResponse) => {
       response.writeHead(404);
       response.end('PonsWarp peer data endpoint');
-    });
+    };
+    const server = this.options.tls
+      ? createHttpsServer({
+          cert: readFileSync(this.options.tls.cert, 'utf-8'),
+          key: readFileSync(this.options.tls.key, 'utf-8'),
+          ca: this.options.tls.ca ? readFileSync(this.options.tls.ca, 'utf-8') : undefined
+        }, handler)
+      : createServer(handler);
     server.on('upgrade', (request, socket) => this.handleUpgrade(request, socket as Socket));
     await new Promise<void>((resolve, reject) => {
       server.once('error', reject);
@@ -81,7 +99,8 @@ export class NodeWebSocketTransport implements Transport {
     this.server = server;
     const address = server.address();
     const port = typeof address === 'object' && address ? address.port : this.requestedPort;
-    this.endpointUrl = `ws://${this.host}:${port}/peer/${encodeURIComponent(this.selfId)}`;
+    const scheme = this.options.tls ? 'wss' : 'ws';
+    this.endpointUrl = `${scheme}://${this.host}:${port}/peer/${encodeURIComponent(this.selfId)}`;
     this.registry.set({ peerId: this.selfId, url: this.endpointUrl });
     return { peerId: this.selfId, url: this.endpointUrl };
   }

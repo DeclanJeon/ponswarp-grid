@@ -288,3 +288,131 @@ export class WebRTCTransport implements Transport {
     return this.options.createPeerConnection(peerId);
   }
 }
+
+export interface SignalingRelay {
+  sendRelay(envelope: { type: string; sessionId: string; fromPeerId: PeerId; toPeerId: PeerId; payload: Record<string, unknown> }): void;
+  onMessage(handler: (envelope: { type: string; fromPeerId: PeerId; payload: Record<string, unknown> }) => void): Unsubscribe;
+}
+
+export interface SdpCapablePeerConnection extends PeerConnectionLike {
+  createOffer(): Promise<unknown>;
+  createAnswer(): Promise<unknown>;
+  setLocalDescription(desc: unknown): Promise<void>;
+  setRemoteDescription(desc: unknown): Promise<void>;
+  addIceCandidate(candidate: unknown): Promise<void>;
+}
+
+export interface SignalingBridgeOptions {
+  transport: WebRTCTransport;
+  signaling: SignalingRelay;
+  sessionId: string;
+  selfPeerId: PeerId;
+  createPeerConnection: () => SdpCapablePeerConnection;
+}
+
+export class SignalingBridge {
+  private readonly transport: WebRTCTransport;
+  private readonly signaling: SignalingRelay;
+  private readonly sessionId: string;
+  private readonly selfPeerId: PeerId;
+  private readonly createPeerConnection: () => SdpCapablePeerConnection;
+  private unsubscribe: Unsubscribe | null = null;
+
+  constructor(options: SignalingBridgeOptions) {
+    this.transport = options.transport;
+    this.signaling = options.signaling;
+    this.sessionId = options.sessionId;
+    this.selfPeerId = options.selfPeerId;
+    this.createPeerConnection = options.createPeerConnection;
+  }
+
+  start(): void {
+    this.unsubscribe = this.signaling.onMessage(envelope => this.handleSignal(envelope));
+  }
+
+  stop(): void {
+    this.unsubscribe?.();
+    this.unsubscribe = null;
+  }
+
+  async initiateOffer(remotePeerId: PeerId): Promise<void> {
+    const connection = this.createPeerConnection();
+    const peer = this.transport.ensurePeer(remotePeerId, connection);
+    this.forwardIceCandidates(peer, remotePeerId);
+    peer.createDataChannel();
+    const offer = await connection.createOffer();
+    await connection.setLocalDescription(offer);
+    this.signaling.sendRelay({
+      type: 'WEBRTC_OFFER',
+      sessionId: this.sessionId,
+      fromPeerId: this.selfPeerId,
+      toPeerId: remotePeerId,
+      payload: { sdp: offer }
+    });
+  }
+
+  private forwardIceCandidates(peer: PeerConnectionWrapper, remotePeerId: PeerId): void {
+    peer.on('iceCandidate', candidate => {
+      if (candidate) {
+        this.signaling.sendRelay({
+          type: 'ICE_CANDIDATE',
+          sessionId: this.sessionId,
+          fromPeerId: this.selfPeerId,
+          toPeerId: remotePeerId,
+          payload: { candidate: candidate.toJSON?.() ?? candidate }
+        });
+      }
+    });
+  }
+
+  private handleSignal(envelope: { type: string; fromPeerId: PeerId; payload: Record<string, unknown> }): void {
+    if (envelope.fromPeerId === this.selfPeerId) return;
+    switch (envelope.type) {
+      case 'ICE_CANDIDATE': {
+        const peer = this.transport.getPeer(envelope.fromPeerId);
+        const candidate = envelope.payload.candidate as RTCIceCandidateInit | undefined;
+        if (peer && candidate) {
+          const conn = this.getConnection(peer);
+          conn?.addIceCandidate(candidate).catch(() => {});
+        }
+        break;
+      }
+      case 'WEBRTC_OFFER': {
+        const connection = this.createPeerConnection();
+        const peer = this.transport.ensurePeer(envelope.fromPeerId, connection);
+        this.forwardIceCandidates(peer, envelope.fromPeerId);
+        const sdp = envelope.payload.sdp as RTCSessionDescriptionInit;
+        connection.setRemoteDescription(sdp)
+          .then(async () => {
+            const answer = await connection.createAnswer();
+            await connection.setLocalDescription(answer);
+            this.signaling.sendRelay({
+              type: 'WEBRTC_ANSWER',
+              sessionId: this.sessionId,
+              fromPeerId: this.selfPeerId,
+              toPeerId: envelope.fromPeerId,
+              payload: { sdp: answer }
+            });
+          })
+          .catch(() => {});
+        break;
+      }
+      case 'WEBRTC_ANSWER': {
+        const peer = this.transport.getPeer(envelope.fromPeerId);
+        const conn = this.getConnection(peer);
+        if (conn) {
+          const sdp = envelope.payload.sdp as RTCSessionDescriptionInit;
+          conn.setRemoteDescription(sdp).catch(() => {});
+        }
+        break;
+      }
+    }
+  }
+
+  private getConnection(peer: PeerConnectionWrapper | undefined): SdpCapablePeerConnection | null {
+    if (!peer) return null;
+    const pc = (peer as unknown as { connection?: SdpCapablePeerConnection }).connection;
+    if (pc && typeof pc.createOffer === 'function') return pc;
+    return null;
+  }
+}
