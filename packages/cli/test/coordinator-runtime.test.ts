@@ -170,7 +170,7 @@ describe('coordinator CLI runtime', () => {
         'GET /api/grid/v1/workspaces/ws/files/file-1/candidates'
       ]);
       const output = JSON.parse(String(consoleSpy.mock.calls.at(-1)?.[0]));
-      expect(output).toMatchObject({ ok: true, command: 'download', dryRun: false, data: { fileId: 'file-1', outDir: 'downloads', status: 'planned', discovery: 'coordinator' } });
+      expect(output).toMatchObject({ ok: true, command: 'download', data: { fileId: 'file-1', outDir: 'downloads', status: 'planned', discovery: 'coordinator' } });
       expect(output.data.candidates).toMatchObject({ candidates: [{ nodeId: 'node-a', online: true }] });
     } finally {
       await server.close();

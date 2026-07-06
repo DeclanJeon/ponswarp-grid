@@ -334,16 +334,24 @@ function safeStorageKey(value: string): string {
 
 async function bestEffortCreateSignalingRoom(signalUrl: string, ownerPeerId: PeerId, sessionId: SessionId, files: SessionFileDescriptor[]): Promise<void> {
   await withTimeout(async () => {
-    const client = new BrowserSignalingClient({ url: signalUrl, reconnectDelaysMs: [] });
+    const client = new BrowserSignalingClient({ url: resolveSignalUrl(signalUrl), reconnectDelaysMs: [] });
     await client.connect();
     client.createSession({ sessionId, ownerPeerId, files, mode: 'grid' });
     await client.close();
   }, 250).catch(() => undefined);
 }
 
+function resolveSignalUrl(signalUrl: string): string {
+  if (signalUrl !== 'auto') return signalUrl;
+  const coordinator = process.env.PONSWARP_COORDINATOR_URL ?? 'https://grid.ponslink.com';
+  const url = new URL('/ws', coordinator);
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+  return url.toString();
+}
+
 async function bestEffortJoinSignalingRoom(signalUrl: string, sessionId: SessionId, peerId: PeerId): Promise<void> {
   await withTimeout(async () => {
-    const client = new BrowserSignalingClient({ url: signalUrl, reconnectDelaysMs: [] });
+    const client = new BrowserSignalingClient({ url: resolveSignalUrl(signalUrl), reconnectDelaysMs: [] });
     await client.connect();
     client.joinSession({ sessionId, peerId, role: 'receiver' });
     await client.close();

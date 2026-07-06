@@ -29,4 +29,12 @@ describe('web product helpers', () => {
     expect(isLocalShareMatch('ABCD-EFGH', 'WXYZ-9999')).toBe(false);
     expect(isLocalShareMatch(undefined, 'WXYZ-9999')).toBe(false);
   });
+
+  it('share codes round-trip through parseShareCode', () => {
+    for (let i = 0; i < 20; i++) {
+      const code = createShareCode();
+      expect(parseShareCode(code)).toBe(code);
+      expect(parseShareCode(`https://grid.ponslink.com/#/get/${code.toLowerCase()}?session=sess_1`)).toBe(code);
+    }
+  });
 });

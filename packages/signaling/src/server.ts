@@ -35,6 +35,7 @@ export interface SignalingServerConfig {
   turnRealm: string;
   turnUrls: string[];
   turnTtlSeconds: number;
+  sessionToken?: string;
 }
 
 export const DEFAULT_SIGNALING_SERVER_CONFIG: SignalingServerConfig = {
@@ -56,8 +57,9 @@ export const DEFAULT_SIGNALING_SERVER_CONFIG: SignalingServerConfig = {
   readinessChecks: {},
   turnStaticAuthSecret: process.env.PONSWARP_TURN_STATIC_AUTH_SECRET,
   turnRealm: process.env.PONSWARP_TURN_REALM ?? 'ponslink.com',
+  turnTtlSeconds: Number(process.env.PONSWARP_TURN_TTL_SECONDS ?? 600),
   turnUrls: (process.env.PONSWARP_TURN_URLS ?? '').split(',').map(url => url.trim()).filter(Boolean),
-  turnTtlSeconds: Number(process.env.PONSWARP_TURN_TTL_SECONDS ?? 600)
+  sessionToken: process.env.PONSWARP_SESSION_TOKEN || undefined
 };
 
 export type SignalingGatewayEvent =
@@ -299,6 +301,14 @@ export function createSignalingHttpServer(input: { config?: Partial<SignalingSer
       socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
       socket.destroy();
       return;
+    }
+    if (config.sessionToken) {
+      const requestUrl = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`);
+      if (requestUrl.searchParams.get('token') !== config.sessionToken) {
+        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+        socket.destroy();
+        return;
+      }
     }
     if (!isGridWebSocketPath(request.url)) {
       socket.write('HTTP/1.1 404 Not Found\r\n\r\n');

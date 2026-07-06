@@ -1003,6 +1003,8 @@ function App() {
     setState(current => ({ ...current, status: 'complete', sessionId: session.sessionId, shareUrl: session.shareUrl, manifest, progress, restoredProgress, downloadUrl, assembledBytes: assembledFile.size }));
   }
 
+  const showQA = import.meta.env.VITE_SHOW_QA_CONTROLS === 'true' || new URLSearchParams(location.search).has('qa');
+
   return (
     <main className="grid-shell">
       <style>{`
@@ -1689,7 +1691,7 @@ function App() {
           <div className="trust-item"><span className="trust-icon trust-icon-live"><Icon name="radio" size={26} /><span className="online-dot" /></span><span><p className="trust-title">Sender online</p><p className="trust-copy">Transfer happens in real time</p></span></div>
         </section>
 
-        <details id="how-it-works" className="developer-panel">
+        {showQA && <details id="how-it-works" className="developer-panel">
           <summary>Developer and QA controls</summary>
           <section aria-label="Sender panel">
             <h2>Sender</h2>
@@ -1728,7 +1730,7 @@ function App() {
             {state.error && <p role="alert" className="error-text">{state.error}</p>}
             <ol>{state.logs.map((log, index) => <li key={`${index}-${log}`}>{log}</li>)}</ol>
           </section>
-        </details>
+        </details>}
       </div>
     </main>
   );

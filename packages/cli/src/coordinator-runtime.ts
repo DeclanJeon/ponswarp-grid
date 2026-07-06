@@ -32,9 +32,11 @@ interface MeshDownloadPlan {
   fileId: string;
   outDir: string;
   candidates: unknown;
-  status: 'planned';
+  status: 'planned' | 'complete';
   discovery: 'dry-run-skipped' | 'coordinator';
+  execution: 'planned' | 'direct-join' | 'unavailable';
   note: string;
+  transferExitCode?: number;
 }
 
 interface MeshSharePlan {
@@ -167,25 +169,46 @@ export async function runFiles(command: FilesCommand): Promise<void> {
 }
 
 export async function runDownload(command: DownloadCommand): Promise<void> {
-  const candidates = command.dryRun
-    ? { candidates: [], note: 'Dry-run skipped coordinator discovery and did not contact provider nodes.' }
-    : await coordinatorRequest<unknown>(command.coordinator, `/api/grid/v1/workspaces/${encodeURIComponent(command.workspace)}/files/${encodeURIComponent(command.fileId)}/candidates`, { method: 'GET' });
+  if (command.dryRun) {
+    const plan: MeshDownloadPlan = {
+      fileId: command.fileId,
+      outDir: command.outDir,
+      candidates: { candidates: [], note: 'Dry-run skipped coordinator discovery and did not contact provider nodes.' },
+      status: 'planned',
+      discovery: 'dry-run-skipped',
+      execution: 'planned',
+      note: 'Dry run skipped candidate discovery. Run without --dry-run to discover providers and transfer.'
+    };
+    printResult(command.json, { ok: true, command: command.command, coordinator: command.coordinator, workspace: command.workspace, dryRun: true, data: plan });
+    return;
+  }
+  const candidates = await coordinatorRequest<unknown>(command.coordinator, `/api/grid/v1/workspaces/${encodeURIComponent(command.workspace)}/files/${encodeURIComponent(command.fileId)}/candidates`, { method: 'GET' });
+  const directTransfer = findDirectTransferHint(null, candidates);
+  let transferExitCode: number | undefined;
+  if (directTransfer) {
+    transferExitCode = await directTransferRunner({
+      command: 'join',
+      session: directTransfer.join,
+      signal: 'auto',
+      listen: '127.0.0.1:0',
+      outDir: command.outDir,
+      peer: directTransfer.peer,
+      seedAfterComplete: false,
+      maxPeers: 8
+    });
+    if (transferExitCode !== 0) throw new Error(`Direct join transfer failed with exit code ${transferExitCode}`);
+  }
   const plan: MeshDownloadPlan = {
     fileId: command.fileId,
     outDir: command.outDir,
     candidates,
-    status: 'planned',
-    discovery: command.dryRun ? 'dry-run-skipped' : 'coordinator',
-    note: 'Coordinator discovery is ready; provider transport execution remains on the direct send/join primitive until coordinator-mediated transport is enabled.'
+    status: directTransfer ? 'complete' : 'planned',
+    discovery: 'coordinator',
+    execution: directTransfer ? 'direct-join' : 'unavailable',
+    note: directTransfer ? 'Coordinator discovered provider and direct join transfer completed.' : 'Coordinator discovered candidates, but no direct provider join hint is online yet.',
+    transferExitCode
   };
-  printResult(command.json, {
-    ok: true,
-    command: command.command,
-    coordinator: command.coordinator,
-    workspace: command.workspace,
-    dryRun: command.dryRun,
-    data: plan
-  });
+  printResult(command.json, { ok: true, command: command.command, coordinator: command.coordinator, workspace: command.workspace, data: plan });
 }
 
 export async function runShare(command: ShareCommand): Promise<void> {
@@ -320,20 +343,41 @@ async function createManifestSummary(filePath: string, pieceSize: number): Promi
   };
 }
 
+const COORDINATOR_REQUEST_TIMEOUT_MS = 15_000;
+const COORDINATOR_MAX_RETRIES = 1;
+
 async function coordinatorRequest<T>(coordinator: string, path: string, options: { method: 'GET' | 'POST'; body?: unknown }): Promise<T> {
   const url = new URL(path, normalizeCoordinator(coordinator));
-  const response = await fetch(url, {
-    method: options.method,
-    headers: options.body === undefined ? undefined : { 'content-type': 'application/json' },
-    body: options.body === undefined ? undefined : JSON.stringify(options.body)
-  });
-  const text = await response.text();
-  const payload = text.length > 0 ? safeJsonParse(text) : null;
-  if (!response.ok) {
-    const detail = payload && typeof payload === 'object' && 'error' in payload ? String((payload as { error: unknown }).error) : text;
-    throw new Error(`Coordinator ${options.method} ${url.pathname} failed with ${response.status}${detail ? `: ${detail}` : ''}`);
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= COORDINATOR_MAX_RETRIES; attempt++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), COORDINATOR_REQUEST_TIMEOUT_MS);
+    try {
+      const response = await fetch(url, {
+        method: options.method,
+        headers: options.body === undefined ? undefined : { 'content-type': 'application/json' },
+        body: options.body === undefined ? undefined : JSON.stringify(options.body),
+        signal: controller.signal
+      });
+      clearTimeout(timeout);
+      const text = await response.text();
+      const payload = text.length > 0 ? safeJsonParse(text) : null;
+      if (!response.ok) {
+        const detail = payload && typeof payload === 'object' && 'error' in payload ? String((payload as { error: unknown }).error) : text;
+        throw new Error(`Coordinator ${options.method} ${url.pathname} failed with ${response.status}${detail ? `: ${detail}` : ''}`);
+      }
+      return payload as T;
+    } catch (error) {
+      clearTimeout(timeout);
+      lastError = error;
+      if (attempt < COORDINATOR_MAX_RETRIES && (error instanceof TypeError || (error instanceof DOMException && error.name === 'AbortError'))) {
+        await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+        continue;
+      }
+      throw error;
+    }
   }
-  return payload as T;
+  throw lastError;
 }
 
 function normalizeCoordinator(coordinator: string): string {
@@ -433,7 +477,7 @@ function createCoordinatorJoinCommand(command: GetCommand, hint: DirectTransferH
   return {
     command: 'join',
     session: hint.join,
-    signal: 'ws://127.0.0.1:8787/ws',
+    signal: 'auto',
     listen: '127.0.0.1:0',
     outDir: command.outDir,
     peer: hint.peer,

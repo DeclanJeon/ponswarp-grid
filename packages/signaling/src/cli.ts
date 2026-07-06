@@ -13,7 +13,8 @@ function readConfig(): SignalingServerConfig {
     maxSessions: Number(process.env.PONSWARP_MAX_SESSIONS ?? DEFAULT_SIGNALING_SERVER_CONFIG.maxSessions),
     heartbeatIntervalMs: Number(process.env.PONSWARP_HEARTBEAT_INTERVAL_MS ?? DEFAULT_SIGNALING_SERVER_CONFIG.heartbeatIntervalMs),
     stalePeerTimeoutMs: Number(process.env.PONSWARP_STALE_PEER_TIMEOUT_MS ?? DEFAULT_SIGNALING_SERVER_CONFIG.stalePeerTimeoutMs),
-    allowedOrigins: (process.env.PONSWARP_ALLOWED_ORIGINS ?? '').split(',').map(origin => origin.trim()).filter(Boolean)
+    allowedOrigins: (process.env.PONSWARP_ALLOWED_ORIGINS ?? '').split(',').map(origin => origin.trim()).filter(Boolean),
+    sessionToken: process.env.PONSWARP_SESSION_TOKEN || undefined
   };
 }
 
