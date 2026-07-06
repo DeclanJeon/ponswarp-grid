@@ -28,18 +28,9 @@
 | `05-test-plan.md` | 테스트 계획서 | 단위, 통합, E2E, 시연 테스트 전략 정의 |
 | `06-contest-dev-report-draft.md` | 대회 개발보고서 초안 | 오픈소스 개발자대회 제출용 서술 구조 |
 | `07-implementation-tickets.md` | 구현 티켓 목록 | 실제 개발 작업 단위와 우선순위 정의 |
-| `08-production-hardening-design.md` | 운영 보강 설계서 | Postgres 영속화, 인증/권한, rate limit, 관측성, cleanup, 멀티 디바이스 release gate 정의 |
-| `09-final-production-architecture-summary.md` | 최종 운영 아키텍처 요약 | mesh coordinator 분리형 최종 구조, 구현 순서, production enable blockers 정리 |
 | `10-release-qa-gates.md` | 릴리스 QA 게이트 | mesh API load, abuse/rate-limit, cleanup/retention, restart/DR, metrics/log, rollback/go/no-go 체크리스트 |
 | `11-multi-device-qa-report-template.md` | 멀티 디바이스 QA 보고서 템플릿 | desktop/mobile, LAN/NAT, reconnect, restart, large-file/resume, 3+ peer grid 검증 기록 양식 |
-| `12-public-production-readiness-design.md` | Public production readiness 설계 | TURN TCP/TLS, Postgres, RBAC/token/audit, rate limit, multi-provider 대용량 grid gate 설계 |
-| `13-public-production-work-order.md` | Public production 작업지시서 | 운영 배포 전 gate별 구현·QA·checkpoint 작업 순서 |
-| `14-grid-ponslink-deployment-design.md` | `grid.ponslink.com` 배포 설계 | 기존 `warp.ponslink.com` 운영과 분리된 Grid 전용 도메인, proxy, DB, rollout, QA 작업지시 |
-| `16-grid-95-completion-design.md` | 95% 완성도 달성 설계서 | 현재 MVP 상태에서 제품 완성도 95% 이상으로 올리기 위한 목표 아키텍처, scorecard, gap closure 설계 |
-| `17-grid-95-completion-work-order.md` | 95% 완성도 작업지시서 | core, browser, CLI, coordinator, network QA, production hardening, docs 정렬을 위한 실행 작업 패키지 |
 | `18-external-network-qa-playbook.md` | 외부망 QA 플레이북 | strict network matrix를 통과하기 위해 필요한 실제 외부망/UDP 차단/TURN TCP-TLS 검증 절차와 artifact 형식 |
-| `19-grid-public-ui-concept.md` | Public UI 콘셉트 | 공개 웹 화면을 Send file / Receive file 두 동작으로 단순화하기 위한 IA, copy, visual prompt |
-| `20-grid-ui-reference-implementation-prompt.md` | UI reference 구현 프롬프트 | 승인된 콘셉트 이미지를 실제 React/Vite UI로 재현하기 위한 시각/상호작용/QA 기준 |
 
 ---
 
@@ -150,10 +141,7 @@ MVP 성공 기준은 다음이다.
 | 테스트 추가 | `05-test-plan.md` |
 | 대회 제출 문안 변경 | `06-contest-dev-report-draft.md` |
 | 작업 우선순위 변경 | `07-implementation-tickets.md` |
-| 운영 보강 설계 변경 | `08-production-hardening-design.md` |
-| 95% 완성도 계획 수립 | `16-grid-95-completion-design.md`, `17-grid-95-completion-work-order.md` |
-| 최종 운영 구조 변경 | `09-final-production-architecture-summary.md`, `14-grid-ponslink-deployment-design.md`, `16-grid-95-completion-design.md`, `17-grid-95-completion-work-order.md` |
-| 릴리스/운영 QA 기준 변경 | `10-release-qa-gates.md`, `11-multi-device-qa-report-template.md`, `13-public-production-work-order.md`, `14-grid-ponslink-deployment-design.md`, `16-grid-95-completion-design.md`, `17-grid-95-completion-work-order.md` |
+| 릴리스/운영 QA 기준 변경 | `10-release-qa-gates.md`, `11-multi-device-qa-report-template.md`, `18-external-network-qa-playbook.md` |
 
 ---
 
