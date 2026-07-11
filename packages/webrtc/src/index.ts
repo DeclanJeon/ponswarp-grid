@@ -2,6 +2,8 @@ import type { BinaryFrame, PeerId, Transport, TransportMessage, TransportMessage
 
 const KIB = 1024;
 const MIB = 1024 * KIB;
+const MIN_PENDING_SEND_BYTES = 256 * KIB;
+const TEXT_ENCODER = new TextEncoder();
 
 export interface FlowControlProfile {
   chunkSize: number;
@@ -58,12 +60,22 @@ export interface PeerConnectionLike {
   removeEventListener(type: 'connectionstatechange' | 'icecandidate' | 'datachannel', listener: EventListener): void;
 }
 
+export interface WatermarkEvent {
+  peerId: PeerId;
+  phase: 'high' | 'low';
+  bufferedAmount: number;
+  highWaterMark: number;
+  lowWaterMark: number;
+  timestamp: number;
+}
+
 export type DataChannelEventMap = {
   open: void;
   close: void;
   error: Event;
   message: string | ArrayBuffer;
   drain: void;
+  watermark: WatermarkEvent;
 };
 
 export interface PeerConnectionEvents {
@@ -78,6 +90,7 @@ export interface TransportEvents {
   binary: { peerId: PeerId; data: ArrayBuffer };
   peerState: { peerId: PeerId; state: RTCPeerConnectionState };
   error: { peerId: PeerId; error: Error };
+  watermark: WatermarkEvent;
 }
 
 type DrainWaiter = { resolveIfWritable: () => void; reject: (reason: Error) => void };
@@ -103,7 +116,15 @@ class Emitter<TEvents extends object> {
 export class DataChannelWrapper {
   private readonly emitter = new Emitter<DataChannelEventMap>();
   private readonly drainWaiters = new Set<DrainWaiter>();
-  private sendQueue: Promise<void> = Promise.resolve();
+  private readonly pendingSends: Array<{
+    send: () => void;
+    bytes: number;
+    resolve: () => void;
+    reject: (reason: unknown) => void;
+  }> = [];
+  private pendingSendBytes = 0;
+  private pumpingSends = false;
+  private watermarkBlocked = false;
 
   constructor(readonly peerId: PeerId, readonly channel: DataChannelLike, readonly flowControl: FlowControlProfile = DEFAULT_FLOW_CONTROL_PROFILE) {
     channel.binaryType = 'arraybuffer';
@@ -117,8 +138,8 @@ export class DataChannelWrapper {
 
   on<TType extends keyof DataChannelEventMap>(type: TType, handler: Handler<DataChannelEventMap[TType]>): Unsubscribe { return this.emitter.on(type, handler); }
   async sendJson(value: unknown): Promise<void> { await this.sendText(JSON.stringify(value)); }
-  async sendText(value: string): Promise<void> { await this.enqueueSend(() => this.channel.send(value)); }
-  async sendBinary(value: ArrayBuffer | ArrayBufferView): Promise<void> { await this.enqueueSend(() => this.channel.send(value)); }
+  async sendText(value: string): Promise<void> { await this.enqueueSend(() => this.channel.send(value), TEXT_ENCODER.encode(value).byteLength); }
+  async sendBinary(value: ArrayBuffer | ArrayBufferView): Promise<void> { await this.enqueueSend(() => this.channel.send(value), value.byteLength); }
   canSend(): boolean { return this.channel.readyState === 'open' && this.channel.bufferedAmount < this.flowControl.highWaterMark; }
   close(): void { this.channel.close(); }
 
@@ -128,24 +149,58 @@ export class DataChannelWrapper {
     this.channel.removeEventListener('error', this.handleError);
     this.channel.removeEventListener('message', this.handleMessage);
     this.channel.removeEventListener('bufferedamountlow', this.handleDrain);
-    this.rejectDrainWaiters(new Error(`DataChannel for ${this.peerId} disposed while waiting for backpressure drain`));
+    const error = new Error(`DataChannel for ${this.peerId} disposed while waiting for backpressure drain`);
+    this.rejectDrainWaiters(error);
+    this.rejectPendingSends(error);
     this.emitter.clear();
   }
 
   private ensureOpen(): void { if (this.channel.readyState !== 'open') throw new Error(`DataChannel for ${this.peerId} is ${this.channel.readyState}`); }
 
-  private enqueueSend(send: () => void): Promise<void> {
-    const next = this.sendQueue.then(async () => {
-      await this.waitForWritable();
-      send();
+  private enqueueSend(send: () => void, bytes: number): Promise<void> {
+    const capacity = Math.max(this.flowControl.highWaterMark, MIN_PENDING_SEND_BYTES);
+    if (bytes > capacity || this.pendingSendBytes + bytes > capacity) {
+      return Promise.reject(new Error(`DataChannel send queue for ${this.peerId} exceeded ${capacity} bytes`));
+    }
+    this.pendingSendBytes += bytes;
+    const promise = new Promise<void>((resolve, reject) => {
+      this.pendingSends.push({ send, bytes, resolve, reject });
     });
-    this.sendQueue = next.catch(() => undefined);
-    return next;
+    this.pumpSends();
+    return promise;
+  }
+
+  private pumpSends(): void {
+    if (this.pumpingSends) return;
+    this.pumpingSends = true;
+    void this.drainSendQueue();
+  }
+
+  private async drainSendQueue(): Promise<void> {
+    try {
+      while (this.pendingSends.length > 0) {
+        const pending = this.pendingSends.shift()!;
+        try {
+          await this.waitForWritable();
+          pending.send();
+          pending.resolve();
+        } catch (error) {
+          pending.reject(error);
+        } finally {
+          this.pendingSendBytes -= pending.bytes;
+        }
+      }
+    } finally {
+      this.pumpingSends = false;
+      if (this.pendingSends.length > 0) this.pumpSends();
+    }
   }
 
   private async waitForWritable(): Promise<void> {
     this.ensureOpen();
     if (this.channel.bufferedAmount < this.flowControl.highWaterMark) return;
+    this.watermarkBlocked = true;
+    this.emitter.emit('watermark', this.createWatermarkEvent('high'));
     await new Promise<void>((resolve, reject) => {
       const waiter: DrainWaiter = {
         resolveIfWritable: () => {
@@ -160,10 +215,42 @@ export class DataChannelWrapper {
   }
 
   private readonly handleOpen = () => this.emitter.emit('open', undefined);
-  private readonly handleClose = () => { this.rejectDrainWaiters(new Error(`DataChannel for ${this.peerId} closed while waiting for backpressure drain`)); this.emitter.emit('close', undefined); };
-  private readonly handleError = (event: Event) => { this.rejectDrainWaiters(new Error(`DataChannel for ${this.peerId} errored while waiting for backpressure drain`)); this.emitter.emit('error', event); };
-  private readonly handleDrain = () => { this.emitter.emit('drain', undefined); for (const waiter of [...this.drainWaiters]) waiter.resolveIfWritable(); };
+  private readonly handleClose = () => {
+    const error = new Error(`DataChannel for ${this.peerId} closed while waiting for backpressure drain`);
+    this.rejectDrainWaiters(error);
+    this.rejectPendingSends(error);
+    this.emitter.emit('close', undefined);
+  };
+  private readonly handleError = (event: Event) => {
+    const error = new Error(`DataChannel for ${this.peerId} errored while waiting for backpressure drain`);
+    this.rejectDrainWaiters(error);
+    this.rejectPendingSends(error);
+    this.emitter.emit('error', event);
+  };
+  private readonly handleDrain = () => {
+    this.emitter.emit('drain', undefined);
+    if (this.watermarkBlocked && this.channel.bufferedAmount <= this.flowControl.lowWaterMark) {
+      this.watermarkBlocked = false;
+      this.emitter.emit('watermark', this.createWatermarkEvent('low'));
+    }
+    for (const waiter of [...this.drainWaiters]) waiter.resolveIfWritable();
+  };
   private rejectDrainWaiters(error: Error): void { for (const waiter of [...this.drainWaiters]) waiter.reject(error); this.drainWaiters.clear(); }
+  private rejectPendingSends(error: Error): void {
+    const pending = this.pendingSends.splice(0);
+    this.pendingSendBytes -= pending.reduce((total, item) => total + item.bytes, 0);
+    for (const item of pending) item.reject(error);
+  }
+  private createWatermarkEvent(phase: WatermarkEvent['phase']): WatermarkEvent {
+    return {
+      peerId: this.peerId,
+      phase,
+      bufferedAmount: this.channel.bufferedAmount,
+      highWaterMark: this.flowControl.highWaterMark,
+      lowWaterMark: this.flowControl.lowWaterMark,
+      timestamp: Date.now()
+    };
+  }
 
   private readonly handleMessage = (event: Event) => {
     const data = (event as MessageEvent).data;
@@ -193,7 +280,11 @@ export class PeerConnectionWrapper {
   }
 
   attachChannel(channel: DataChannelLike): DataChannelWrapper {
-    this.channel?.dispose();
+    const previous = this.channel;
+    if (previous) {
+      if (previous.channel.readyState !== 'closed' && previous.channel.readyState !== 'closing') previous.close();
+      previous.dispose();
+    }
     this.channel = new DataChannelWrapper(this.peerId, channel, this.flowControl);
     this.emitter.emit('channel', this.channel);
     return this.channel;
@@ -232,6 +323,10 @@ export class WebRTCTransport implements Transport {
   onBinary(handler: BinaryFrameHandler): Unsubscribe { return this.emitter.on('binary', event => handler(event.peerId, event.data)); }
   onPeerState(handler: Handler<TransportEvents['peerState']>): Unsubscribe { return this.emitter.on('peerState', handler); }
   onError(handler: Handler<TransportEvents['error']>): Unsubscribe { return this.emitter.on('error', handler); }
+  reportError(peerId: PeerId, error: unknown): void {
+    this.emitter.emit('error', { peerId, error: error instanceof Error ? error : new Error(String(error)) });
+  }
+  onWatermark(handler: Handler<TransportEvents['watermark']>): Unsubscribe { return this.emitter.on('watermark', handler); }
 
   async connect(peerId: PeerId): Promise<void> {
     this.ensurePeer(peerId);
@@ -274,7 +369,8 @@ export class WebRTCTransport implements Transport {
         this.emitter.emit('binary', { peerId, data });
       }
     });
-    channel.on('error', event => this.emitter.emit('error', { peerId, error: new Error(`DataChannel error for ${peerId}: ${event.type}`) }));
+    channel.on('error', event => this.reportError(peerId, new Error(`DataChannel error for ${peerId}: ${event.type}`)));
+    channel.on('watermark', event => this.emitter.emit('watermark', event));
   }
 
   private requireChannel(peerId: PeerId): DataChannelWrapper {
@@ -373,7 +469,7 @@ export class SignalingBridge {
         const candidate = envelope.payload.candidate as RTCIceCandidateInit | undefined;
         if (peer && candidate) {
           const conn = this.getConnection(peer);
-          conn?.addIceCandidate(candidate).catch(() => {});
+          conn?.addIceCandidate(candidate).catch(error => this.transport.reportError(envelope.fromPeerId, error));
         }
         break;
       }
@@ -394,7 +490,7 @@ export class SignalingBridge {
               payload: { sdp: answer }
             });
           })
-          .catch(() => {});
+          .catch(error => this.transport.reportError(envelope.fromPeerId, error));
         break;
       }
       case 'WEBRTC_ANSWER': {
@@ -402,7 +498,7 @@ export class SignalingBridge {
         const conn = this.getConnection(peer);
         if (conn) {
           const sdp = envelope.payload.sdp as RTCSessionDescriptionInit;
-          conn.setRemoteDescription(sdp).catch(() => {});
+          conn.setRemoteDescription(sdp).catch(error => this.transport.reportError(envelope.fromPeerId, error));
         }
         break;
       }

@@ -1,8 +1,15 @@
+# Provision once as root:
+# install -d -o root -g root -m 0755 /etc/ponswarp-grid
+# install -o root -g root -m 0644 deploy/ponswarp-grid-runtime-config.json.example /etc/ponswarp-grid/web-runtime-config.json
+# Atomic replacement or rollback: install -o root -g root -m 0644 web-runtime-config.json.new /etc/ponswarp-grid/web-runtime-config.json.tmp && mv -f /etc/ponswarp-grid/web-runtime-config.json.tmp /etc/ponswarp-grid/web-runtime-config.json.
+
 [Unit]
 Description=PonsWarp Grid static web for grid.ponslink.com
 After=network.target
 
 [Service]
+ExecStartPre=/usr/bin/install -d -o root -g root -m 0755 /etc/ponswarp-grid
+ExecStartPre=/usr/bin/test -s /etc/ponswarp-grid/web-runtime-config.json
 Type=simple
 WorkingDirectory=/home/declan/ponswarp-grid-web/current
 ExecStart=/usr/bin/python3 -m http.server 4180 --bind 127.0.0.1

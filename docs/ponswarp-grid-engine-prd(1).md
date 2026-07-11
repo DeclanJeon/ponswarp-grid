@@ -817,10 +817,31 @@ Average Speed
 - hash mismatch
 - signaling server 연결 끊김
 - peer 이탈
-- 중복 piece 수신
-- 오래된 session 접근
-
-### 16.3 보안
+|- 오래된 session 접근
+|
+|### 16.3 Direct-transfer reliability evidence mapping
+|
+|The implemented direct-transfer reliability work satisfies the existing requirements; it does not change their priority or meaning. Evidence is collected with the local QA run schema v2 and mapped as follows:
+|
+| Requirement | Evidence focus |
+|---|---|
+| F006 | Piece/chunk transfer completes under the selected request window and preserves ordered header/binary pairing. |
+| F007 | ACK/REJECT outcomes and piece progress are present in the run record. |
+| F008 | Retry and missing-piece behavior is recorded, including lifecycle interruption handling. |
+| F009 | Backpressure and bounded in-flight scheduling are recorded without claiming a throughput gain. |
+| F010 | Each verified piece has storage/write evidence before completion. |
+| F011 | Resume/reconnect restores local state and requests only missing pieces. |
+| F012 | Piece and final-file verification outcomes are recorded. |
+| F013 | Final download assembly is recorded only after verification succeeds. |
+| F014 | Progress, speed observation, and remaining-piece state are captured as observed facts. |
+| F015 | Connection, verification, storage, lifecycle, and disposal errors are explicit outcomes. |
+| F105 | Transfer report contains observed speed, retry count, failure outcome, and evidence references. |
+|
+|The same evidence is cross-referenced to §§12 (engine modules and lifecycle ownership), 15 (user-visible progress/error behavior), 16 (quality and stability), 21 (DataChannel and storage decisions), and 22 (risk mitigations). Every succeeded, failed, or cancelled run requires clean `dispose` evidence. An unavailable stratum is represented only by the separate approval record; a missing or malformed run disposal record is invalid evidence.
+|
+|Runtime config v1 is hold-1 by default. Window 2 is experimental and cannot be selected before an explicit `ENABLE` gate; `HOLD` and `ROLLBACK` select window 1. Local runs and approvals are defined by `qa/direct-transfer/run-manifest.v1.json` and `qa/direct-transfer/unavailable-approval.v1.json`, with outputs under `artifacts/direct-transfer/<suiteId>/`. A valid unexpired approval excludes only that unavailable stratum; it is not a passing result, and `ENABLE` still requires two complete available external/relay strata.
+|
+|### 16.4 보안
 
 MVP 기준:
 

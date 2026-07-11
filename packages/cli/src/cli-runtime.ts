@@ -1,4 +1,5 @@
 import { mkdir, readFile, readdir, rename, rm } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
 import { basename, join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { PonsWarpEngine, type FileManifest, type PeerId, type SessionId, type TransferProgress } from '@ponswarp/core';
@@ -143,11 +144,14 @@ export async function runSend(command: SendCommand): Promise<void> {
   const ownerPeerId = `peer_owner_${process.pid}` as PeerId;
   const registry = new NodePeerEndpointRegistry();
   const transport = new NodeWebSocketTransport({ selfId: ownerPeerId, host: parseListenHost(command.listen), port: parseListenPort(command.listen), registry });
-  const ownerEndpoint = await transport.listen();
   let source: NodeFileSource | undefined;
+  let engine: PonsWarpEngine | undefined;
+  const cleanup = createCliCleanup(() => engine, () => source, transport);
+  const shutdown = installCliShutdownHandlers(cleanup);
   try {
+    const ownerEndpoint = await transport.listen();
     const storage = new NodeFileStorageAdapter({ rootDir: join(getCliStorageRoot(), 'owners', safeStorageKey(command.session ?? String(process.pid))) });
-    const engine = new PonsWarpEngine(storage, undefined, undefined, undefined, transport);
+    engine = new PonsWarpEngine(storage, undefined, undefined, undefined, transport);
     source = await openNodeFileSource(command.file);
     const file = toBlobLikeFile(source);
     const session = await engine.createSession({
@@ -168,14 +172,12 @@ export async function runSend(command: SendCommand): Promise<void> {
     console.log(`Join: ${encodeJoinDescriptor(descriptor)}`);
     console.log(`Owner endpoint: ${descriptor.ownerEndpoint.url}`);
     console.log(`Serving ${session.manifests[0]?.name ?? command.file} with ${session.manifests[0]?.pieceCount ?? 0} pieces.`);
-    await waitForShutdown(async () => {
-      await source?.close();
-      await transport.close();
-    });
+    await shutdown.wait;
   } catch (error) {
-    await source?.close().catch(() => undefined);
-    await transport.close().catch(() => undefined);
-    throw error;
+    await rethrowWithCleanup(error, cleanup);
+  }
+  finally {
+    shutdown.remove();
   }
 }
 
@@ -185,88 +187,93 @@ export async function runJoin(command: JoinCommand): Promise<number> {
   const registry = new NodePeerEndpointRegistry();
   registry.set(descriptor.ownerEndpoint);
   const transport = new NodeWebSocketTransport({ selfId: receiverPeerId, host: parseListenHost(command.listen), port: parseListenPort(command.listen), registry });
-  const receiverEndpoint = await transport.listen();
-  const storage = new NodeFileStorageAdapter({ rootDir: join(getCliStorageRoot(), 'receivers', safeStorageKey(`${descriptor.sessionId}:${command.outDir}`)) });
-  const engine = new PonsWarpEngine(storage, undefined, undefined, undefined, transport);
-  await engine.joinSession(descriptor.sessionId, descriptor.manifests);
-  const manifest = descriptor.manifests[0];
-  if (!manifest) throw new Error('Join descriptor does not contain a file manifest');
-  await mkdir(command.outDir, { recursive: true });
-  const outputName = basename(manifest.name);
-  const outputPath = join(command.outDir, outputName);
-  const tempOutputPath = join(command.outDir, `.${outputName}.ponswarp-partial`);
-  const activeOutputPath = command.seedAfterComplete ? outputPath : tempOutputPath;
-  await storage.prepareOutputFile(manifest, activeOutputPath);
-  await engine.resumeFile(manifest.fileId);
-  await bestEffortJoinSignalingRoom(command.signal, descriptor.sessionId, receiverPeerId);
-  const peerDescriptor = command.peer ? decodePeerDescriptor(command.peer) : undefined;
-  if (peerDescriptor) {
-    registry.set(peerDescriptor.endpoint);
-    engine.updatePeerPieceMap(peerDescriptor.peerId, {
-      type: 'PIECE_MAP',
-      fileId: peerDescriptor.fileId,
-      verifiedPieces: peerDescriptor.verifiedPieces,
-      totalPieces: peerDescriptor.totalPieces,
-      generation: 1,
-      updatedAt: Date.now()
-    });
-    await transport.connect(peerDescriptor.peerId);
-  }
-  await transport.connect(descriptor.ownerPeerId);
-  let progress = engine.getProgress(manifest.fileId);
-  const providerPieces = new Map<string, number>();
-  while (progress.verifiedPieces < progress.totalPieces) {
-    const before = progress.verifiedPieces;
-    let scheduledPeerId: PeerId;
-    if (peerDescriptor) {
-      const scheduled = await engine.requestNextGridPiece(manifest.fileId, { ownerPeerId: descriptor.ownerPeerId, candidatePeers: [peerDescriptor.peerId, descriptor.ownerPeerId] });
-      if (scheduled.type !== 'scheduled') throw new Error(`No piece scheduled for CLI grid transfer: ${scheduled.reason}`);
-      scheduledPeerId = scheduled.peerId;
-      providerPieces.set(scheduledPeerId, (providerPieces.get(scheduledPeerId) ?? 0) + 1);
-    } else {
-      const scheduled = await engine.requestPieceWindow(descriptor.ownerPeerId, manifest.fileId, { maxInFlight: command.transferWindow });
-      if (scheduled.length === 0 && engine.getOutstandingRequestCount(manifest.fileId, descriptor.ownerPeerId) === 0) throw new Error('No piece scheduled for CLI direct transfer');
-      scheduledPeerId = descriptor.ownerPeerId;
-      if (scheduled.length > 0) providerPieces.set(scheduledPeerId, (providerPieces.get(scheduledPeerId) ?? 0) + scheduled.length);
-    }
-    progress = await waitForProgress(engine, manifest.fileId, before);
-    renderProgress(progress);
-  }
+  let engine: PonsWarpEngine | undefined;
+  const cleanup = createCliCleanup(() => engine, () => undefined, transport);
+  const shutdown = installCliShutdownHandlers(cleanup);
   try {
+    const receiverEndpoint = await transport.listen();
+    const storage = new NodeFileStorageAdapter({ rootDir: join(getCliStorageRoot(), 'receivers', safeStorageKey(`${descriptor.sessionId}:${command.outDir}`)) });
+    engine = new PonsWarpEngine(storage, undefined, undefined, undefined, transport);
+    await engine.joinSession(descriptor.sessionId, descriptor.manifests);
+    const manifest = descriptor.manifests[0];
+    if (!manifest) throw new Error('Join descriptor does not contain a file manifest');
+    await mkdir(command.outDir, { recursive: true });
+    const outputName = basename(manifest.name);
+    const outputPath = join(command.outDir, outputName);
+    const tempOutputPath = join(command.outDir, `.${outputName}.ponswarp-partial`);
+    const activeOutputPath = command.seedAfterComplete ? outputPath : tempOutputPath;
+    await storage.prepareOutputFile(manifest, activeOutputPath);
+    await engine.resumeFile(manifest.fileId);
+    await bestEffortJoinSignalingRoom(command.signal, descriptor.sessionId, receiverPeerId);
+    const peerDescriptor = command.peer ? decodePeerDescriptor(command.peer) : undefined;
+    if (peerDescriptor) {
+      registry.set(peerDescriptor.endpoint);
+      engine.updatePeerPieceMap(peerDescriptor.peerId, {
+        type: 'PIECE_MAP',
+        fileId: peerDescriptor.fileId,
+        verifiedPieces: peerDescriptor.verifiedPieces,
+        totalPieces: peerDescriptor.totalPieces,
+        generation: 1,
+        updatedAt: Date.now()
+      });
+      await transport.connect(peerDescriptor.peerId);
+    }
+    await transport.connect(descriptor.ownerPeerId);
+    let progress = engine.getProgress(manifest.fileId);
+    const providerPieces = new Map<string, number>();
+    while (progress.verifiedPieces < progress.totalPieces) {
+      const before = progress.verifiedPieces;
+      let scheduledPeerId: PeerId;
+      if (peerDescriptor) {
+        const scheduled = await engine.requestNextGridPiece(manifest.fileId, { ownerPeerId: descriptor.ownerPeerId, candidatePeers: [peerDescriptor.peerId, descriptor.ownerPeerId] });
+        if (scheduled.type !== 'scheduled') throw new Error(`No piece scheduled for CLI grid transfer: ${scheduled.reason}`);
+        scheduledPeerId = scheduled.peerId;
+        providerPieces.set(scheduledPeerId, (providerPieces.get(scheduledPeerId) ?? 0) + 1);
+      } else {
+        const scheduled = await engine.requestPieceWindow(descriptor.ownerPeerId, manifest.fileId, { maxInFlight: command.transferWindow });
+        if (scheduled.length === 0 && engine.getOutstandingRequestCount(manifest.fileId, descriptor.ownerPeerId) === 0) throw new Error('No piece scheduled for CLI direct transfer');
+        scheduledPeerId = descriptor.ownerPeerId;
+        if (scheduled.length > 0) providerPieces.set(scheduledPeerId, (providerPieces.get(scheduledPeerId) ?? 0) + scheduled.length);
+      }
+      progress = await waitForProgress(engine, manifest.fileId, before);
+      renderProgress(progress);
+    }
     const usage = await storage.getOutputStorageUsage(manifest.fileId);
     if (usage.mode !== 'offset' || usage.outputBytes !== manifest.size) {
       throw new Error(`Offset output storage was not prepared for ${manifest.name}`);
     }
     const completedPath = command.seedAfterComplete ? outputPath : tempOutputPath;
     if (manifest.fileHash) {
-      const hash = createHash('sha256').update(await readFile(completedPath)).digest('hex');
+      const hash = await hashFileStreaming(completedPath);
       if (hash !== manifest.fileHash) throw new Error(`Final hash mismatch: expected ${manifest.fileHash}, got ${hash}`);
     }
     if (!command.seedAfterComplete) await rename(tempOutputPath, outputPath);
+    console.log(`Complete: ${outputName}`);
+    console.log(`Output: ${outputPath}`);
+    console.log(`Verified: ${progress.verifiedPieces}/${progress.totalPieces}`);
+    console.log(`Hash: ${manifest.fileHash ? 'verified' : 'piece-only'}`);
+    for (const [peerId, count] of providerPieces) console.log(`Provider ${peerId}: ${count} pieces`);
+    const nonOwnerPieces = [...providerPieces].filter(([peerId]) => peerId !== descriptor.ownerPeerId).reduce((sum, [, count]) => sum + count, 0);
+    console.log(`Non-owner provider pieces: ${nonOwnerPieces}`);
+    if (command.seedAfterComplete) {
+      console.log(`Peer: ${encodePeerDescriptor({
+        schemaVersion: 1,
+        peerId: receiverPeerId,
+        endpoint: command.advertise ? { peerId: receiverPeerId, url: command.advertise } : receiverEndpoint,
+        fileId: manifest.fileId,
+        verifiedPieces: manifest.pieces.map(piece => piece.index),
+        totalPieces: manifest.pieceCount
+      })}`);
+      await shutdown.wait;
+    }
+    await cleanup();
+    return 0;
   } catch (error) {
-    await transport.close().catch(() => undefined);
-    throw error;
+    return rethrowWithCleanup(error, cleanup);
   }
-  console.log(`Complete: ${outputName}`);
-  console.log(`Output: ${outputPath}`);
-  console.log(`Verified: ${progress.verifiedPieces}/${progress.totalPieces}`);
-  console.log(`Hash: ${manifest.fileHash ? 'verified' : 'piece-only'}`);
-  for (const [peerId, count] of providerPieces) console.log(`Provider ${peerId}: ${count} pieces`);
-  const nonOwnerPieces = [...providerPieces].filter(([peerId]) => peerId !== descriptor.ownerPeerId).reduce((sum, [, count]) => sum + count, 0);
-  console.log(`Non-owner provider pieces: ${nonOwnerPieces}`);
-  if (command.seedAfterComplete) {
-    console.log(`Peer: ${encodePeerDescriptor({
-      schemaVersion: 1,
-      peerId: receiverPeerId,
-      endpoint: command.advertise ? { peerId: receiverPeerId, url: command.advertise } : receiverEndpoint,
-      fileId: manifest.fileId,
-      verifiedPieces: manifest.pieces.map(piece => piece.index),
-      totalPieces: manifest.pieceCount
-    })}`);
-    await waitForShutdown(async () => transport.close());
+  finally {
+    shutdown.remove();
   }
-  await transport.close();
-  return 0;
 }
 
 export function encodeJoinDescriptor(descriptor: CliSessionDescriptor): string {
@@ -331,6 +338,12 @@ function parseListenPort(listen: string): number {
 
 function safeStorageKey(value: string): string {
   return createHash('sha256').update(value).digest('hex').slice(0, 24);
+}
+
+async function hashFileStreaming(path: string): Promise<string> {
+  const hash = createHash('sha256');
+  for await (const chunk of createReadStream(path)) hash.update(chunk);
+  return hash.digest('hex');
 }
 
 async function bestEffortCreateSignalingRoom(signalUrl: string, ownerPeerId: PeerId, sessionId: SessionId, files: SessionFileDescriptor[]): Promise<void> {
@@ -414,15 +427,102 @@ function renderProgress(progress: TransferProgress): void {
   console.log(`Progress: ${progress.verifiedPieces}/${progress.totalPieces} pieces (${percent.toFixed(1)}%)`);
 }
 
-async function waitForShutdown(close: () => Promise<void>): Promise<never> {
-  return new Promise<never>(() => {
-    let closing = false;
-    const shutdown = (): void => {
-      if (closing) return;
-      closing = true;
-      void close().finally(() => process.exit(0));
-    };
-    process.once('SIGINT', shutdown);
-    process.once('SIGTERM', shutdown);
-  });
+type CleanupResource = PonsWarpEngine | undefined;
+
+export function createCliCleanup(
+  getEngine: () => CleanupResource,
+  getSource: () => NodeFileSource | undefined,
+  transport: NodeWebSocketTransport
+): () => Promise<void> {
+  let cleanupPromise: Promise<void> | undefined;
+  return (): Promise<void> => {
+    if (!cleanupPromise) {
+      cleanupPromise = (async (): Promise<void> => {
+        let firstError: unknown;
+        let hasFirstError = false;
+        const attempt = async (operation: () => Promise<void>): Promise<void> => {
+          try {
+            await operation();
+          } catch (error) {
+            if (!hasFirstError) {
+              hasFirstError = true;
+              firstError = error;
+            } else {
+              logCleanupError(error);
+            }
+          }
+        };
+        const engine = getEngine();
+        if (engine) {
+          await attempt(async () => {
+            await engine.dispose();
+          });
+        }
+        const source = getSource();
+        if (source) await attempt(() => source.close());
+        await attempt(() => transport.close());
+        if (hasFirstError) throw firstError;
+      })();
+    }
+    return cleanupPromise;
+  };
+}
+
+function logCleanupError(error: unknown): void {
+  console.error(error instanceof Error ? error.stack ?? error.message : String(error));
+}
+
+async function rethrowWithCleanup(primary: unknown, cleanup: () => Promise<void>): Promise<never> {
+  try {
+    await cleanup();
+  } catch (cleanupError) {
+    logCleanupError(cleanupError);
+  }
+  throw primary;
+}
+
+type ShutdownRuntime = {
+  on(signal: 'SIGINT' | 'SIGTERM', listener: () => void): unknown;
+  removeListener(signal: 'SIGINT' | 'SIGTERM', listener: () => void): unknown;
+  exit(code: number): unknown;
+};
+
+export function installCliShutdownHandlers(
+  cleanup: () => Promise<void>,
+  runtime: ShutdownRuntime = process
+): { wait: Promise<never>; remove: () => void } {
+  let closing = false;
+  let removed = false;
+  const wait = new Promise<never>(() => undefined);
+
+  const remove = (): void => {
+    if (removed || closing) return;
+    removed = true;
+    runtime.removeListener('SIGINT', onSigint);
+    runtime.removeListener('SIGTERM', onSigterm);
+  };
+  const finish = (code: number): void => {
+    if (!removed) {
+      removed = true;
+      runtime.removeListener('SIGINT', onSigint);
+      runtime.removeListener('SIGTERM', onSigterm);
+    }
+    runtime.exit(code);
+  };
+  const shutdown = (signal: 'SIGINT' | 'SIGTERM'): void => {
+    if (closing) return;
+    closing = true;
+    void cleanup().then(
+      () => finish(signal === 'SIGINT' ? 130 : 143),
+      error => {
+        console.error(error instanceof Error ? error.stack ?? error.message : String(error));
+        finish(1);
+      }
+    );
+  };
+  const onSigint = (): void => shutdown('SIGINT');
+  const onSigterm = (): void => shutdown('SIGTERM');
+  runtime.on('SIGINT', onSigint);
+  runtime.on('SIGTERM', onSigterm);
+  return { wait, remove };
 }

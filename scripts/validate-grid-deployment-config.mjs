@@ -27,6 +27,36 @@ function assertTrue(id, condition, evidence, failure) {
   if (condition) pass(id, evidence);
   else fail(id, failure);
 }
+function parseExactHoldOneConfig(text) {
+  try {
+    const value = JSON.parse(text);
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+    const keys = Object.keys(value).sort();
+    const direct = value.directTransfer;
+    return JSON.stringify(keys) === JSON.stringify(['directTransfer', 'schema'])
+      && value.schema === 'ponswarp-grid.runtime-config/v1'
+      && direct
+      && typeof direct === 'object'
+      && !Array.isArray(direct)
+      && JSON.stringify(Object.keys(direct).sort()) === JSON.stringify(['allowDiagnosticWindow2', 'hold', 'qaBuild', 'rolloutId', 'window'])
+      && direct.window === 1
+      && direct.hold === true
+      && direct.qaBuild === false
+      && direct.allowDiagnosticWindow2 === false
+      && direct.rolloutId === 'hold-1';
+  } catch {
+    return false;
+  }
+}
+
+async function readOptional(path) {
+  try {
+    return await readFile(path, 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    throw error;
+  }
+}
 
 const env = await readFile('deploy/grid.ponslink.env.example', 'utf8');
 const nginx = await readFile('deploy/grid.ponslink.nginx.conf', 'utf8');
@@ -34,6 +64,9 @@ const coordinatorSystemd = await readFile('deploy/ponswarp-grid-coordinator.serv
 const webSystemd = await readFile('deploy/ponswarp-grid-web.service', 'utf8');
 const cliIndex = await readFile('packages/cli/src/index.ts', 'utf8');
 const signalingServer = await readFile('packages/signaling/src/server.ts', 'utf8');
+const runtimeConfig = await readOptional('apps/demo/public/runtime-config.json');
+const runtimeConfigExample = await readOptional('deploy/ponswarp-grid-runtime-config.json.example');
+const transferReleaseConfig = await readOptional('apps/demo/src/transfer-release-config.ts');
 
 const activeNginx = uncommented(nginx);
 includesAll('env-grid-domain', env, [
@@ -54,6 +87,31 @@ includesAll('nginx-grid-routes', activeNginx, [
   'location = /healthz',
   'location = /readyz'
 ]);
+if (runtimeConfig !== null || runtimeConfigExample !== null || transferReleaseConfig !== null) {
+  includesAll('nginx-runtime-config-route', activeNginx, [
+    'location = /runtime-config.json',
+    'alias /etc/ponswarp-grid/web-runtime-config.json;',
+    'default_type application/json;',
+    'add_header Cache-Control "no-store, max-age=0" always;',
+    'add_header X-Content-Type-Options "nosniff" always;'
+  ]);
+  assertTrue(
+    'runtime-config-exact-hold-1',
+    runtimeConfig !== null && runtimeConfigExample !== null
+      && parseExactHoldOneConfig(runtimeConfig) && parseExactHoldOneConfig(runtimeConfigExample),
+    'Bundled and deployment runtime configs use the exact ponswarp-grid.runtime-config/v1 hold-1 object.',
+    'Runtime configs must include the strict hold/window/QA authorization/rollout fields; malformed, missing, extra, or window-2 values fail validation.'
+  );
+  assertTrue(
+    'runtime-config-fail-closed-window-1',
+    transferReleaseConfig !== null
+      && transferReleaseConfig.includes('DEFAULT_TRANSFER_WINDOW = 1;')
+      && transferReleaseConfig.includes('return DEFAULT_TRANSFER_WINDOW;')
+      && transferReleaseConfig.includes('return null;'),
+    'Runtime config parsing and resolution retain window-1 fallback on invalid or unavailable config.',
+    'Runtime config handling must fail closed to transfer window 1 when config is malformed or unavailable.'
+  );
+}
 assertTrue(
   'nginx-legacy-isolation',
   !activeNginx.includes('warp.ponslink.com') && !activeNginx.includes('location /ws ') && !activeNginx.includes('location /ws{'),
@@ -82,6 +140,15 @@ includesAll('systemd-web-static-service', webSystemd, [
   'Restart=on-failure',
   'NoNewPrivileges=true'
 ]);
+if (runtimeConfig !== null || runtimeConfigExample !== null || transferReleaseConfig !== null) {
+  includesAll('systemd-web-runtime-config', webSystemd, [
+    '/etc/ponswarp-grid/web-runtime-config.json',
+    'install -d -o root -g root -m 0755 /etc/ponswarp-grid',
+    'install -o root -g root -m 0644',
+    'ExecStartPre=/usr/bin/test -s /etc/ponswarp-grid/web-runtime-config.json',
+    'Atomic replacement or rollback:'
+  ]);
+}
 includesAll('cli-default-grid', cliIndex, [
   "process.env.PONSWARP_COORDINATOR_URL ?? 'https://grid.ponslink.com'"
 ]);

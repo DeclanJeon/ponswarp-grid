@@ -1,0 +1,10 @@
+{
+  "schema": "ponswarp-grid.runtime-config/v1",
+  "directTransfer": {
+    "window": 1,
+    "hold": true,
+    "allowDiagnosticWindow2": false,
+    "qaBuild": false,
+    "rolloutId": "hold-1"
+  }
+}

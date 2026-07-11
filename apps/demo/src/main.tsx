@@ -17,7 +17,9 @@ import {
 import { BrowserSignalingClient, SIGNALING_PROTOCOL, PROTOCOL_VERSION, type SignalingEnvelope } from '@ponswarp/signaling';
 import { WebRTCTransport } from '@ponswarp/webrtc';
 import { createShareCode, formatBytes, isLocalShareMatch, parseShareCode, resolveReceiveDisplayMetadata } from './web-product';
-import { DEFAULT_STUN_URL, SHARE_EXPIRY_MS, PIECE_PROGRESS_TIMEOUT_MS, PROGRESS_POLL_INTERVAL_MS, DEFAULT_BROWSER_TRANSFER_WINDOW, MAX_BROWSER_TRANSFER_WINDOW, DEFAULT_SAMPLE_FILE_NAME, DEFAULT_SAMPLE_PAYLOAD, calculatePieceSize } from './constants';
+import { DirectTransferController } from './direct-transfer-controller';
+import { loadRuntimeConfig, resolveBrowserTransferWindow, type RuntimeConfig } from './transfer-release-config';
+import { DEFAULT_STUN_URL, SHARE_EXPIRY_MS, PIECE_PROGRESS_TIMEOUT_MS, PROGRESS_POLL_INTERVAL_MS, DEFAULT_SAMPLE_FILE_NAME, DEFAULT_SAMPLE_PAYLOAD, calculatePieceSize } from './constants';
 import { DemoTransport, BroadcastDemoTransport } from './demo-transports';
 
 
@@ -52,6 +54,7 @@ type WebGetState =
   | { status: 'error'; input: string; code: string; message: string; suggestedAction?: string };
 
 type OwnerRuntime = {
+  generation: number;
   peerId: PeerId;
   sessionId: SessionId;
   client: BrowserSignalingClient;
@@ -61,6 +64,7 @@ type OwnerRuntime = {
 };
 
 type ReceiverRuntime = {
+  generation: number;
   peerId: PeerId;
   ownerPeerId?: PeerId;
   sessionId: SessionId;
@@ -112,12 +116,20 @@ function signalingUrl(): string {
   return `${scheme}//${location.host}/ws`;
 }
 
-function transferWindowSize(): number {
-  const explicit = Number(new URLSearchParams(location.search).get('transferWindow'));
-  if (!Number.isSafeInteger(explicit) || explicit <= 0) return DEFAULT_BROWSER_TRANSFER_WINDOW;
-  return Math.min(explicit, MAX_BROWSER_TRANSFER_WINDOW);
+async function transferWindowSize(): Promise<number> {
+  const configured = await ensureTransferWindowConfig();
+  return Math.min(configured, 2);
 }
 let runtimeRtcConfig: RTCConfiguration | null = null;
+let runtimeTransferConfig: RuntimeConfig | null = null;
+let runtimeTransferConfigLoaded = false;
+async function ensureTransferWindowConfig(): Promise<number> {
+  if (!runtimeTransferConfigLoaded) {
+    runtimeTransferConfigLoaded = true;
+    runtimeTransferConfig = await loadRuntimeConfig({ fetch }, location.origin);
+  }
+  return resolveBrowserTransferWindow(runtimeTransferConfig);
+}
 
 function rtcConfigFromUrl(): RTCConfiguration | null {
   const params = new URLSearchParams(location.search);
@@ -303,8 +315,36 @@ function App() {
   const [state, setState] = useState<AppState>({ status: 'idle', logs: ['Ready. Select a file or run the built-in sample.'] });
   const ownerRuntime = useRef<OwnerRuntime | null>(null);
   const receiverRuntime = useRef<ReceiverRuntime | null>(null);
+  const ownerRuntimeGeneration = useRef(0);
+  const receiverRuntimeGeneration = useRef(0);
+  const isCurrentRuntime = (runtime: OwnerRuntime | ReceiverRuntime): boolean =>
+    (runtime === ownerRuntime.current && runtime.generation === ownerRuntimeGeneration.current) ||
+    (runtime === receiverRuntime.current && runtime.generation === receiverRuntimeGeneration.current);
+  async function disposeOwnerRuntime(runtime: OwnerRuntime | null): Promise<void> {
+    if (!runtime) return;
+    if (ownerRuntime.current === runtime) ownerRuntime.current = null;
+    await runtime.client.close().catch(() => undefined);
+    for (const pc of runtime.peerConnections.values()) pc.close();
+    runtime.peerConnections.clear();
+    await runtime.engine.dispose().catch(() => undefined);
+    await runtime.transport.close().catch(() => undefined);
+  }
+  async function disposeReceiverRuntime(runtime: ReceiverRuntime | null): Promise<void> {
+    if (!runtime) return;
+    if (receiverRuntime.current === runtime) receiverRuntime.current = null;
+    await runtime.client.close().catch(() => undefined);
+    runtime.pc?.close();
+    runtime.pc = undefined;
+    await runtime.engine.dispose().catch(() => undefined);
+    await runtime.transport.close().catch(() => undefined);
+  }
   const storageKinds = useRef(new Map<SessionId, string>());
   const crossTabRuntimes = useRef<Array<{ transport: Transport; engine: PonsWarpEngine; storage: StorageAdapter }>>([]);
+  async function disposeCrossTabRuntime(runtime: { transport: Transport; engine: PonsWarpEngine; storage: StorageAdapter } | undefined): Promise<void> {
+    if (!runtime) return;
+    await runtime.engine.dispose().catch(() => undefined);
+    await runtime.transport.close().catch(() => undefined);
+  }
   const [webShare, setWebShare] = useState<WebShareState>({ status: 'idle' });
   const [webGet, setWebGet] = useState<WebGetState>({ status: 'idle', input: '' });
   const webShareFile = useRef<(Blob & { name?: string; type?: string }) | null>(null);
@@ -313,6 +353,17 @@ function App() {
 
   useEffect(() => { const downloadUrl = state.downloadUrl; if (!downloadUrl) return; return () => URL.revokeObjectURL(downloadUrl); }, [state.downloadUrl]);
   useEffect(() => () => { if (webDownloadUrl.current) URL.revokeObjectURL(webDownloadUrl.current); }, []);
+  useEffect(() => () => {
+    ownerRuntimeGeneration.current += 1;
+    receiverRuntimeGeneration.current += 1;
+    void disposeOwnerRuntime(ownerRuntime.current);
+    void disposeReceiverRuntime(receiverRuntime.current);
+    for (const runtime of crossTabRuntimes.current) {
+      void runtime.engine.dispose();
+      void runtime.transport.close();
+    }
+    crossTabRuntimes.current = [];
+  }, []);
   useEffect(() => {
     const match = location.hash.match(/^#\/get\/(.+)$/);
     if (match?.[1]) setWebGet({ status: 'idle', input: `${location.origin}${location.pathname}${location.search}${location.hash}` });
@@ -337,18 +388,36 @@ function App() {
     return `${type}/${protocol}`;
   }
 
-  async function logSelectedCandidatePair(label: string, pc: RTCPeerConnection): Promise<void> {
+  type RtcSnapshot = { bytes: number; pair?: { localCandidateType?: string; remoteCandidateType?: string; protocol?: string }; rttMs?: number };
+  async function readRtcSnapshot(pc: RTCPeerConnection): Promise<RtcSnapshot> {
     const stats = await pc.getStats();
-    let selectedPair: RTCStats | undefined;
+    let selected: RTCStats & { localCandidateId?: string; remoteCandidateId?: string; currentRoundTripTime?: number; bytesSent?: number; bytesReceived?: number } | undefined;
     stats.forEach(report => {
-      const candidatePair = report as RTCStats & { selected?: boolean; nominated?: boolean };
-      if (report.type === 'candidate-pair' && (candidatePair.selected || candidatePair.nominated)) selectedPair = report;
+      if (!selected && report.type === 'candidate-pair') {
+        const pair = report as RTCStats & { selected?: boolean; nominated?: boolean };
+        if (pair.selected || pair.nominated) selected = pair;
+      }
     });
-    if (!selectedPair) { pushLog(`${label} selected ICE pair: unavailable`); return; }
-    const pair = selectedPair as RTCStats & { localCandidateId?: string; remoteCandidateId?: string };
-    const local = pair.localCandidateId ? stats.get(pair.localCandidateId) as (RTCStats & { candidateType?: string; protocol?: string }) | undefined : undefined;
-    const remote = pair.remoteCandidateId ? stats.get(pair.remoteCandidateId) as (RTCStats & { candidateType?: string; protocol?: string }) | undefined : undefined;
-    pushLog(`${label} selected ICE pair: local=${local?.candidateType ?? 'unknown'}/${local?.protocol ?? 'unknown'} remote=${remote?.candidateType ?? 'unknown'}/${remote?.protocol ?? 'unknown'}`);
+    stats.forEach(report => {
+      if (!selected && report.type === 'candidate-pair' && (report as RTCStats & { state?: string }).state === 'succeeded') selected = report as typeof selected;
+    });
+    if (!selected) return { bytes: 0 };
+    const local = selected.localCandidateId ? stats.get(selected.localCandidateId) as (RTCStats & { candidateType?: string; protocol?: string }) | undefined : undefined;
+    const remote = selected.remoteCandidateId ? stats.get(selected.remoteCandidateId) as (RTCStats & { candidateType?: string }) | undefined : undefined;
+    return { bytes: (selected.bytesReceived ?? 0) + (selected.bytesSent ?? 0), pair: { localCandidateType: local?.candidateType, remoteCandidateType: remote?.candidateType, protocol: local?.protocol }, rttMs: typeof selected.currentRoundTripTime === 'number' ? Math.round(selected.currentRoundTripTime * 1000) : undefined };
+  }
+  async function logSelectedCandidatePair(label: string, pc: RTCPeerConnection): Promise<void> {
+    const snapshot = await readRtcSnapshot(pc);
+    if (!snapshot.pair) { pushLog(`${label} selected ICE pair: unavailable`); return; }
+    pushLog(`${label} selected ICE pair: local=${snapshot.pair.localCandidateType ?? 'unknown'}/${snapshot.pair.protocol ?? 'unknown'} remote=${snapshot.pair.remoteCandidateType ?? 'unknown'}`);
+  }
+  async function recordRtcMetrics(pc: RTCPeerConnection | undefined, controller: DirectTransferController, payloadBytes: number, effectiveWindow: number, beforeWireBytes = 0): Promise<void> {
+    if (!pc) return;
+    const snapshot = await readRtcSnapshot(pc);
+    controller.recordMetrics({ payloadBytes, wireBytes: Math.max(0, snapshot.bytes - beforeWireBytes), rttMs: snapshot.rttMs, effectiveWindow, selectedIcePair: snapshot.pair });
+  }
+  function exposeTransferMetrics(controller: DirectTransferController): void {
+    window.dispatchEvent(new CustomEvent('ponswarp:direct-transfer-metrics', { detail: controller.getMetrics() }));
   }
 
   function attachRtcDiagnostics(label: string, pc: RTCPeerConnection): void {
@@ -371,33 +440,51 @@ function App() {
 
 
   async function createWebShareLink(): Promise<void> {
+    const generation = ++ownerRuntimeGeneration.current;
     const file = selectedFile ?? namedBlob(DEFAULT_SAMPLE_PAYLOAD, DEFAULT_SAMPLE_FILE_NAME);
     setWebShare({ status: 'creating' });
     setState({ status: 'running', logs: ['Creating a phone-ready WebRTC share link.'] });
+    let transport: WebRTCTransport | undefined;
+    let engine: PonsWarpEngine | undefined;
+    let runtime: OwnerRuntime | undefined;
     try {
       const ice = await ensureRtcConfig();
-      await ownerRuntime.current?.client.close();
+      if (generation !== ownerRuntimeGeneration.current) return;
+      await disposeOwnerRuntime(ownerRuntime.current);
+      if (generation !== ownerRuntimeGeneration.current) return;
       const ownerPeerId = `owner_${Date.now()}` as PeerId;
       const sessionId = `sess_signal_${Date.now()}` as SessionId;
-      const transport = new WebRTCTransport();
+      transport = new WebRTCTransport();
       const storage = new MemoryStorageAdapter();
-      const engine = new PonsWarpEngine(storage, undefined, undefined, undefined, transport);
+      engine = new PonsWarpEngine(storage, undefined, undefined, undefined, transport);
       const session = await engine.createSession({ sessionId, files: [file], pieceSize: calculatePieceSize(file) });
+      if (generation !== ownerRuntimeGeneration.current) {
+        await engine.dispose().catch(() => undefined);
+        await transport.close().catch(() => undefined);
+        return;
+      }
       const manifest = session.manifests[0];
       const client = new BrowserSignalingClient({ url: signalingUrl() });
-      const runtime: OwnerRuntime = { peerId: ownerPeerId, sessionId, client, transport, engine, peerConnections: new Map() };
+      runtime = { generation, peerId: ownerPeerId, sessionId, client, transport, engine, peerConnections: new Map() };
       ownerRuntime.current = runtime;
-      client.onMessage(envelope => { void handleOwnerSignal(runtime, envelope).catch(error => recordAsyncError('Sender signaling handler error', error)); });
-      client.onState(value => pushLog(`Sender signaling state: ${value}`));
-      client.onError(error => pushLog(`Sender signaling error: ${error.message}`));
+      client.onMessage(envelope => {
+        void handleOwnerSignal(runtime!, envelope).catch(error => {
+          if (isCurrentRuntime(runtime!)) recordAsyncError('Sender signaling handler error', error);
+        });
+      });
+      client.onState(value => { if (isCurrentRuntime(runtime!)) pushLog(`Sender signaling state: ${value}`); });
+      client.onError(error => { if (isCurrentRuntime(runtime!)) pushLog(`Sender signaling error: ${error.message}`); });
       await client.connect();
+      if (!isCurrentRuntime(runtime)) { await disposeOwnerRuntime(runtime); return; }
       pushLog(`ICE servers loaded: ${ice.iceServers?.length ?? 0}.`);
       client.createSession({ ownerPeerId, files: [manifest], sessionId, mode: 'direct' });
       const localCode = createShareCode();
       const coordinatorShare = await registerCoordinatorBrowserShare({ code: localCode, sessionId, ownerPeerId, manifest });
+      if (!isCurrentRuntime(runtime)) { await disposeOwnerRuntime(runtime); return; }
       const code = coordinatorShare?.code ?? localCode;
       const link = coordinatorShare?.link ?? currentGetUrl(code, sessionId);
       const qrDataUrl = await createQrDataUrl(link);
+      if (!isCurrentRuntime(runtime)) { await disposeOwnerRuntime(runtime); return; }
       webShareFile.current = file;
       setWebShare({
         status: 'serving',
@@ -414,9 +501,12 @@ function App() {
       setState(current => ({ ...current, status: 'ready', sessionId, shareUrl: link, shareQrDataUrl: qrDataUrl, manifest, logs: [...current.logs, `Phone-ready sender online for ${manifest.name}.`, `Scan or open receiver link: ${link}`] }));
       setWebGet({ status: 'idle', input: '' });
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      setWebShare({ status: 'error', code: 'share_failed', message, suggestedAction: 'Check signaling connectivity and try again.' });
-      setState(current => ({ ...current, status: 'error', error: message, logs: [...current.logs, `Share link creation failed: ${message}`] }));
+      await (runtime ? disposeOwnerRuntime(runtime) : Promise.all([engine?.dispose().catch(() => undefined), transport?.close().catch(() => undefined)]));
+      if (generation === ownerRuntimeGeneration.current) {
+        const message = error instanceof Error ? error.message : String(error);
+        setWebShare({ status: 'error', code: 'share_failed', message, suggestedAction: 'Check signaling connectivity and try again.' });
+        setState(current => ({ ...current, status: 'error', error: message, logs: [...current.logs, `Share link creation failed: ${message}`] }));
+      }
     }
   }
 
@@ -510,14 +600,24 @@ function App() {
 
   async function runLocalGridSchedulerDemo(): Promise<void> {
     setState({ status: 'running', logs: ['Creating owner, Receiver A, and Receiver B grid engines with in-memory transports.'] });
+    let ownerTransport: DemoTransport | undefined;
+    let receiverATransport: DemoTransport | undefined;
+    let receiverBTransport: DemoTransport | undefined;
+    let owner: PonsWarpEngine | undefined;
+    let ownerStorage: StorageAdapter | undefined;
+    let receiverAStorage: StorageAdapter | undefined;
+    let receiverBStorage: StorageAdapter | undefined;
+    let receiverA: PonsWarpEngine | undefined;
+    let receiverB: PonsWarpEngine | undefined;
+    let restoredReceiver: PonsWarpEngine | undefined;
     try {
       const ownerPeerId = 'peer_owner' as PeerId;
       const receiverAPeerId = 'peer_receiver_a' as PeerId;
       const receiverBPeerId = 'peer_receiver_b' as PeerId;
       const sessionId = `sess_grid_${Date.now()}` as SessionId;
-      const ownerTransport = new DemoTransport(ownerPeerId);
-      const receiverATransport = new DemoTransport(receiverAPeerId);
-      const receiverBTransport = new DemoTransport(receiverBPeerId);
+      ownerTransport = new DemoTransport(ownerPeerId);
+      receiverATransport = new DemoTransport(receiverAPeerId);
+      receiverBTransport = new DemoTransport(receiverBPeerId);
       ownerTransport.link(receiverAPeerId, receiverATransport);
       ownerTransport.link(receiverBPeerId, receiverBTransport);
       receiverATransport.link(ownerPeerId, ownerTransport);
@@ -525,11 +625,12 @@ function App() {
       receiverBTransport.link(ownerPeerId, ownerTransport);
       receiverBTransport.link(receiverAPeerId, receiverATransport);
 
-      const owner = new PonsWarpEngine(new MemoryStorageAdapter(), undefined, undefined, undefined, ownerTransport);
-      const receiverAStorage = new MemoryStorageAdapter();
-      const receiverBStorage = new MemoryStorageAdapter();
-      const receiverA = new PonsWarpEngine(receiverAStorage, undefined, undefined, undefined, receiverATransport);
-      const receiverB = new PonsWarpEngine(receiverBStorage, undefined, undefined, undefined, receiverBTransport);
+      ownerStorage = new MemoryStorageAdapter();
+      owner = new PonsWarpEngine(ownerStorage, undefined, undefined, undefined, ownerTransport);
+      receiverAStorage = new MemoryStorageAdapter();
+      receiverBStorage = new MemoryStorageAdapter();
+      receiverA = new PonsWarpEngine(receiverAStorage, undefined, undefined, undefined, receiverATransport);
+      receiverB = new PonsWarpEngine(receiverBStorage, undefined, undefined, undefined, receiverBTransport);
       const file = selectedFile ?? namedBlob(DEFAULT_SAMPLE_PAYLOAD, DEFAULT_SAMPLE_FILE_NAME);
       const session = await owner.createSession({ sessionId, files: [file], pieceSize: calculatePieceSize(file) });
       const manifest = session.manifests[0];
@@ -564,7 +665,7 @@ function App() {
         }
       }
 
-      const restoredReceiver = new PonsWarpEngine(receiverBStorage);
+      restoredReceiver = new PonsWarpEngine(receiverBStorage);
       await restoredReceiver.joinSession(sessionId);
       const restoredProgress = restoredReceiver.getProgress(manifest.fileId);
       const assembledFile = await receiverBStorage.assembleFile(manifest.fileId, manifest);
@@ -587,10 +688,20 @@ function App() {
         ]
       }));
     } catch (error) { setState(current => ({ ...current, status: 'error', error: error instanceof Error ? error.message : String(error) })); }
+    finally {
+      await restoredReceiver?.dispose().catch(() => undefined);
+      await receiverA?.dispose().catch(() => undefined);
+      await receiverB?.dispose().catch(() => undefined);
+      await owner?.dispose().catch(() => undefined);
+      await receiverBTransport?.close().catch(() => undefined);
+      await receiverATransport?.close().catch(() => undefined);
+      await ownerTransport?.close().catch(() => undefined);
+    }
   }
 
   async function startCrossTabGridOwner(): Promise<void> {
     setState({ status: 'running', logs: ['Starting 3-browser-context grid owner.'] });
+    let runtime: { transport: Transport; engine: PonsWarpEngine; storage: StorageAdapter } | undefined;
     try {
       const ownerPeerId = 'peer_owner' as PeerId;
       const sessionId = `sess_grid_tabs_${Date.now()}` as SessionId;
@@ -603,39 +714,51 @@ function App() {
       Object.defineProperty(file, 'name', { value: 'grid-10mb.bin' });
       const session = await engine.createSession({ sessionId, files: [file], pieceSize: calculatePieceSize(file) });
       const manifest = session.manifests[0];
+      runtime = { transport, engine, storage };
       localStorage.setItem(CROSS_TAB_SESSION_KEY, JSON.stringify({ sessionId, ownerPeerId, receiverAPeerId: 'peer_receiver_a', receiverBPeerId: 'peer_receiver_b', manifest }));
-      crossTabRuntimes.current.push({ transport, engine, storage });
+      crossTabRuntimes.current.push(runtime);
+      runtime = undefined;
       setState(current => ({ ...current, status: 'ready', sessionId, manifest, shareUrl: currentJoinUrl(sessionId), storageKind: 'memory', logs: [...current.logs, `Cross-tab owner ready with ${manifest.pieceCount} pieces for ${manifest.name}.`] }));
     } catch (error) { setState(current => ({ ...current, status: 'error', error: error instanceof Error ? error.message : String(error) })); }
+    finally {
+      await disposeCrossTabRuntime(runtime);
+    }
   }
 
   async function runCrossTabReceiverASeed(): Promise<void> {
     setState({ status: 'running', logs: ['Starting 3-browser-context Receiver A seed.'] });
+    let runtime: { transport: Transport; engine: PonsWarpEngine; storage: StorageAdapter } | undefined;
     try {
       const setup = readCrossTabSetup();
       const transport = new BroadcastDemoTransport(setup.receiverAPeerId, setup.sessionId);
       const storage = new MemoryStorageAdapter();
       const engine = new PonsWarpEngine(storage, undefined, undefined, undefined, transport);
+      runtime = { transport, engine, storage };
       await engine.joinSession(setup.sessionId, [setup.manifest]);
-      crossTabRuntimes.current.push({ transport, engine, storage });
       const scheduled = await engine.requestNextPiece(setup.ownerPeerId, setup.manifest.fileId);
       if (!scheduled) throw new Error('Receiver A could not request owner seed piece.');
       const progress = await waitForPieceProgress(engine, setup.manifest.fileId, 0);
       const broadcast = await engine.broadcastPieceMap(setup.manifest.fileId, [setup.receiverBPeerId]);
       localStorage.setItem(CROSS_TAB_PIECE_MAP_KEY, JSON.stringify({ sessionId: setup.sessionId, peerId: setup.receiverAPeerId, map: broadcast }));
+      crossTabRuntimes.current.push(runtime);
+      runtime = undefined;
       setState(current => ({ ...current, status: 'complete', sessionId: setup.sessionId, manifest: setup.manifest, progress, shareUrl: currentJoinUrl(setup.sessionId), storageKind: 'memory', logs: [...current.logs, `Receiver A seeded ${progress.verifiedPieces}/${progress.totalPieces} from owner.`, `Receiver A broadcast PIECE_MAP generation ${broadcast.generation} with pieces ${broadcast.verifiedPieces.join(',')}.`] }));
     } catch (error) { setState(current => ({ ...current, status: 'error', error: error instanceof Error ? error.message : String(error) })); }
+    finally {
+      await disposeCrossTabRuntime(runtime);
+    }
   }
 
   async function runCrossTabReceiverBGrid(): Promise<void> {
     setState({ status: 'running', logs: ['Starting 3-browser-context Receiver B grid scheduler.'] });
+    let runtime: { transport: Transport; engine: PonsWarpEngine; storage: StorageAdapter } | undefined;
     try {
       const setup = readCrossTabSetup();
       const transport = new BroadcastDemoTransport(setup.receiverBPeerId, setup.sessionId);
       const storage = new MemoryStorageAdapter();
       const engine = new PonsWarpEngine(storage, undefined, undefined, undefined, transport);
+      runtime = { transport, engine, storage };
       await engine.joinSession(setup.sessionId, [setup.manifest]);
-      crossTabRuntimes.current.push({ transport, engine, storage });
       for (let attempt = 0; attempt < 200 && !engine.getAvailability(setup.manifest.fileId).pieces.some(piece => piece.providers.some(provider => provider.peerId === setup.receiverAPeerId)); attempt += 1) {
         await delay(25);
       }
@@ -663,12 +786,22 @@ function App() {
       }
       const assembledFile = await storage.assembleFile(setup.manifest.fileId, setup.manifest);
       const downloadUrl = URL.createObjectURL(assembledFile);
+      crossTabRuntimes.current.push(runtime);
+      runtime = undefined;
       setState(current => ({ ...current, status: 'complete', sessionId: setup.sessionId, manifest: setup.manifest, progress, restoredProgress: progress, shareUrl: currentJoinUrl(setup.sessionId), storageKind: 'memory', downloadUrl, assembledBytes: assembledFile.size, logs: [...current.logs, ...logs, `Cross-tab grid complete: Receiver B used ${nonOwnerPieces} non-owner provider piece(s).`] }));
     } catch (error) { setState(current => ({ ...current, status: 'error', error: error instanceof Error ? error.message : String(error) })); }
+    finally {
+      await disposeCrossTabRuntime(runtime);
+    }
   }
 
   async function runBrowserResumeQa(bytes: number, label: string): Promise<void> {
     setState({ status: 'running', storageKind: 'probing', logs: [`Starting ${label} browser transfer + reload resume QA.`] });
+    let ownerTransport: DemoTransport = new DemoTransport('peer_owner' as PeerId);
+    let receiverTransport: DemoTransport = new DemoTransport('peer_receiver' as PeerId);
+    let owner: PonsWarpEngine | undefined;
+    let receiver: PonsWarpEngine | undefined;
+    let restoredReceiver: PonsWarpEngine | undefined;
     try {
       const ownerPeerId = 'peer_owner' as PeerId;
       const receiverPeerId = 'peer_receiver' as PeerId;
@@ -681,32 +814,33 @@ function App() {
       const file = new Blob(parts, { type: 'application/octet-stream' }) as Blob & { name: string; type: string };
       Object.defineProperty(file, 'name', { value: `${label}.bin` });
 
-      const ownerTransport = new DemoTransport(ownerPeerId);
-      let receiverTransport = new DemoTransport(receiverPeerId);
       ownerTransport.link(receiverPeerId, receiverTransport);
       receiverTransport.link(ownerPeerId, ownerTransport);
 
-      const owner = new PonsWarpEngine(new MemoryStorageAdapter(), undefined, undefined, undefined, ownerTransport);
+      owner = new PonsWarpEngine(new MemoryStorageAdapter(), undefined, undefined, undefined, ownerTransport);
       const storageResult = await createPersistentStorage(sessionId);
-      let receiver = new PonsWarpEngine(storageResult.adapter, undefined, undefined, undefined, receiverTransport);
-      const session = await owner.createSession({ sessionId, files: [file], pieceSize, includeFileHash: false });
+      receiver = new PonsWarpEngine(storageResult.adapter, undefined, undefined, undefined, receiverTransport);
+      restoredReceiver = undefined;
+      const session = await owner!.createSession({ sessionId, files: [file], pieceSize, includeFileHash: false });
       const manifest = session.manifests[0];
-      await receiver.joinSession(sessionId, [manifest]);
+      await receiver!.joinSession(sessionId, [manifest]);
       storageKinds.current.set(sessionId, storageResult.kind);
 
-      let progress = receiver.getProgress(manifest.fileId);
+      let progress = receiver!.getProgress(manifest.fileId);
       const reloadAt = Math.max(1, Math.floor(progress.totalPieces * 0.4));
       let reloaded = false;
       while (progress.verifiedPieces < progress.totalPieces) {
         const before = progress.verifiedPieces;
-        const scheduled = await receiver.requestNextPiece(ownerPeerId, manifest.fileId);
+        const scheduled = await receiver!.requestNextPiece(ownerPeerId, manifest.fileId);
         if (!scheduled) throw new Error('No piece scheduled during resume QA.');
-        progress = await waitForPieceProgress(receiver, manifest.fileId, before);
+        progress = await waitForPieceProgress(receiver!, manifest.fileId, before);
         if (progress.verifiedPieces % 50 === 0 || progress.verifiedPieces === reloadAt || progress.verifiedPieces === progress.totalPieces) {
           pushLog(`${label}: ${progress.verifiedPieces}/${progress.totalPieces} pieces verified.`);
         }
         if (!reloaded && progress.verifiedPieces >= reloadAt) {
           reloaded = true;
+          await receiver?.dispose().catch(() => undefined);
+          await receiverTransport.close().catch(() => undefined);
           receiverTransport = new DemoTransport(receiverPeerId);
           ownerTransport.link(receiverPeerId, receiverTransport);
           receiverTransport.link(ownerPeerId, ownerTransport);
@@ -718,7 +852,7 @@ function App() {
         }
       }
 
-      const restoredReceiver = new PonsWarpEngine(storageResult.adapter);
+      restoredReceiver = new PonsWarpEngine(storageResult.adapter);
       await restoredReceiver.joinSession(sessionId);
       const restoredProgress = restoredReceiver.getProgress(manifest.fileId);
       const saveResult = await storageResult.adapter.saveAssembledFile(manifest.fileId, manifest);
@@ -741,7 +875,20 @@ function App() {
           `${label}: browser transfer + reload resume QA complete.`
         ]
       }));
-    } catch (error) { setState(current => ({ ...current, status: 'error', error: error instanceof Error ? error.message : String(error), logs: [...current.logs, `${label} QA failed.`] })); }
+    } catch (error) {
+      setState(current => ({
+        ...current,
+        status: 'error',
+        error: error instanceof Error ? error.message : String(error),
+        logs: [...current.logs, `${label} QA failed.`]
+      }));
+    } finally {
+      await restoredReceiver?.dispose().catch(() => undefined);
+      await receiver?.dispose().catch(() => undefined);
+      await owner?.dispose().catch(() => undefined);
+      await receiverTransport.close().catch(() => undefined);
+      await ownerTransport.close().catch(() => undefined);
+    }
   }
 
   async function run10MiBReloadResumeQa(): Promise<void> {
@@ -753,31 +900,53 @@ function App() {
   }
 
   async function startSignaledSender(): Promise<void> {
+    const generation = ++ownerRuntimeGeneration.current;
     setState({ status: 'running', logs: ['Connecting sender to signaling server.'] });
+    let transport: WebRTCTransport | undefined;
+    let engine: PonsWarpEngine | undefined;
+    let runtime: OwnerRuntime | undefined;
     try {
       const ice = await ensureRtcConfig();
-      await ownerRuntime.current?.client.close();
+      if (generation !== ownerRuntimeGeneration.current) return;
+      await disposeOwnerRuntime(ownerRuntime.current);
+      if (generation !== ownerRuntimeGeneration.current) return;
       const ownerPeerId = `owner_${Date.now()}` as PeerId;
       const sessionId = `sess_signal_${Date.now()}` as SessionId;
-      const transport = new WebRTCTransport();
+      transport = new WebRTCTransport();
       const storage = new MemoryStorageAdapter();
-      const engine = new PonsWarpEngine(storage, undefined, undefined, undefined, transport);
+      engine = new PonsWarpEngine(storage, undefined, undefined, undefined, transport);
       const file = selectedFile ?? namedBlob(DEFAULT_SAMPLE_PAYLOAD, DEFAULT_SAMPLE_FILE_NAME);
       const session = await engine.createSession({ sessionId, files: [file], pieceSize: calculatePieceSize(file) });
+      if (generation !== ownerRuntimeGeneration.current) {
+        await engine.dispose().catch(() => undefined);
+        await transport.close().catch(() => undefined);
+        return;
+      }
       const manifest = session.manifests[0];
       const client = new BrowserSignalingClient({ url: signalingUrl() });
-      const runtime: OwnerRuntime = { peerId: ownerPeerId, sessionId, client, transport, engine, peerConnections: new Map() };
+      runtime = { generation, peerId: ownerPeerId, sessionId, client, transport, engine, peerConnections: new Map() };
       ownerRuntime.current = runtime;
-      client.onMessage(envelope => { void handleOwnerSignal(runtime, envelope).catch(error => recordAsyncError('Sender signaling handler error', error)); });
-      client.onState(value => pushLog(`Sender signaling state: ${value}`));
-      client.onError(error => pushLog(`Sender signaling error: ${error.message}`));
+      client.onMessage(envelope => {
+        void handleOwnerSignal(runtime!, envelope).catch(error => {
+          if (isCurrentRuntime(runtime!)) recordAsyncError('Sender signaling handler error', error);
+        });
+      });
+      client.onState(value => { if (isCurrentRuntime(runtime!)) pushLog(`Sender signaling state: ${value}`); });
+      client.onError(error => { if (isCurrentRuntime(runtime!)) pushLog(`Sender signaling error: ${error.message}`); });
       await client.connect();
+      if (!isCurrentRuntime(runtime)) { await disposeOwnerRuntime(runtime); return; }
       pushLog(`ICE servers loaded: ${ice.iceServers?.length ?? 0}.`);
       client.createSession({ ownerPeerId, files: [manifest], sessionId, mode: 'direct' });
       const shareUrl = currentJoinUrl(sessionId);
       const shareQrDataUrl = await createQrDataUrl(shareUrl);
+      if (!isCurrentRuntime(runtime)) { await disposeOwnerRuntime(runtime); return; }
       setState(current => ({ ...current, status: 'ready', sessionId, shareUrl, shareQrDataUrl, manifest, logs: [...current.logs, `Signaled sender ready for ${manifest.name}.`, `Open receiver link: ${shareUrl}`] }));
-    } catch (error) { setState(current => ({ ...current, status: 'error', error: error instanceof Error ? error.message : String(error) })); }
+    } catch (error) {
+      await (runtime ? disposeOwnerRuntime(runtime) : Promise.all([engine?.dispose().catch(() => undefined), transport?.close().catch(() => undefined)]));
+      if (generation === ownerRuntimeGeneration.current) {
+        setState(current => ({ ...current, status: 'error', error: error instanceof Error ? error.message : String(error) }));
+      }
+    }
   }
 
   async function joinSignaledReceiver(sessionIdOverride?: SessionId): Promise<void> {
@@ -785,28 +954,49 @@ function App() {
     const sessionId = (sessionIdOverride ?? match?.[1] ?? state.sessionId) as SessionId | undefined;
     if (!sessionId) { setState(current => ({ ...current, status: 'error', error: 'No #/join/:sessionId route found.' })); return; }
     setState({ status: 'running', sessionId, storageKind: 'probing', logs: [`Connecting receiver to signaling server for ${sessionId}.`] });
+    const generation = ++receiverRuntimeGeneration.current;
+    let transport: WebRTCTransport | undefined;
+    let engine: PonsWarpEngine | undefined;
+    let runtime: ReceiverRuntime | undefined;
     try {
       const ice = await ensureRtcConfig();
-      await receiverRuntime.current?.client.close();
+      if (generation !== receiverRuntimeGeneration.current) return;
+      await disposeReceiverRuntime(receiverRuntime.current);
+      if (generation !== receiverRuntimeGeneration.current) return;
       const peerId = `receiver_${Date.now()}` as PeerId;
-      const transport = new WebRTCTransport();
+      transport = new WebRTCTransport();
       const storageResult = await createPersistentStorage(sessionId);
+      if (generation !== receiverRuntimeGeneration.current) {
+        await transport.close().catch(() => undefined);
+        return;
+      }
       storageKinds.current.set(sessionId, storageResult.kind);
       const storage = storageResult.adapter;
-      const engine = new PonsWarpEngine(storage, undefined, undefined, undefined, transport);
+      engine = new PonsWarpEngine(storage, undefined, undefined, undefined, transport);
       const client = new BrowserSignalingClient({ url: signalingUrl() });
-      const runtime: ReceiverRuntime = { peerId, sessionId, client, transport, engine, storage, pendingIce: [], completed: false };
+      runtime = { generation, peerId, sessionId, client, transport, engine, storage, pendingIce: [], completed: false };
       receiverRuntime.current = runtime;
-      client.onMessage(envelope => { void handleReceiverSignal(runtime, envelope).catch(error => recordAsyncError('Receiver signaling handler error', error)); });
-      client.onState(value => pushLog(`Receiver signaling state: ${value}`));
-      client.onError(error => pushLog(`Receiver signaling error: ${error.message}`));
+      client.onMessage(envelope => {
+        void handleReceiverSignal(runtime!, envelope).catch(error => {
+          if (isCurrentRuntime(runtime!)) recordAsyncError('Receiver signaling handler error', error);
+        });
+      });
+      client.onState(value => { if (isCurrentRuntime(runtime!)) pushLog(`Receiver signaling state: ${value}`); });
+      client.onError(error => { if (isCurrentRuntime(runtime!)) pushLog(`Receiver signaling error: ${error.message}`); });
       await client.connect();
+      if (!isCurrentRuntime(runtime)) { await disposeReceiverRuntime(runtime); return; }
       pushLog(`ICE servers loaded: ${ice.iceServers?.length ?? 0}.`);
       client.joinSession({ sessionId, peerId });
-    } catch (error) { setState(current => ({ ...current, status: 'error', error: error instanceof Error ? error.message : String(error) })); }
+    } catch (error) {
+      await (runtime ? disposeReceiverRuntime(runtime) : Promise.all([engine?.dispose().catch(() => undefined), transport?.close().catch(() => undefined)]));
+      if (generation === receiverRuntimeGeneration.current) {
+        setState(current => ({ ...current, status: 'error', error: error instanceof Error ? error.message : String(error) }));
+      }
+    }
   }
 
   async function handleOwnerSignal(runtime: OwnerRuntime, envelope: SignalingEnvelope): Promise<void> {
+    if (!isCurrentRuntime(runtime)) return;
     if (envelope.type === 'ERROR') {
       const payload = envelope.payload as { code?: string; message?: string };
       const message = payload.message ?? payload.code ?? 'Signaling error';
@@ -835,6 +1025,7 @@ function App() {
   }
 
   async function handleReceiverSignal(runtime: ReceiverRuntime, envelope: SignalingEnvelope): Promise<void> {
+    if (!isCurrentRuntime(runtime)) return;
     if (envelope.type === 'ERROR') {
       const payload = envelope.payload as { code?: string; message?: string };
       const message = payload.message ?? payload.code ?? 'Signaling error';
@@ -872,31 +1063,78 @@ function App() {
   }
 
   async function completeReceiverTransfer(runtime: ReceiverRuntime): Promise<void> {
+    if (!isCurrentRuntime(runtime)) return;
     if (runtime.completed || !runtime.ownerPeerId) return;
-    runtime.completed = true;
-    const manifest = runtime.manifest;
-    if (!manifest) throw new Error('Receiver did not receive a manifest');
-    const joined = await runtime.engine.joinSession(runtime.sessionId, [manifest]);
-    let progress = runtime.engine.getProgress(manifest.fileId);
-    const transferWindow = transferWindowSize();
-    while (progress.verifiedPieces < progress.totalPieces) {
-      const before = progress.verifiedPieces;
-      const scheduled = await runtime.engine.requestPieceWindow(runtime.ownerPeerId, manifest.fileId, { maxInFlight: transferWindow });
-      if (scheduled.length === 0 && runtime.engine.getOutstandingRequestCount(manifest.fileId, runtime.ownerPeerId) === 0) throw new Error(`No provider scheduled piece after ${progress.verifiedPieces}/${progress.totalPieces} verified`);
-      progress = await waitForPieceProgress(runtime.engine, manifest.fileId, before);
-      pushLog(`Signaled WebRTC transferred piece ${progress.verifiedPieces}/${progress.totalPieces} verified (${scheduled.length} request(s) queued, window ${transferWindow}).`);
-      if (globalThis.localStorage?.getItem('ponswarp-partial-resume') === '1' && progress.verifiedPieces >= Math.ceil(progress.totalPieces / 2)) {
-        setState(current => ({ ...current, status: 'ready', manifest, progress, restoredProgress: progress, storageKind: storageKinds.current.get(runtime.sessionId), shareUrl: currentJoinUrl(runtime.sessionId), logs: [...current.logs, `Partial resume seed persisted at ${progress.verifiedPieces}/${progress.totalPieces} pieces.`] }));
-        return;
+    const controller = new DirectTransferController(runtime.engine, `run_${runtime.sessionId}`, {
+      onTransportFatal: handler => {
+        const removeError = runtime.transport.onError(event => handler({ peerId: event.peerId, error: event.error }));
+        const removeState = runtime.transport.onPeerState(event => {
+          if (event.state === 'failed' || event.state === 'disconnected') handler({ peerId: event.peerId, error: new Error(`WebRTC peer ${event.state}`) });
+        });
+        return () => { removeError(); removeState(); };
       }
+    });
+    let transferDownloadUrl: string | undefined;
+    try {
+      const manifest = runtime.manifest;
+      if (!manifest) throw new Error('Receiver did not receive a manifest');
+      controller.setTransfer({ fileBytes: manifest.size, pieceBytes: manifest.pieceSize, pieceCount: manifest.pieceCount, hashMode: 'sha256' });
+      await runtime.engine.joinSession(runtime.sessionId, [manifest]);
+      let progress = runtime.engine.getProgress(manifest.fileId);
+      const transferWindow = await transferWindowSize();
+      controller.beginTransferMetrics();
+      const rtcStart = runtime.pc ? await readRtcSnapshot(runtime.pc) : { bytes: 0 };
+      while (progress.verifiedPieces < progress.totalPieces) {
+        const before = progress.verifiedPieces;
+        const terminals = await controller.requestWindow(runtime.ownerPeerId, manifest.fileId, { controllerId: 'browser-direct', windowKey: `${runtime.sessionId}:${manifest.fileId}`, maxInFlight: transferWindow });
+        const scheduled = Array.from({ length: terminals.length });
+        if (scheduled.length === 0 && runtime.engine.getOutstandingRequestCount(manifest.fileId, runtime.ownerPeerId) === 0) throw new Error(`No provider scheduled piece after ${progress.verifiedPieces}/${progress.totalPieces} verified`);
+        progress = await waitForPieceProgress(runtime.engine, manifest.fileId, before);
+        pushLog(`Signaled WebRTC transferred piece ${progress.verifiedPieces}/${progress.totalPieces} verified (${scheduled.length} request(s) queued, window ${transferWindow}).`);
+        if (globalThis.localStorage?.getItem('ponswarp-partial-resume') === '1' && progress.verifiedPieces >= Math.ceil(progress.totalPieces / 2)) {
+          setState(current => ({ ...current, status: 'ready', manifest, progress, restoredProgress: progress, storageKind: storageKinds.current.get(runtime.sessionId), shareUrl: currentJoinUrl(runtime.sessionId), logs: [...current.logs, `Partial resume seed persisted at ${progress.verifiedPieces}/${progress.totalPieces} pieces.`] }));
+          await controller.dispose('cancelled');
+          return;
+        }
+      }
+      controller.recordMetrics({ payloadBytes: manifest.size, pieceTiming: { count: progress.verifiedPieces } });
+      controller.endTransferMetrics();
+      const restoredReceiver = new PonsWarpEngine(runtime.storage);
+      try {
+        await restoredReceiver.joinSession(runtime.sessionId);
+        const restoredProgress = restoredReceiver.getProgress(manifest.fileId);
+        if (restoredProgress.verifiedPieces !== restoredProgress.totalPieces) throw new Error(`Cannot assemble incomplete file: ${restoredProgress.verifiedPieces}/${restoredProgress.totalPieces} pieces verified`);
+        const assembledFile = await runtime.storage.assembleFile(manifest.fileId, manifest);
+        const downloadUrl = URL.createObjectURL(assembledFile);
+        transferDownloadUrl = downloadUrl;
+        controller.recordResumeValidation(restoredProgress.verifiedPieces, 0, 'passed');
+        await recordRtcMetrics(runtime.pc, controller, manifest.size, transferWindow, rtcStart.bytes);
+        await controller.dispose('succeeded');
+        exposeTransferMetrics(controller);
+        runtime.completed = true;
+        setState(current => ({ ...current, status: 'complete', manifest, progress, restoredProgress, downloadUrl, assembledBytes: assembledFile.size, storageKind: storageKinds.current.get(runtime.sessionId), shareUrl: currentJoinUrl(runtime.sessionId), logs: [...current.logs, `Signaled WebRTC resume restored ${restoredProgress.verifiedPieces}/${restoredProgress.totalPieces}; assembled ${assembledFile.size} bytes.`] }));
+        setWebGet(current => current.status === 'downloading'
+          ? { status: 'complete', code: current.code, outputName: manifest.name, verificationLabel: 'fully verified', downloadUrl }
+          : current);
+      } finally {
+        await restoredReceiver.dispose().catch(() => undefined);
+      }
+      return;
+    } catch (error) {
+      runtime.completed = false;
+      if (transferDownloadUrl) URL.revokeObjectURL(transferDownloadUrl);
+      const message = error instanceof Error ? error.message : String(error);
+      setWebGet(current => current.status === 'downloading'
+        ? { status: 'error', input: current.code, code: 'transfer_failed', message, suggestedAction: 'Check the sender connection and retry the transfer.' }
+        : current);
+      try {
+        await controller.dispose('failed');
+        exposeTransferMetrics(controller);
+      } catch (cleanupError) {
+        pushLog(`Direct transfer cleanup failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`);
+      }
+      throw error;
     }
-    const restoredReceiver = new PonsWarpEngine(runtime.storage);
-    await restoredReceiver.joinSession(runtime.sessionId);
-    const restoredProgress = restoredReceiver.getProgress(manifest.fileId);
-    if (restoredProgress.verifiedPieces !== restoredProgress.totalPieces) throw new Error(`Cannot assemble incomplete file: ${restoredProgress.verifiedPieces}/${restoredProgress.totalPieces} pieces verified`);
-    const assembledFile = await runtime.storage.assembleFile(manifest.fileId, manifest);
-    const downloadUrl = URL.createObjectURL(assembledFile);
-    setState(current => ({ ...current, status: 'complete', manifest, progress, restoredProgress, downloadUrl, assembledBytes: assembledFile.size, storageKind: storageKinds.current.get(runtime.sessionId), shareUrl: currentJoinUrl(runtime.sessionId), logs: [...current.logs, `Signaled WebRTC resume restored ${restoredProgress.verifiedPieces}/${restoredProgress.totalPieces}; assembled ${assembledFile.size} bytes.`] }));
   }
 
   async function restoreLocalResumeState(): Promise<void> {
@@ -904,11 +1142,14 @@ function App() {
     const sessionId = (match?.[1] ?? state.sessionId) as SessionId | undefined;
     if (!sessionId) { setState(current => ({ ...current, status: 'error', error: 'No sessionId available for local resume restore.' })); return; }
     setState({ status: 'restoring_local_state', sessionId, storageKind: 'probing', logs: [`Restoring local persisted state for ${sessionId}.`] });
+    let storage: StorageAdapter | undefined;
+    let engine: PonsWarpEngine | undefined;
     try {
       const storageResult = await createPersistentStorage(sessionId);
+      storage = storageResult.adapter;
       setState(current => ({ ...current, status: 'local_state_restored', storageKind: storageResult.kind, logs: [...current.logs, `Local storage selected: ${storageResult.kind}.`] }));
       storageKinds.current.set(sessionId, storageResult.kind);
-      const engine = new PonsWarpEngine(storageResult.adapter);
+      engine = new PonsWarpEngine(storage);
       const joined = await engine.joinSession(sessionId);
       const manifest = joined.manifests[0];
       setState(current => ({ ...current, status: 'validating_remote_manifest', manifest, logs: [...current.logs, 'Validating restored manifest and piece map.'] }));
@@ -937,6 +1178,8 @@ function App() {
       if (progress.verifiedPieces < progress.totalPieces) globalThis.localStorage?.removeItem('ponswarp-partial-resume');
     } catch (error) {
       setState(current => ({ ...current, status: 'error', error: error instanceof Error ? error.message : String(error), logs: [...current.logs, 'Local resume restore failed.'] }));
+    } finally {
+      await engine?.dispose().catch(() => undefined);
     }
   }
 
@@ -944,28 +1187,38 @@ function App() {
     const ownerStorage = new MemoryStorageAdapter();
     const receiverStorage = new MemoryStorageAdapter();
     const owner = new PonsWarpEngine(ownerStorage, undefined, undefined, undefined, input.ownerTransport);
-    const receiver = new PonsWarpEngine(receiverStorage, undefined, undefined, undefined, input.receiverTransport);
-    const session = await owner.createSession({ sessionId: input.sessionId, files: [input.file], pieceSize: calculatePieceSize(input.file) });
-    const manifest = session.manifests[0];
-    pushLog(`Sender created ${manifest.pieceCount} pieces for ${manifest.name}.`);
-    await receiver.joinSession(session.sessionId, [manifest]);
-    pushLog(input.initialLog);
-    let progress = receiver.getProgress(manifest.fileId);
-    const transferWindow = transferWindowSize();
-    while (progress.verifiedPieces < progress.totalPieces) {
-      const before = progress.verifiedPieces;
-      const scheduled = await receiver.requestPieceWindow(input.ownerPeerId, manifest.fileId, { maxInFlight: transferWindow });
-      if (scheduled.length === 0 && receiver.getOutstandingRequestCount(manifest.fileId, input.ownerPeerId) === 0) break;
-      progress = await waitForPieceProgress(receiver, manifest.fileId, before);
-      pushLog(`${input.logPrefix} piece ${progress.verifiedPieces}/${progress.totalPieces} verified (${scheduled.length} request(s) queued, window ${transferWindow}).`);
+    let receiver: PonsWarpEngine | undefined;
+    let restoredReceiver: PonsWarpEngine | undefined;
+    try {
+      receiver = new PonsWarpEngine(receiverStorage, undefined, undefined, undefined, input.receiverTransport);
+      const session = await owner.createSession({ sessionId: input.sessionId, files: [input.file], pieceSize: calculatePieceSize(input.file) });
+      const manifest = session.manifests[0];
+      pushLog(`Sender created ${manifest.pieceCount} pieces for ${manifest.name}.`);
+      await receiver!.joinSession(session.sessionId, [manifest]);
+      pushLog(input.initialLog);
+      let progress = receiver!.getProgress(manifest.fileId);
+      const transferWindow = await transferWindowSize();
+      while (progress.verifiedPieces < progress.totalPieces) {
+        const before = progress.verifiedPieces;
+        const scheduled = await receiver!.requestPieceWindow(input.ownerPeerId, manifest.fileId, { maxInFlight: transferWindow });
+        if (scheduled.length === 0 && receiver!.getOutstandingRequestCount(manifest.fileId, input.ownerPeerId) === 0) break;
+        progress = await waitForPieceProgress(receiver!, manifest.fileId, before);
+        pushLog(`${input.logPrefix} piece ${progress.verifiedPieces}/${progress.totalPieces} verified (${scheduled.length} request(s) queued, window ${transferWindow}).`);
+      }
+      restoredReceiver = new PonsWarpEngine(receiverStorage);
+      await restoredReceiver.joinSession(session.sessionId);
+      const restoredProgress = restoredReceiver.getProgress(manifest.fileId);
+      const assembledFile = await receiverStorage.assembleFile(manifest.fileId, manifest);
+      const downloadUrl = URL.createObjectURL(assembledFile);
+      pushLog(`Resume restored ${restoredProgress.verifiedPieces}/${restoredProgress.totalPieces}; assembled ${assembledFile.size} bytes.`);
+      setState(current => ({ ...current, status: 'complete', sessionId: session.sessionId, shareUrl: session.shareUrl, manifest, progress, restoredProgress, downloadUrl, assembledBytes: assembledFile.size }));
+    } finally {
+      await restoredReceiver?.dispose().catch(() => undefined);
+      await receiver?.dispose().catch(() => undefined);
+      await owner.dispose().catch(() => undefined);
+      await input.receiverTransport.close().catch(() => undefined);
+      await input.ownerTransport.close().catch(() => undefined);
     }
-    const restoredReceiver = new PonsWarpEngine(receiverStorage);
-    await restoredReceiver.joinSession(session.sessionId);
-    const restoredProgress = restoredReceiver.getProgress(manifest.fileId);
-    const assembledFile = await receiverStorage.assembleFile(manifest.fileId, manifest);
-    const downloadUrl = URL.createObjectURL(assembledFile);
-    pushLog(`Resume restored ${restoredProgress.verifiedPieces}/${restoredProgress.totalPieces}; assembled ${assembledFile.size} bytes.`);
-    setState(current => ({ ...current, status: 'complete', sessionId: session.sessionId, shareUrl: session.shareUrl, manifest, progress, restoredProgress, downloadUrl, assembledBytes: assembledFile.size }));
   }
 
   const showQA = import.meta.env.VITE_SHOW_QA_CONTROLS === 'true' || new URLSearchParams(location.search).has('qa');

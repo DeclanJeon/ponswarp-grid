@@ -2,7 +2,126 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { createCliCleanup, installCliShutdownHandlers } from '../src/cli-runtime.js';
+import type { PonsWarpEngine } from '@ponswarp/core';
+import type { NodeFileSource } from '../src/node-file-storage.js';
+import type { NodeWebSocketTransport } from '../src/node-websocket-transport.js';
+it('runs ordered cleanup after disposal failure and only once', async () => {
+  const order: string[] = [];
+  const disposeError = new Error('dispose failed');
+  const engine = { dispose: async () => { order.push('engine'); throw disposeError; } } as unknown as PonsWarpEngine;
+  const source = { close: async () => { order.push('source'); } } as unknown as NodeFileSource;
+  const transport = { close: async () => { order.push('transport'); } } as unknown as NodeWebSocketTransport;
+  const cleanup = createCliCleanup(() => engine, () => source, transport);
+
+  await expect(cleanup()).rejects.toBe(disposeError);
+  await expect(cleanup()).rejects.toBe(disposeError);
+
+  expect(order).toEqual(['engine', 'source', 'transport']);
+});
+it('shares concurrent cleanup and preserves the primary failure', async () => {
+  const order: string[] = [];
+  const disposeError = new Error('dispose failed');
+  const sourceError = new Error('source close failed');
+  const transportError = new Error('transport close failed');
+  let release!: () => void;
+  const disposal = new Promise<void>(resolve => {
+    release = resolve;
+  });
+  const engine = {
+    dispose: async () => {
+      order.push('engine');
+      await disposal;
+      throw disposeError;
+    }
+  } as unknown as PonsWarpEngine;
+  const source = {
+    close: async () => {
+      order.push('source');
+      throw sourceError;
+    }
+  } as unknown as NodeFileSource;
+  const transport = {
+    close: async () => {
+      order.push('transport');
+      throw transportError;
+    }
+  } as unknown as NodeWebSocketTransport;
+  const cleanup = createCliCleanup(() => engine, () => source, transport);
+  const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+  try {
+    const firstCall = cleanup();
+    const secondCall = cleanup();
+    expect(secondCall).toBe(firstCall);
+    expect(order).toEqual(['engine']);
+
+    release();
+
+    await expect(firstCall).rejects.toBe(disposeError);
+    await expect(secondCall).rejects.toBe(disposeError);
+    expect(order).toEqual(['engine', 'source', 'transport']);
+    expect(errorSpy).toHaveBeenCalledWith(sourceError.stack ?? sourceError.message);
+    expect(errorSpy).toHaveBeenCalledWith(transportError.stack ?? transportError.message);
+  } finally {
+    errorSpy.mockRestore();
+  }
+});
+
+it('preserves an undefined first cleanup rejection and still attempts every close', async () => {
+  const order: string[] = [];
+  const sourceError = new Error('source close failed');
+  const engine = { dispose: async () => { order.push('engine'); return Promise.reject(undefined); } } as unknown as PonsWarpEngine;
+  const source = { close: async () => { order.push('source'); throw sourceError; } } as unknown as NodeFileSource;
+  const transport = { close: async () => { order.push('transport'); } } as unknown as NodeWebSocketTransport;
+  const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+  const cleanup = createCliCleanup(() => engine, () => source, transport);
+
+  try {
+    const rejection = await cleanup().then(
+      () => 'resolved',
+      error => error
+    );
+    expect(rejection).toBeUndefined();
+    expect(order).toEqual(['engine', 'source', 'transport']);
+    expect(errorSpy).toHaveBeenCalledWith(sourceError.stack ?? sourceError.message);
+  } finally {
+    errorSpy.mockRestore();
+  }
+});
+
+it('keeps signal handlers active until shared cleanup settles', async () => {
+  const handlers = new Map<'SIGINT' | 'SIGTERM', Set<() => void>>([
+    ['SIGINT', new Set()],
+    ['SIGTERM', new Set()]
+  ]);
+  const exits: number[] = [];
+  let release!: () => void;
+  const cleanup = vi.fn(() => new Promise<void>(resolve => {
+    release = resolve;
+  }));
+  const runtime = {
+    on: (signal: 'SIGINT' | 'SIGTERM', listener: () => void) => handlers.get(signal)?.add(listener),
+    removeListener: (signal: 'SIGINT' | 'SIGTERM', listener: () => void) => handlers.get(signal)?.delete(listener),
+    exit: (code: number) => { exits.push(code); }
+  };
+  installCliShutdownHandlers(cleanup, runtime);
+
+  for (const listener of handlers.get('SIGTERM') ?? []) listener();
+  for (const listener of handlers.get('SIGINT') ?? []) listener();
+  expect(cleanup).toHaveBeenCalledOnce();
+  expect(handlers.get('SIGINT')?.size).toBe(1);
+  expect(handlers.get('SIGTERM')?.size).toBe(1);
+
+  release();
+  await Promise.resolve();
+  await Promise.resolve();
+
+  expect(exits).toEqual([143]);
+  expect(handlers.get('SIGINT')?.size).toBe(0);
+  expect(handlers.get('SIGTERM')?.size).toBe(0);
+});
 
 async function tempRoot(): Promise<string> {
   return mkdtemp(join(tmpdir(), 'ponswarp-cli-direct-'));
@@ -68,6 +187,8 @@ describe('ponswarp CLI direct transfer', () => {
       expect(output).toContain('Provider peer_owner_');
       expect(await readFile(join(outDir, 'source.bin'))).toEqual(payload);
       expect(receiverOutput.stderr.join('')).toBe('');
+      expect(sender.kill('SIGTERM')).toBe(true);
+      expect(await waitForExit(sender)).toBe(143);
     } finally {
       if (sender && sender.exitCode === null) sender.kill('SIGTERM');
       await rm(root, { recursive: true, force: true });
@@ -92,8 +213,9 @@ describe('ponswarp CLI direct transfer', () => {
       firstReceiver = spawnCli(['join', joinUrl, '--out', outDir], repo);
       const firstOutput = collect(firstReceiver);
       await waitForLine(firstOutput.stdout, /^Progress: [1-9]\d*\//);
-      firstReceiver.kill('SIGTERM');
-      await waitForExit(firstReceiver).catch(() => null);
+      expect(firstReceiver.kill('SIGTERM')).toBe(true);
+      expect(await waitForExit(firstReceiver)).toBe(143);
+      expect(firstOutput.stderr.join('')).toBe('');
 
       const secondReceiver = spawnCli(['join', joinUrl, '--out', outDir], repo);
       const secondOutput = collect(secondReceiver);

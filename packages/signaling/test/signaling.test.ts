@@ -585,6 +585,16 @@ async function writeDeploymentFixture(root: string, input: { signalingServer: st
     'NoNewPrivileges=true',
     ''
   ].join('\n'));
+  await writeFile(join(root, 'deploy/ponswarp-grid-web.service'), [
+    '[Unit]',
+    'Description=PonsWarp Grid static web for grid.ponslink.com',
+    '[Service]',
+    'WorkingDirectory=/home/declan/ponswarp-grid-web/current',
+    'ExecStart=/usr/bin/python3 -m http.server 4180 --bind 127.0.0.1',
+    'Restart=on-failure',
+    'NoNewPrivileges=true',
+    ''
+  ].join('\n'));
   await writeFile(join(root, 'packages/cli/src/index.ts'), "const coordinator = process.env.PONSWARP_COORDINATOR_URL ?? 'https://grid.ponslink.com';\n");
   await writeFile(join(root, 'packages/cli/src/coordinator-runtime.ts'), [
     "const workspacePath = '/api/grid/v1/workspaces';",

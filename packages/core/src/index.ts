@@ -139,6 +139,68 @@ export interface PieceReceiveResult {
   hash?: string;
 }
 
+export type DirectTerminalReason = 'verified' | 'acknowledged' | 'send_failed' | 'request_timeout' | 'cancelled' | 'provider_reject' | 'hash_mismatch' | 'invalid_chunk';
+export interface DirectTerminalEvent {
+  fileId: FileId;
+  pieceIndex: number;
+  peerId: PeerId;
+  requestId: string;
+  reason: DirectTerminalReason;
+  retryCount: number;
+  willRetry: boolean;
+  at: number;
+  generation: number;
+  controllerId?: string;
+  windowKey: string;
+}
+export interface DirectWindowExhaustedEvent {
+  fileId: FileId;
+  peerId: PeerId;
+  controllerId?: string;
+  windowKey: string;
+  generation: number;
+  pieceIndex: number;
+  requestId: string;
+  reason: DirectTerminalReason;
+  retryCount: number;
+  at: number;
+}
+export interface DirectLifecycleErrorEvent {
+  phase: 'send' | 'receive' | 'storage' | 'persist' | 'finalize';
+  code: string;
+  message: string;
+  fileId: FileId;
+  pieceIndex: number;
+  peerId: PeerId;
+  requestId?: string;
+  controllerId?: string;
+  windowKey: string;
+  generation: number;
+  at: number;
+}
+
+export interface DirectRequestOptions {
+  timeoutMs?: number;
+  controllerId?: string;
+  windowKey?: string;
+}
+
+export interface DirectLifecycleOptions {
+  now?: () => number;
+  setTimeout?: (handler: () => void, timeout: number) => ReturnType<typeof globalThis.setTimeout>;
+  clearTimeout?: (handle: ReturnType<typeof globalThis.setTimeout>) => void;
+  directTimeoutMs?: number;
+  directWindowCap?: number;
+}
+
+export interface DirectCancelSelector {
+  fileId?: FileId;
+  peerId?: PeerId;
+  controllerId?: string;
+  windowKey?: string;
+  generation?: number;
+}
+
 export interface EngineEvents extends EventMap {
   progress: TransferProgress;
   pieceVerified: { fileId: FileId; pieceIndex: number };
@@ -146,6 +208,9 @@ export interface EngineEvents extends EventMap {
   availabilityChanged: AvailabilityChangedEvent;
   requestTimedOut: { fileId: FileId; pieceIndex: number; peerId: PeerId; requestId: string };
   performance: PerformanceEvent;
+  requestTerminal: DirectTerminalEvent;
+  requestWindowExhausted: DirectWindowExhaustedEvent;
+  directLifecycleError: DirectLifecycleErrorEvent;
 }
 
 export interface PieceRequestMessage {
@@ -253,7 +318,7 @@ export interface GridScheduleOptions {
   now?: number;
 }
 
-export interface PieceWindowOptions {
+export interface PieceWindowOptions extends DirectRequestOptions {
   maxInFlight?: number;
 }
 
@@ -815,7 +880,7 @@ export class PonsWarpEngine {
   private readonly ownerSources = new Map<FileId, Blob>();
   private readonly pendingChunks = new Map<PeerId, PieceChunkHeaderMessage>();
   private readonly incomingChunks = new Map<string, IncomingChunkAssembly>();
-  private readonly outstandingRequests = new Map<string, { fileId: FileId; pieceIndex: number; peerId: PeerId; requestedAt: number; gridOptions?: GridScheduleOptions }>();
+  private readonly outstandingRequests = new Map<string, { fileId: FileId; pieceIndex: number; peerId: PeerId; requestedAt: number; gridOptions?: GridScheduleOptions; direct?: { timeoutMs: number; controllerId?: string; windowKey: string; expiresAt: number; generation: number; retryCount: number } }>();
   private readonly pieceSendQueues = new Map<PeerId, Promise<void>>();
   private readonly availability = new PieceAvailabilityTable();
   private readonly peerHealth = new PeerHealthTable();
@@ -823,6 +888,17 @@ export class PonsWarpEngine {
   private readonly knownPeers = new Set<PeerId>();
   private sessionId: SessionId | null = null;
   private transportUnsubscribers: Unsubscribe[] = [];
+  private readonly directTimers = new Map<string, ReturnType<typeof globalThis.setTimeout>>();
+  private readonly directTombstones = new Set<string>();
+  private readonly directWindows = new Map<string, { fileId: FileId; peerId: PeerId; controllerId?: string; cap: number; generation: number; queue: Promise<void>; error?: unknown; disabled?: boolean; exhausted?: boolean }>();
+  private readonly maxDirectMetadataEntries = 4_096;
+  private nextDirectGeneration = 0;
+  private readonly clock: () => number;
+  private readonly scheduleTimer: (handler: () => void, timeout: number) => ReturnType<typeof globalThis.setTimeout>;
+  private readonly cancelTimer: (handle: ReturnType<typeof globalThis.setTimeout>) => void;
+  private disposed = false;
+  private defaultDirectTimeout = 300_000;
+  private directWindowCap?: number;
 
   constructor(
     private readonly storage: StorageAdapter,
@@ -830,13 +906,80 @@ export class PonsWarpEngine {
     private readonly integrity = new IntegrityChecker(),
     private readonly events = new EventBus<EngineEvents>(),
     private transport?: Transport,
-    private readonly maxRetries = 3
+    private readonly maxRetries = 3,
+    lifecycleOptions: DirectLifecycleOptions = {}
   ) {
+    this.clock = lifecycleOptions.now ?? (() => Date.now());
+    this.scheduleTimer = lifecycleOptions.setTimeout ?? ((handler, timeout) => globalThis.setTimeout(handler, timeout));
+    this.cancelTimer = lifecycleOptions.clearTimeout ?? (handle => globalThis.clearTimeout(handle));
+    this.defaultDirectTimeout = lifecycleOptions.directTimeoutMs ?? 300_000;
+    assertPositiveSafeInteger(this.defaultDirectTimeout, 'directTimeoutMs');
+    this.directWindowCap = lifecycleOptions.directWindowCap;
+    if (this.directWindowCap !== undefined) assertPositiveSafeInteger(this.directWindowCap, 'directWindowCap');
     if (transport) this.bindTransport(transport);
   }
 
   on<T extends keyof EngineEvents>(type: T, handler: EventHandler<EngineEvents[T]>): Unsubscribe {
     return this.events.on(type, handler);
+  }
+  async dispose(): Promise<void> {
+    if (this.disposed) {
+      await this.flushDirectLifecycle();
+      return;
+    }
+    this.cancelDirectRequests();
+    await this.flushDirectLifecycle();
+    this.disposed = true;
+    for (const timer of this.directTimers.values()) this.cancelTimer(timer);
+    this.directTimers.clear();
+    this.outstandingRequests.clear();
+    this.directWindows.clear();
+    this.transportUnsubscribers.forEach(unsubscribe => unsubscribe());
+    this.transportUnsubscribers = [];
+  }
+
+  expireDirectRequests(now = this.clock()): void {
+    for (const [requestId, request] of [...this.outstandingRequests]) {
+      if (request.direct?.expiresAt !== undefined && request.direct.expiresAt <= now) this.expireDirectRequest(requestId);
+    }
+  }
+
+  cancelDirectRequests(selector: DirectCancelSelector = {}): number {
+    for (const [windowKey, window] of this.directWindows) {
+      if (selector.windowKey !== undefined && windowKey !== selector.windowKey) continue;
+      if (selector.fileId !== undefined && window.fileId !== selector.fileId) continue;
+      if (selector.peerId !== undefined && window.peerId !== selector.peerId) continue;
+      if (selector.controllerId !== undefined && window.controllerId !== selector.controllerId) continue;
+      if (selector.generation !== undefined && window.generation !== selector.generation) continue;
+      window.disabled = true;
+      window.generation = this.allocateDirectGeneration();
+    }
+
+    let count = 0;
+    for (const [requestId, request] of [...this.outstandingRequests]) {
+      const direct = request.direct;
+      if (!direct) continue;
+      if (selector.fileId !== undefined && request.fileId !== selector.fileId) continue;
+      if (selector.peerId !== undefined && request.peerId !== selector.peerId) continue;
+      if (selector.controllerId !== undefined && direct.controllerId !== selector.controllerId) continue;
+      if (selector.windowKey !== undefined && direct.windowKey !== selector.windowKey) continue;
+      if (selector.generation !== undefined && direct.generation !== selector.generation) continue;
+      this.addDirectTombstone(requestId);
+      if (this.finalizeDirectRequest(requestId, 'cancelled')) count += 1;
+    }
+    this.pruneDirectLifecycleMetadata();
+    return count;
+  }
+
+  async flushDirectLifecycle(): Promise<void> {
+    this.expireDirectRequests();
+    const windows = [...this.directWindows.values()];
+    await Promise.all(windows.map(window => window.queue));
+    const failed = windows.find(window => window.error !== undefined);
+    const error = failed?.error;
+    if (failed) failed.error = undefined;
+    this.pruneDirectLifecycleMetadata();
+    if (failed) throw error;
   }
 
   setTransport(transport: Transport): void {
@@ -888,32 +1031,77 @@ export class PonsWarpEngine {
     return { sessionId, manifests: mergedManifests };
   }
 
-  async requestNextPiece(peerId: PeerId, fileId: FileId): Promise<ScheduledPiece | null> {
+  async requestNextPiece(peerId: PeerId, fileId: FileId, directOptions?: DirectRequestOptions): Promise<ScheduledPiece | null> {
     const manager = this.requireManager(fileId);
     const scheduled = new OwnerFirstScheduler(peerId, this.maxRetries).next(manager);
     if (!scheduled) return null;
+    if (directOptions?.timeoutMs !== undefined) assertPositiveSafeInteger(directOptions.timeoutMs, 'timeoutMs');
     const requestId = this.createRequestId(fileId, scheduled.piece.index);
     manager.markRequested(scheduled.piece.index, peerId);
-    this.outstandingRequests.set(requestId, { fileId, pieceIndex: scheduled.piece.index, peerId, requestedAt: Date.now() });
-    await this.sendPieceRequest(peerId, fileId, scheduled.piece.index, requestId);
-    await this.persistState();
-    return scheduled;
-  }
-
-  async requestPieceWindow(peerId: PeerId, fileId: FileId, options: PieceWindowOptions = {}): Promise<ScheduledPiece[]> {
-    const maxInFlight = options.maxInFlight ?? 1;
-    assertPositiveSafeInteger(maxInFlight, 'maxInFlight');
-    const scheduled: ScheduledPiece[] = [];
-    while (this.countOutstandingRequests(fileId, peerId) < maxInFlight) {
-      const next = await this.requestNextPiece(peerId, fileId);
-      if (!next) break;
-      scheduled.push(next);
+    const timeoutMs = directOptions?.timeoutMs ?? this.defaultDirectTimeout;
+    const windowKey = directOptions ? directOptions.windowKey ?? `${fileId}:${peerId}:${directOptions.controllerId ?? 'default'}` : undefined;
+    if (directOptions && windowKey && !this.directWindows.has(windowKey)) {
+      this.directWindows.set(windowKey, { fileId, peerId, controllerId: directOptions.controllerId, cap: 1, generation: 0, queue: Promise.resolve() });
+    }
+    const window = windowKey ? this.directWindows.get(windowKey) : undefined;
+    const retryCount = (directOptions as (DirectRequestOptions & { retryCount?: number }) | undefined)?.retryCount ?? 0;
+    const generation = window?.generation ?? 0;
+    this.outstandingRequests.set(requestId, { fileId, pieceIndex: scheduled.piece.index, peerId, requestedAt: this.clock(), direct: directOptions ? {
+      timeoutMs, controllerId: directOptions.controllerId, windowKey: windowKey!, expiresAt: this.clock() + timeoutMs, generation, retryCount
+    } : undefined });
+    if (directOptions) this.armDirectTimer(requestId);
+    try {
+      await this.sendPieceRequest(peerId, fileId, scheduled.piece.index, requestId);
+    } catch {
+      manager.markFailed(scheduled.piece.index, 'send_failed');
+      this.finalizeDirectRequest(requestId, 'send_failed');
+      return null;
+    }
+    try {
+      await this.persistState();
+    } catch (error) {
+      const request = this.outstandingRequests.get(requestId);
+      this.emitDirectLifecycleError('persist', request, requestId, error);
+      manager.markFailed(scheduled.piece.index, 'persist_failed');
+      this.finalizeDirectRequest(requestId, 'cancelled');
+      return null;
     }
     return scheduled;
   }
 
+  async requestPieceWindow(peerId: PeerId, fileId: FileId, options: PieceWindowOptions = {}): Promise<ScheduledPiece[]> {
+    const maxInFlight = options.maxInFlight ?? this.directWindowCap ?? 1;
+    assertPositiveSafeInteger(maxInFlight, 'maxInFlight');
+    const windowKey = options.windowKey ?? `${fileId}:${peerId}:${options.controllerId ?? 'default'}`;
+    let window = this.directWindows.get(windowKey);
+    if (!window) {
+      window = { fileId, peerId, controllerId: options.controllerId, cap: maxInFlight, generation: this.allocateDirectGeneration(), queue: Promise.resolve() };
+      this.directWindows.set(windowKey, window);
+      this.pruneDirectLifecycleMetadata(windowKey);
+    } else if (window.cap !== maxInFlight) {
+      throw new PonsWarpError('direct:window_cap_mismatch', 'Direct window cap is immutable', { category: 'lifecycle', recoverable: true });
+    } else if (window.fileId !== fileId || window.peerId !== peerId || window.controllerId !== options.controllerId) {
+      throw new PonsWarpError('direct:window_identity_mismatch', 'Direct window identity is immutable', { category: 'lifecycle', recoverable: true });
+    } else if (window.disabled) {
+      throw new PonsWarpError('direct:window_cancelled', 'Direct window is cancelled', { category: 'lifecycle', recoverable: true });
+    }
+    return this.enqueueWindow(windowKey, async () => {
+      const scheduled: ScheduledPiece[] = [];
+      while (this.countOutstandingRequestsForWindow(windowKey) < window!.cap) {
+        const next = await this.requestNextPiece(peerId, fileId, { ...options, windowKey });
+        if (!next) break;
+        scheduled.push(next);
+      }
+      return scheduled;
+    });
+  }
+
   getOutstandingRequestCount(fileId: FileId, peerId?: PeerId): number {
     return this.countOutstandingRequests(fileId, peerId);
+  }
+
+  getDirectWindowGeneration(windowKey: string): number | undefined {
+    return this.directWindows.get(windowKey)?.generation;
   }
 
   exportPieceMapBroadcast(fileId: FileId): PieceMapBroadcast {
@@ -1051,33 +1239,55 @@ export class PonsWarpEngine {
     });
   }
 
-  async receivePiece(input: { fileId: FileId; pieceIndex: number; requestId: string; data: ArrayBuffer }): Promise<PieceReceiveResult> {
+  async receivePiece(input: { fileId: FileId; pieceIndex: number; requestId: string; data: ArrayBuffer }, expectedPeerId?: PeerId): Promise<PieceReceiveResult> {
+    if (this.directTombstones.has(input.requestId)
+      || (this.isEngineGeneratedRequestId(input.requestId) && !this.outstandingRequests.has(input.requestId))) {
+      return { type: 'PIECE_REJECT', fileId: input.fileId, pieceIndex: input.pieceIndex, requestId: input.requestId, reason: 'unauthorized' };
+    }
     const manifest = this.requireManifest(input.fileId);
     const descriptor = manifest.pieces[input.pieceIndex];
     if (!descriptor) throw new PonsWarpError('piece:not_found', `Unknown piece ${input.pieceIndex}`, { category: 'piece', recoverable: true });
     const manager = this.requireManager(input.fileId);
 
-    if (!(await this.integrity.verifyPiece(input.data, descriptor))) {
+    const verified = await this.integrity.verifyPiece(input.data, descriptor);
+    if (expectedPeerId !== undefined && !this.isExactActiveRequest(expectedPeerId, input.fileId, input.pieceIndex, input.requestId)) {
+      return { type: 'PIECE_REJECT', fileId: input.fileId, pieceIndex: input.pieceIndex, requestId: input.requestId, reason: 'unauthorized' };
+    }
+    if (!verified) {
       const outstanding = this.outstandingRequests.get(input.requestId);
       this.availability.release(input.fileId, input.pieceIndex, input.requestId);
-      this.outstandingRequests.delete(input.requestId);
-      if (outstanding) this.peerHealth.markReject(outstanding.peerId);
       manager.markFailed(input.pieceIndex, 'hash_mismatch');
+      if (outstanding) this.peerHealth.markReject(outstanding.peerId);
       if (outstanding) this.emitRetryPerformance({ fileId: input.fileId, pieceIndex: input.pieceIndex, peerId: outstanding.peerId, requestId: input.requestId, reason: 'hash_mismatch' });
       await this.storage.deletePiece(input.fileId, input.pieceIndex);
+      try {
+        await this.persistState();
+      } catch (error) {
+        this.emitDirectLifecycleError('persist', outstanding, input.requestId, error);
+        this.finalizeDirectRequest(input.requestId, 'cancelled');
+      }
+      if (!this.finalizeDirectRequest(input.requestId, 'hash_mismatch')) this.outstandingRequests.delete(input.requestId);
       this.events.emit('pieceRejected', { fileId: input.fileId, pieceIndex: input.pieceIndex, reason: 'hash_mismatch' });
       this.events.emit('progress', manager.getProgress());
-      await this.persistState();
       return { type: 'PIECE_REJECT', fileId: input.fileId, pieceIndex: input.pieceIndex, requestId: input.requestId, reason: 'hash_mismatch', hash: descriptor.hash };
     }
 
+    if (expectedPeerId !== undefined && !this.isExactActiveRequest(expectedPeerId, input.fileId, input.pieceIndex, input.requestId)) {
+      return { type: 'PIECE_REJECT', fileId: input.fileId, pieceIndex: input.pieceIndex, requestId: input.requestId, reason: 'unauthorized' };
+    }
+    const outstanding = this.outstandingRequests.get(input.requestId);
     const writeStartedAt = Date.now();
-    await this.storage.writePiece(input.fileId, input.pieceIndex, input.data);
+    try {
+      await this.storage.writePiece(input.fileId, input.pieceIndex, input.data);
+    } catch (error) {
+      this.emitDirectLifecycleError('storage', outstanding, input.requestId, error);
+      manager.markFailed(input.pieceIndex, 'storage_failed');
+      this.finalizeDirectRequest(input.requestId, 'cancelled');
+      return { type: 'PIECE_REJECT', fileId: input.fileId, pieceIndex: input.pieceIndex, requestId: input.requestId, reason: 'storage_failed' };
+    }
     this.events.emit('performance', { type: 'storage:write', fileId: input.fileId, pieceIndex: input.pieceIndex, bytes: input.data.byteLength, durationMs: Math.max(0, Date.now() - writeStartedAt) });
     manager.markVerified(input.pieceIndex);
-    const outstanding = this.outstandingRequests.get(input.requestId);
     this.availability.release(input.fileId, input.pieceIndex, input.requestId);
-    this.outstandingRequests.delete(input.requestId);
     if (outstanding) {
       const windowMs = Math.max(1, Date.now() - outstanding.requestedAt);
       this.peerHealth.markSuccess(outstanding.peerId, input.data.byteLength, windowMs);
@@ -1091,10 +1301,18 @@ export class PonsWarpEngine {
         windowMs
       });
     }
+    try {
+      await this.persistState();
+    } catch (error) {
+      this.emitDirectLifecycleError('persist', outstanding, input.requestId, error);
+      manager.markFailed(input.pieceIndex, 'persist_failed');
+      this.finalizeDirectRequest(input.requestId, 'cancelled');
+      return { type: 'PIECE_REJECT', fileId: input.fileId, pieceIndex: input.pieceIndex, requestId: input.requestId, reason: 'persist_failed' };
+    }
+    if (!this.finalizeDirectRequest(input.requestId, 'verified')) this.outstandingRequests.delete(input.requestId);
     if (this.knownPeers.size > 0) await this.broadcastPieceMap(input.fileId, [...this.knownPeers]);
     this.events.emit('pieceVerified', { fileId: input.fileId, pieceIndex: input.pieceIndex });
     this.events.emit('progress', manager.getProgress());
-    await this.persistState();
     return { type: 'PIECE_ACK', fileId: input.fileId, pieceIndex: input.pieceIndex, requestId: input.requestId, hash: descriptor.hash };
   }
 
@@ -1146,23 +1364,44 @@ export class PonsWarpEngine {
       return;
     }
     if (type === 'PIECE_CHUNK_HEADER') {
-      this.pendingChunks.set(peerId, this.parseChunkHeader(message));
+      const header = this.parseChunkHeader(message);
+      const active = this.outstandingRequests.get(header.requestId);
+      if (!active || active.peerId !== peerId || active.fileId !== header.fileId || active.pieceIndex !== header.pieceIndex || this.directTombstones.has(header.requestId)) return;
+      const previous = this.pendingChunks.get(peerId);
+      if (previous) {
+        const same = previous.requestId === header.requestId &&
+          previous.fileId === header.fileId &&
+          previous.pieceIndex === header.pieceIndex &&
+          previous.chunkIndex === header.chunkIndex &&
+          previous.totalChunks === header.totalChunks &&
+          previous.payloadSize === header.payloadSize;
+        if (!same) {
+          await this.rejectIncomingChunk(peerId, header);
+          return;
+        }
+      } else {
+        this.pendingChunks.set(peerId, header);
+      }
       return;
     }
     if (type === 'PIECE_ACK') {
       const requestId = requireStringField(message, 'requestId');
+      const ackFileId = requireStringField(message, 'fileId') as FileId;
+      const ackPieceIndex = requireNumberField(message, 'pieceIndex');
       const outstanding = this.outstandingRequests.get(requestId);
+      if (outstanding && outstanding.peerId !== peerId) return;
+      if (outstanding && (outstanding.peerId !== peerId || outstanding.fileId !== ackFileId || outstanding.pieceIndex !== ackPieceIndex)) return;
       if (outstanding) {
         this.availability.release(outstanding.fileId, outstanding.pieceIndex, requestId);
         this.peerHealth.markSuccess(outstanding.peerId, 0, Math.max(1, Date.now() - outstanding.requestedAt));
       }
-      this.outstandingRequests.delete(requestId);
+      if (!this.finalizeDirectRequest(requestId, 'acknowledged')) this.outstandingRequests.delete(requestId);
       return;
     }
     if (type === 'PIECE_REJECT') {
       const requestId = requireStringField(message, 'requestId');
       const outstanding = this.outstandingRequests.get(requestId);
-      this.outstandingRequests.delete(requestId);
+      if (outstanding && outstanding.peerId !== peerId) return;
       if (outstanding) {
         this.availability.release(outstanding.fileId, outstanding.pieceIndex, requestId);
         this.peerHealth.markReject(outstanding.peerId);
@@ -1170,10 +1409,14 @@ export class PonsWarpEngine {
         const reason = requireStringField(message, 'reason');
         manager.markFailed(outstanding.pieceIndex, reason);
         this.emitRetryPerformance({ fileId: outstanding.fileId, pieceIndex: outstanding.pieceIndex, peerId: outstanding.peerId, requestId, reason });
-        if (manager.getPieceState(outstanding.pieceIndex).retryCount <= this.maxRetries) {
-          manager.resetFailedToMissing(outstanding.pieceIndex);
-          if (outstanding.gridOptions) await this.requestNextGridPiece(outstanding.fileId, outstanding.gridOptions);
-          else await this.requestNextPiece(outstanding.peerId, outstanding.fileId);
+        const finalizedDirect = this.finalizeDirectRequest(requestId, 'provider_reject');
+        if (!finalizedDirect) {
+          this.outstandingRequests.delete(requestId);
+          if (manager.getPieceState(outstanding.pieceIndex).retryCount <= this.maxRetries) {
+            manager.resetFailedToMissing(outstanding.pieceIndex);
+            if (outstanding.gridOptions) await this.requestNextGridPiece(outstanding.fileId, outstanding.gridOptions);
+            else await this.requestNextPiece(outstanding.peerId, outstanding.fileId);
+          }
         }
       }
     }
@@ -1188,17 +1431,27 @@ export class PonsWarpEngine {
     if (!assembled) return;
 
     const outstanding = this.outstandingRequests.get(header.requestId);
-    const result = await this.receivePiece({ fileId: header.fileId, pieceIndex: header.pieceIndex, requestId: header.requestId, data: assembled });
+    if (!outstanding || outstanding.peerId !== peerId || outstanding.fileId !== header.fileId || outstanding.pieceIndex !== header.pieceIndex) {
+      return;
+    }
+    let result: PieceReceiveResult;
+    try {
+      result = await this.receivePiece({ fileId: header.fileId, pieceIndex: header.pieceIndex, requestId: header.requestId, data: assembled }, peerId);
+    } catch (error) {
+      this.emitDirectLifecycleError('receive', outstanding, header.requestId, error);
+      this.managers.get(header.fileId)?.markFailed(header.pieceIndex, 'receive_failed');
+      this.finalizeDirectRequest(header.requestId, 'cancelled');
+      return;
+    }
     const response: PieceAckMessage | PieceRejectMessage = result.type === 'PIECE_ACK'
       ? { type: 'PIECE_ACK', fileId: result.fileId, pieceIndex: result.pieceIndex, requestId: result.requestId, status: 'verified', hash: result.hash }
       : { type: 'PIECE_REJECT', fileId: result.fileId, pieceIndex: result.pieceIndex, requestId: result.requestId, reason: (result.reason === 'hash_mismatch' ? 'hash_mismatch' : 'missing_piece'), expectedHash: result.hash };
     await this.requireTransport().send(peerId, response);
-    if (result.type === 'PIECE_REJECT') {
+    if (result.type === 'PIECE_REJECT' && outstanding?.gridOptions) {
       const manager = this.requireManager(result.fileId);
       if (manager.getPieceState(result.pieceIndex).retryCount <= this.maxRetries) {
         manager.resetFailedToMissing(result.pieceIndex);
-        if (outstanding?.gridOptions) await this.requestNextGridPiece(result.fileId, outstanding.gridOptions);
-        else await this.requestNextPiece(peerId, result.fileId);
+        await this.requestNextGridPiece(result.fileId, outstanding.gridOptions);
       }
     }
   }
@@ -1251,10 +1504,11 @@ export class PonsWarpEngine {
   private async rejectIncomingChunk(peerId: PeerId, header: PieceChunkHeaderMessage): Promise<void> {
     const outstanding = this.outstandingRequests.get(header.requestId);
     this.incomingChunks.delete(header.requestId);
-    this.outstandingRequests.delete(header.requestId);
     this.availability.release(header.fileId, header.pieceIndex, header.requestId);
     const manager = this.managers.get(header.fileId);
     if (manager) manager.markFailed(header.pieceIndex, 'invalid_chunk');
+    const finalizedDirect = this.finalizeDirectRequest(header.requestId, 'invalid_chunk');
+    if (!finalizedDirect) this.outstandingRequests.delete(header.requestId);
     this.peerHealth.markReject(peerId);
     if (manager) this.emitRetryPerformance({ fileId: header.fileId, pieceIndex: header.pieceIndex, peerId, requestId: header.requestId, reason: 'invalid_chunk' });
     await this.requireTransport().send(peerId, {
@@ -1267,7 +1521,7 @@ export class PonsWarpEngine {
     this.events.emit('pieceRejected', { fileId: header.fileId, pieceIndex: header.pieceIndex, reason: 'invalid_chunk' });
     if (manager) {
       this.events.emit('progress', manager.getProgress());
-      if (manager.getPieceState(header.pieceIndex).retryCount <= this.maxRetries) {
+      if (!finalizedDirect && manager.getPieceState(header.pieceIndex).retryCount <= this.maxRetries) {
         manager.resetFailedToMissing(header.pieceIndex);
         if (outstanding?.gridOptions) await this.requestNextGridPiece(header.fileId, outstanding.gridOptions);
         else await this.requestNextPiece(peerId, header.fileId);
@@ -1416,6 +1670,117 @@ export class PonsWarpEngine {
     } satisfies PieceRequestMessage);
   }
 
+  private armDirectTimer(requestId: string): void {
+    const request = this.outstandingRequests.get(requestId);
+    if (!request?.direct) return;
+    this.directTimers.set(requestId, this.scheduleTimer(() => {
+      const windowKey = request.direct?.windowKey;
+      if (windowKey) void this.enqueueWindow(windowKey, async () => { this.expireDirectRequest(requestId); }, true);
+      else this.expireDirectRequest(requestId);
+    }, request.direct.timeoutMs));
+  }
+
+  private expireDirectRequest(requestId: string): void {
+    const request = this.outstandingRequests.get(requestId);
+    if (!request?.direct) return;
+    this.managers.get(request.fileId)?.markFailed(request.pieceIndex, 'request_timeout');
+    this.peerHealth.markTimeout(request.peerId);
+    this.events.emit('requestTimedOut', { fileId: request.fileId, pieceIndex: request.pieceIndex, peerId: request.peerId, requestId });
+    this.finalizeDirectRequest(requestId, 'request_timeout');
+  }
+
+  private finalizeDirectRequest(requestId: string, status: DirectTerminalReason): boolean {
+    const request = this.outstandingRequests.get(requestId);
+    if (!request?.direct) return false;
+    this.outstandingRequests.delete(requestId);
+    const timer = this.directTimers.get(requestId);
+    if (timer !== undefined) this.cancelTimer(timer);
+    this.directTimers.delete(requestId);
+    this.incomingChunks.delete(requestId);
+    for (const [peerId, header] of this.pendingChunks) if (header.requestId === requestId) this.pendingChunks.delete(peerId);
+    const retryable = status === 'provider_reject' || status === 'send_failed' || status === 'request_timeout' || status === 'hash_mismatch' || status === 'invalid_chunk';
+    const willRetry = retryable && request.direct.retryCount < this.maxRetries;
+    this.events.emit('requestTerminal', {
+      fileId: request.fileId, pieceIndex: request.pieceIndex, peerId: request.peerId, requestId,
+      reason: status,
+      retryCount: request.direct.retryCount,
+      willRetry,
+      at: this.clock(), generation: request.direct.generation,
+      windowKey: request.direct.windowKey, controllerId: request.direct.controllerId
+    });
+    if (willRetry) {
+      const retryOptions = { timeoutMs: request.direct.timeoutMs, controllerId: request.direct.controllerId, windowKey: request.direct.windowKey, retryCount: request.direct.retryCount + 1 } as DirectRequestOptions & { retryCount: number };
+      const key = request.direct.windowKey;
+      if (key) void this.enqueueWindow(key, async () => {
+        if (this.disposed || this.directTombstones.has(requestId)) return;
+        const retryWindow = this.directWindows.get(key);
+        if (!retryWindow || retryWindow.disabled || retryWindow.generation !== request.direct!.generation) return;
+        if (this.countOutstandingRequestsForWindow(key) >= retryWindow.cap) return;
+        this.managers.get(request.fileId)?.resetFailedToMissing(request.pieceIndex);
+        await this.requestNextPiece(request.peerId, request.fileId, retryOptions);
+      }, true);
+    } else if (retryable && request.direct.windowKey) {
+      const window = this.directWindows.get(request.direct.windowKey);
+      if (window && !window.exhausted) {
+        window.exhausted = true;
+        this.emitWindowExhausted(window, request.direct.windowKey, status, { ...request, requestId });
+      }
+    }
+    return true;
+  }
+
+  private emitWindowExhausted(window: { fileId: FileId; peerId: PeerId; controllerId?: string; generation: number }, windowKey: string, reason: DirectTerminalReason, request: { pieceIndex: number; requestId: string; direct?: { controllerId?: string; retryCount: number } }): void {
+    this.events.emit('requestWindowExhausted', {
+      fileId: window.fileId,
+      peerId: window.peerId,
+      controllerId: window.controllerId,
+      windowKey,
+      generation: window.generation,
+      pieceIndex: request.pieceIndex,
+      requestId: request.requestId,
+      reason,
+      retryCount: request.direct?.retryCount ?? 0,
+      at: this.clock()
+    });
+  }
+
+  private enqueueWindow<T>(windowKey: string, task: () => Promise<T>, trackFailure = false): Promise<T> {
+    const window = this.directWindows.get(windowKey);
+    if (!window || window.disabled || this.disposed) return Promise.resolve(undefined as T);
+    const run = window.queue.then(async () => {
+      if (window.disabled || this.disposed) return undefined as T;
+      return task();
+    });
+    window.queue = run.then(
+      () => undefined,
+      error => {
+        if (trackFailure) window.error = error;
+      }
+    );
+    return run;
+  }
+  private emitDirectLifecycleError(phase: DirectLifecycleErrorEvent['phase'], request: { fileId: FileId; pieceIndex: number; peerId: PeerId; direct?: { windowKey?: string; controllerId?: string } } | undefined, requestId: string | undefined, error: unknown): void {
+    if (!request?.direct?.windowKey) return;
+    const window = this.directWindows.get(request.direct.windowKey);
+    if (window) {
+      window.disabled = true;
+      window.error = error;
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    this.events.emit('directLifecycleError', {
+      phase,
+      code: error instanceof PonsWarpError ? error.code : 'direct:lifecycle_failed',
+      message: message.slice(0, 256),
+      fileId: request.fileId,
+      pieceIndex: request.pieceIndex,
+      peerId: request.peerId,
+      requestId,
+      controllerId: request.direct.controllerId,
+      windowKey: request.direct.windowKey,
+      generation: this.directWindows.get(request.direct.windowKey)?.generation ?? 0,
+      at: this.clock()
+    });
+  }
   private createRequestId(fileId: FileId, pieceIndex: number): string {
     return `req_${fileId}_${pieceIndex}_${Date.now()}_${Math.random().toString(36).slice(2)}`;
   }
@@ -1426,6 +1791,66 @@ export class PonsWarpEngine {
       if (request.fileId === fileId && (!peerId || request.peerId === peerId)) count += 1;
     }
     return count;
+  }
+
+  private countOutstandingRequestsForWindow(windowKey: string): number {
+    let count = 0;
+    for (const request of this.outstandingRequests.values()) {
+      if (request.direct?.windowKey === windowKey) count += 1;
+    }
+    return count;
+  }
+
+  private isExactActiveRequest(peerId: PeerId, fileId: FileId, pieceIndex: number, requestId: string): boolean {
+    const request = this.outstandingRequests.get(requestId);
+    return request !== undefined
+      && request.peerId === peerId
+      && request.fileId === fileId
+      && request.pieceIndex === pieceIndex
+      && !this.directTombstones.has(requestId);
+  }
+
+  getDirectLifecycleSnapshot(): { outstandingDirect: number; activeTimers: number } {
+    let outstandingDirect = 0;
+    for (const request of this.outstandingRequests.values()) {
+      if (request.direct) outstandingDirect += 1;
+    }
+    return { outstandingDirect, activeTimers: this.directTimers.size };
+  }
+
+  getDirectLifecycleMetadataSnapshot(): { trackedWindows: number; tombstones: number } {
+    return { trackedWindows: this.directWindows.size, tombstones: this.directTombstones.size };
+  }
+
+  private addDirectTombstone(requestId: string): void {
+    this.directTombstones.add(requestId);
+    while (this.directTombstones.size > this.maxDirectMetadataEntries) {
+      const oldest = this.directTombstones.values().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.directTombstones.delete(oldest);
+    }
+  }
+
+  private allocateDirectGeneration(): number {
+    if (!Number.isSafeInteger(this.nextDirectGeneration)) {
+      throw new PonsWarpError('direct:generation_exhausted', 'Direct lifecycle generation exhausted', { category: 'lifecycle', recoverable: false });
+    }
+    const generation = this.nextDirectGeneration;
+    this.nextDirectGeneration += 1;
+    return generation;
+  }
+
+  private isEngineGeneratedRequestId(requestId: string): boolean {
+    return /^req_.+_[0-9]+_[a-z0-9]+$/.test(requestId);
+  }
+
+  private pruneDirectLifecycleMetadata(preserveWindowKey?: string): void {
+    if (this.directWindows.size <= this.maxDirectMetadataEntries) return;
+    for (const [windowKey] of this.directWindows) {
+      if (this.directWindows.size <= this.maxDirectMetadataEntries) break;
+      if (windowKey === preserveWindowKey || this.countOutstandingRequestsForWindow(windowKey) > 0) continue;
+      this.directWindows.delete(windowKey);
+    }
   }
 
   private registerManifest(manifest: FileManifest): void {

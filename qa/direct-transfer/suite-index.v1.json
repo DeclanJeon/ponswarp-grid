@@ -1,0 +1,12 @@
+{
+  "schema": "ponswarp-grid.direct-transfer-suite-index/v1",
+  "suites": [
+    {
+      "suiteId": "direct-transfer-local-v1",
+      "rolloutId": "hold-1",
+      "decision": "HOLD",
+      "enabled": false,
+      "resultPath": "artifacts/direct-transfer/direct-transfer-local-v1/result.json"
+    }
+  ]
+}

@@ -75,6 +75,8 @@ describe('ponswarp CLI grid transfer', () => {
       expect(nonOwnerPieces).toBeGreaterThan(0);
       expect(await readFile(join(outB, 'grid.bin'))).toEqual(payload);
       expect(bOutput.stderr.join('')).toBe('');
+      expect(receiverA.kill('SIGTERM')).toBe(true);
+      expect(await waitForExit(receiverA)).toBe(143);
     } finally {
       if (receiverA && receiverA.exitCode === null) receiverA.kill('SIGTERM');
       if (sender && sender.exitCode === null) sender.kill('SIGTERM');

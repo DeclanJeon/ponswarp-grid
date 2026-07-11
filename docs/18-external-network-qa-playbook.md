@@ -22,13 +22,17 @@ verdict: passed
 exit code: 0
 ```
 
-Current known blocker state from the latest run:
+Current known blocker state from the latest strict-schema run:
 
 ```text
 verdict: needs_external_evidence
-NET-006 missing: UDP-blocked TCP/TLS-only transfer artifact is absent.
-NET-002 inconclusive: NAT/split-network browser transfer lacks machine-readable selectedPair.
-NET-003 inconclusive: LTE/5G mobile row is not fully normalized as machine-readable evidence.
+NET-001 passed: normalized JSON is backed by the measured LAN CLI receipt and matching SHA-256.
+NET-002 passed: strict NAT/split-network browser evidence records selected pair, RTT, goodput, integrity, and clean disposal.
+NET-003 passed: strict LTE browser evidence records the same machine-readable contract.
+NET-004 missing: the historical TURN UDP result is Markdown/screenshot evidence without the required positive byte and throughput fields.
+NET-005 inconclusive: a historical TCP/TLS diagnostic exists but lacks the complete current producer schema and selected-pair invariants.
+NET-006 missing: UDP-blocked TCP/TLS-only transfer proof is absent.
+NET-007 and NET-008 passed as explicitly synthetic, non-network evidence.
 ```
 
 ## Who can run this
@@ -45,15 +49,15 @@ Without that access, an operator must run the external tests and commit/copy the
 
 ## Required artifacts
 
-Minimum artifact set to unblock the strict matrix:
+Minimum artifact set to unblock the remaining strict matrix rows:
 
 ```text
+artifacts/turn-relay-udp-report.json
+artifacts/turn-tcp-tls-diagnostic-report.json
 artifacts/udp-blocked-tcp-tls-report.json
-artifacts/nat-split-network-browser-report.md
-artifacts/lte-5g-mobile-browser-report.md
 ```
 
-JSON is preferred. Markdown is acceptable if it includes the exact selected-pair and throughput fields listed below.
+Every PASS-producing matrix row requires exact versioned JSON with its scenario-specific positive metrics and cross-field invariants. Markdown and screenshots may be retained only as operator notes and never satisfy a row. Browser and TURN output metrics contain candidate type/protocol only; address-bearing evidence is rejected or excluded from serialization.
 
 ## Preparation
 
@@ -132,19 +136,26 @@ pnpm grid:network-matrix -- --out artifacts/g006-cross-network-matrix-report.jso
 
 ### Artifact requirements
 
-The generated JSON should contain or imply:
+NET-006 is classified only from the exact structured proof below. The diagnostic output must be combined with evidence captured while UDP rejection was active; a filename, Markdown assertion, or `?transport=tcp` URL alone is inconclusive.
 
 ```json
 {
-  "kind": "turn-diagnostic-report",
+  "schemaVersion": 1,
+  "kind": "udp-blocked-turn-diagnostic-report",
   "verdict": "passed",
+  "udpBlockedProof": {
+    "kind": "firewall-rule",
+    "verified": true,
+    "evidence": "isolated QA host firewall rejected UDP during the run"
+  },
   "selectedCandidatePair": {
     "localCandidateType": "relay",
     "localRelayProtocol": "tls"
   },
   "transfer": {
-    "complete": true,
+    "requestedBytes": 1048576,
     "receivedBytes": 1048576,
+    "complete": true,
     "throughputBps": 123456
   },
   "classification": {
@@ -154,13 +165,18 @@ The generated JSON should contain or imply:
 }
 ```
 
+`udpBlockedProof.kind` is limited to `firewall-rule` or `network-namespace`. Requested and received bytes must match, the selected relay protocol and classification must agree, and all numeric measurements must be positive.
+
 ## NET-002: NAT / split-network browser transfer
 
 ### Goal
+Remote HTTP QA must run in a secure context: serve the browser page over HTTPS (or use `localhost` for local-only QA). A plain remote `http://` origin is not valid evidence because WebRTC and its diagnostic APIs require a secure context.
 
 Prove browser transfer works across NAT/split-network conditions and record the selected ICE pair.
 
-### Markdown artifact option
+### Markdown artifact (reference only; never classified)
+
+A Markdown report may be retained for operator notes, but it cannot satisfy NET-002 or NET-003. Use the JSON contract below for machine-readable evidence.
 
 Create:
 
@@ -191,9 +207,9 @@ If relay is selected, record it truthfully:
 Selected pair: local=relay/udp remote=relay/udp
 ```
 
-### JSON artifact option
+### JSON artifact (required for browser classification)
 
-Preferred shape:
+A browser row is classified only from a JSON artifact with these exact fields. Markdown, CLI reports, and JSON with missing or extra fields are inconclusive:
 
 ```json
 {
@@ -201,23 +217,60 @@ Preferred shape:
   "kind": "browser-network-transfer-report",
   "scenario": "nat-split-network",
   "verdict": "passed",
-  "sender": {
-    "device": "workstation",
-    "network": "home-wifi"
-  },
-  "receiver": {
-    "device": "laptop",
-    "network": "phone-lte-hotspot"
-  },
+  "sender": { "device": "workstation", "network": "home-wifi" },
+  "receiver": { "device": "laptop", "network": "phone-lte-hotspot" },
   "selectedPair": "local=srflx/udp remote=srflx/udp",
   "transfer": {
     "complete": true,
     "bytes": 10485760,
-    "throughputBps": 1234567
+    "rttMs": 42,
+    "payloadGoodputBps": 1234567
+  },
+  "runtime": { "window": 1 },
+  "terminal": {
+    "integrityVerified": true,
+    "disposalCompleted": true,
+    "outstandingRequests": 0,
+    "activeTimers": 0
   }
 }
 ```
 
+`selectedPair` contains candidate types and protocols only; never record IP addresses, URLs, tokens, or other privacy-sensitive values. `rttMs`, `payloadGoodputBps`, and `bytes` must be positive observed numbers. `runtime.window` must be `1`; this evidence never enables Window 2.
+
+## Direct-transfer reliability evidence (local)
+
+External-network artifacts do not replace the local direct-transfer reliability run. Local evidence uses schema v2 under `artifacts/direct-transfer/<suiteId>/runs/`; each run is bound to the manifest suite/build/fixture and records its selected window, stratum, outcome, lifecycle errors, and clean `dispose` evidence. Dispose evidence is mandatory for succeeded, failed, and cancelled runs. A stratum that cannot run is represented only by the separate unavailable-approval record, never by a fabricated run.
+
+Use the versioned manifest and approval files:
+
+```text
+qa/direct-transfer/run-manifest.v1.json
+qa/direct-transfer/unavailable-approval.v1.json
+qa/direct-transfer/suite-index.v1.json
+```
+
+Unavailable strata require explicit approval naming the reason, impact, approver, expiry, and rollback condition. Approval does not turn unavailable into pass; absent or expired approval yields `HOLD`.
+
+Run strict validation followed by aggregation:
+
+```bash
+node scripts/validate-direct-transfer-runs.mjs \
+  --manifest qa/direct-transfer/run-manifest.v1.json \
+  --approval qa/direct-transfer/unavailable-approval.v1.json \
+  --runs artifacts/direct-transfer/<suiteId>/runs \
+  --out artifacts/direct-transfer/<suiteId>/validation.json && \
+node scripts/aggregate-direct-transfer-runs.mjs \
+  --manifest qa/direct-transfer/run-manifest.v1.json \
+  --approval qa/direct-transfer/unavailable-approval.v1.json \
+  --validation artifacts/direct-transfer/<suiteId>/validation.json \
+  --runs artifacts/direct-transfer/<suiteId>/runs \
+  --out artifacts/direct-transfer/<suiteId>/result.json \
+  --markdown-out artifacts/direct-transfer/<suiteId>/result.md \
+  --strict
+```
+
+The operational runtime default is hold-1. Window 2 is config-gated and impossible before an explicit `ENABLE`; `HOLD` and `ROLLBACK` force window 1. A lifecycle error, failed validation, unavailable stratum without approval, or missing dispose evidence requires rollback to hold-1. Do not infer or publish performance gains from these records.
 ## NET-003: LTE/5G mobile browser transfer
 
 ### Goal

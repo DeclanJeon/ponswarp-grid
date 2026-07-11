@@ -120,7 +120,33 @@
 - Missing signals:
 - Overall result: `PASS` / `FAIL` / `RETRY REQUIRED`
 
-## 8. Rollback criteria
+## 8. Direct-transfer reliability gate
+
+The direct-transfer rollout uses local QA run schema v2. Runs are under `artifacts/direct-transfer/<suiteId>/runs/` and must include runtime config state, selected window, scenario/stratum, outcome, lifecycle errors, and clean `dispose` evidence. Dispose evidence is mandatory for every outcome; a missing or unclean dispose record is invalid.
+
+Validate and aggregate strictly, in order:
+
+```bash
+node scripts/validate-direct-transfer-runs.mjs \
+  --manifest qa/direct-transfer/run-manifest.v1.json \
+  --approval qa/direct-transfer/unavailable-approval.v1.json \
+  --runs artifacts/direct-transfer/<suiteId>/runs \
+  --out artifacts/direct-transfer/<suiteId>/validation.json && \
+node scripts/aggregate-direct-transfer-runs.mjs \
+  --manifest qa/direct-transfer/run-manifest.v1.json \
+  --approval qa/direct-transfer/unavailable-approval.v1.json \
+  --validation artifacts/direct-transfer/<suiteId>/validation.json \
+  --runs artifacts/direct-transfer/<suiteId>/runs \
+  --out artifacts/direct-transfer/<suiteId>/result.json \
+  --markdown-out artifacts/direct-transfer/<suiteId>/result.md \
+  --strict
+```
+
+A failed validation stops the sequence. An unavailable stratum requires `qa/direct-transfer/unavailable-approval.v1.json` with reason, impact, approver, expiry, and rollback condition. Approval excludes only that stratum; it is not a passing result, and `ENABLE` still requires two complete available external/relay strata.
+
+Runtime config v1 is exact hold-1 by default. `HOLD` and `ROLLBACK` force window 1. Window 2 is experimental and impossible before explicit `ENABLE`; no URL override may bypass this gate. Any lifecycle error, missing dispose evidence, failed run, or unavailable stratum without valid approval requires rollback to hold-1. Do not claim unrun benchmarks or gains.
+
+## 9. Rollback criteria
 
 Rollback or keep mesh disabled when any of these are true:
 
@@ -132,7 +158,7 @@ Rollback or keep mesh disabled when any of these are true:
 - Required metrics/logs are absent for a failing path.
 - Rollback/feature-flag-off drill is untested for the candidate build.
 
-## 9. Go / no-go record
+## 10. Go / no-go record
 
 | Field | Value |
 |---|---|
@@ -143,6 +169,7 @@ Rollback or keep mesh disabled when any of these are true:
 | Gate C Cleanup/retention | `PASS` / `FAIL` / `WAIVED` |
 | Gate D Restart/DR | `PASS` / `FAIL` / `WAIVED` |
 | Gate E Metrics/logs | `PASS` / `FAIL` / `WAIVED` |
+| Direct-transfer reliability | `PASS` / `HOLD` / `ROLLBACK` |
 | Multi-device QA report | link to `docs/11-multi-device-qa-report-template.md` instance |
 | Open blockers | |
 | Waivers and approver | |

@@ -30,6 +30,7 @@ const ownerPeerId = 'peer_owner' as PeerId;
 interface FakeTransportOptions {
   maxBinaryFrameBytes?: number;
   beforeDeliverBinary?: (frame: ArrayBuffer) => Promise<void> | void;
+  beforeSendMessage?: (message: TransportMessage) => Promise<void> | void;
 }
 
 class FakeTransport implements Transport {
@@ -52,6 +53,7 @@ class FakeTransport implements Transport {
 
   async send(peerId: PeerId, message: TransportMessage): Promise<void> {
     this.sentMessages.push(message);
+    await this.options.beforeSendMessage?.(message);
     this.peers.get(peerId)?.emitMessage(this.selfId, message);
   }
 
@@ -654,6 +656,8 @@ describe('core engine foundations', () => {
     const owner = new PonsWarpEngine(new MemoryStorageAdapter(), undefined, undefined, undefined, ownerTransport);
     const receiverStorage = new MemoryStorageAdapter();
     const receiver = new PonsWarpEngine(receiverStorage, undefined, undefined, undefined, receiverTransport);
+    const rejections: string[] = [];
+    receiver.on('pieceRejected', event => rejections.push(event.reason));
     const session = await owner.createSession({ sessionId, files: [new Blob(['abcd'])], pieceSize: 2 });
     const manifest = session.manifests[0];
     await receiver.joinSession(sessionId, [manifest]);
@@ -662,6 +666,7 @@ describe('core engine foundations', () => {
     expect(scheduled).toMatchObject({ peerId: ownerPeerId, piece: { index: 0 } });
     await flushAsync();
 
+    expect(rejections).toEqual([]);
     expect(receiver.getProgress(manifest.fileId).progress).toBe(50);
     expect(await receiverStorage.hasPiece(manifest.fileId, 0)).toBe(true);
     expect(receiverTransport.sentMessages.some(message => typeof message === 'object' && message !== null && 'type' in message && message.type === 'PIECE_REQUEST')).toBe(true);
@@ -681,9 +686,9 @@ describe('core engine foundations', () => {
     await ownerTransport.sendBinary(receiverPeerId, new TextEncoder().encode('xx').buffer);
     await flushAsync();
 
-    expect(receiverTransport.sentMessages.some(message => typeof message === 'object' && message !== null && 'type' in message && message.type === 'PIECE_REJECT')).toBe(true);
+    expect(receiverTransport.sentMessages.some(message => typeof message === 'object' && message !== null && 'type' in message && message.type === 'PIECE_REJECT')).toBe(false);
     const requestCountAfterReject = receiverTransport.sentMessages.filter(message => typeof message === 'object' && message !== null && 'type' in message && message.type === 'PIECE_REQUEST').length;
-    expect(requestCountAfterReject).toBeGreaterThan(requestCountBeforeReject);
+    expect(requestCountAfterReject).toBe(requestCountBeforeReject);
   });
 
   it('tracks availability generations, health penalties, leases, and receiver providers', async () => {
@@ -964,3 +969,294 @@ describe('core engine foundations', () => {
     expect(sentMessagesOfType<{ type: 'PIECE_REQUEST' }>(receiverTransport, 'PIECE_REQUEST').length).toBeGreaterThan(requestCountBeforeTimeout);
   });
 });
+describe('direct lifecycle contract', () => {
+  it('uses the validated five-minute default and rejects unsafe timeout options', () => {
+    expect(() => new PonsWarpEngine(new MemoryStorageAdapter(), undefined, undefined, undefined, undefined, 3, { directTimeoutMs: 0 })).toThrow(/directTimeoutMs/);
+  });
+
+  it('exposes idempotent async disposal and selector cancellation', async () => {
+    const engine = new PonsWarpEngine(new MemoryStorageAdapter());
+    expect(engine.cancelDirectRequests({ controllerId: 'missing' })).toBe(0);
+    await expect(engine.dispose()).resolves.toBeUndefined();
+    await expect(engine.dispose()).resolves.toBeUndefined();
+  });
+});
+  it('retries failed direct sends within the same window and exhausts exactly once', async () => {
+    const receiverPeerId = 'peer_direct_retry_receiver' as PeerId;
+    const providerPeerId = 'peer_direct_retry_provider' as PeerId;
+    const transport = new FakeTransport(receiverPeerId, {
+      beforeSendMessage(message) {
+        if (typeof message === 'object' && message !== null && 'type' in message && message.type === 'PIECE_REQUEST') {
+          throw new Error('simulated control send failure');
+        }
+      }
+    });
+    const manifest = await new ManifestGenerator().create(new Blob(['retry']), {
+      pieceSize: 5,
+      fileId
+    });
+    const engine = new PonsWarpEngine(
+      new MemoryStorageAdapter(),
+      undefined,
+      undefined,
+      undefined,
+      transport,
+      1
+    );
+    const terminals: Array<{ willRetry: boolean; retryCount: number }> = [];
+    const exhausted: number[] = [];
+    engine.on('requestTerminal', event => terminals.push({ willRetry: event.willRetry, retryCount: event.retryCount }));
+    engine.on('requestWindowExhausted', () => exhausted.push(1));
+    await engine.joinSession(sessionId, [manifest]);
+
+    await expect(engine.requestPieceWindow(providerPeerId, fileId, {
+      maxInFlight: 1,
+      controllerId: 'retry-test',
+      windowKey: 'retry-window'
+    })).resolves.toEqual([]);
+    await flushAsync();
+    await engine.flushDirectLifecycle();
+
+    expect(sentMessagesOfType<{ type: 'PIECE_REQUEST' }>(transport, 'PIECE_REQUEST')).toHaveLength(2);
+    expect(terminals).toEqual([
+      { willRetry: true, retryCount: 0 },
+      { willRetry: false, retryCount: 1 }
+    ]);
+    expect(exhausted).toHaveLength(1);
+    expect(engine.getOutstandingRequestCount(fileId, providerPeerId)).toBe(0);
+    await engine.dispose();
+  });
+  it('rejects immutable per-window cap changes and serializes lifecycle cleanup', async () => {
+    const engine = new PonsWarpEngine(new MemoryStorageAdapter());
+    await expect(engine.requestPieceWindow(ownerPeerId, fileId, { maxInFlight: 2, windowKey: 'window-a' })).rejects.toMatchObject({ code: 'piece_map:not_found' });
+    await expect(engine.requestPieceWindow(ownerPeerId, fileId, { maxInFlight: 3, windowKey: 'window-a' })).rejects.toMatchObject({ code: 'direct:window_cap_mismatch' });
+    await expect(engine.requestPieceWindow('peer_other' as PeerId, fileId, { maxInFlight: 2, windowKey: 'window-a' })).rejects.toMatchObject({ code: 'direct:window_identity_mismatch' });
+    await expect(engine.requestPieceWindow(ownerPeerId, fileId, { maxInFlight: 2, controllerId: 'controller-other', windowKey: 'window-a' })).rejects.toMatchObject({ code: 'direct:window_identity_mismatch' });
+    await engine.flushDirectLifecycle();
+    await engine.dispose();
+  });
+
+  it('serializes top-up behind a failed send retry without exceeding the window cap', async () => {
+    const receiverPeerId = 'peer_cap_receiver' as PeerId;
+    const providerPeerId = 'peer_cap_provider' as PeerId;
+    let releaseFirst!: () => void;
+    let firstStarted!: () => void;
+    const firstStartedPromise = new Promise<void>(resolve => { firstStarted = resolve; });
+    const firstReleasePromise = new Promise<void>(resolve => { releaseFirst = resolve; });
+    let activeSends = 0;
+    let maxActiveSends = 0;
+    let sendCount = 0;
+    const transport = new FakeTransport(receiverPeerId, {
+      async beforeSendMessage(message) {
+        if (typeof message !== 'object' || message === null || !('type' in message) || message.type !== 'PIECE_REQUEST') return;
+        activeSends += 1;
+        maxActiveSends = Math.max(maxActiveSends, activeSends);
+        sendCount += 1;
+        if (sendCount === 1) {
+          firstStarted();
+          await firstReleasePromise;
+        }
+        activeSends -= 1;
+        throw new Error('simulated send failure');
+      }
+    });
+    const manifest = await new ManifestGenerator().create(new Blob(['cap']), { pieceSize: 3, fileId });
+    const engine = new PonsWarpEngine(new MemoryStorageAdapter(), undefined, undefined, undefined, transport, 1);
+    await engine.joinSession(sessionId, [manifest]);
+
+    const first = engine.requestPieceWindow(providerPeerId, fileId, { maxInFlight: 1, controllerId: 'cap-test', windowKey: 'cap-window' });
+    await firstStartedPromise;
+    const topUp = engine.requestPieceWindow(providerPeerId, fileId, { maxInFlight: 1, controllerId: 'cap-test', windowKey: 'cap-window' });
+    releaseFirst();
+    await Promise.all([first, topUp]);
+    await flushAsync();
+    await engine.flushDirectLifecycle();
+
+    expect(maxActiveSends).toBe(1);
+    expect(sendCount).toBe(2);
+    expect(engine.getOutstandingRequestCount(fileId, providerPeerId)).toBe(0);
+    await engine.dispose();
+  });
+
+  it('suppresses a queued timeout retry when cancellation wins first', async () => {
+    const receiverPeerId = 'peer_cancel_receiver' as PeerId;
+    const providerPeerId = 'peer_cancel_provider' as PeerId;
+    const timerCallbacks: Array<() => void> = [];
+    const transport = new FakeTransport(receiverPeerId);
+    const manifest = await new ManifestGenerator().create(new Blob(['cancel']), { pieceSize: 6, fileId });
+    const engine = new PonsWarpEngine(
+      new MemoryStorageAdapter(),
+      undefined,
+      undefined,
+      undefined,
+      transport,
+      1,
+      {
+        directTimeoutMs: 10,
+        setTimeout(handler) {
+          timerCallbacks.push(handler);
+          return 1 as unknown as ReturnType<typeof setTimeout>;
+        },
+        clearTimeout() {}
+      }
+    );
+    await engine.joinSession(sessionId, [manifest]);
+    await engine.requestPieceWindow(providerPeerId, fileId, { maxInFlight: 1, controllerId: 'cancel-test', windowKey: 'cancel-window' });
+
+    timerCallbacks[0]?.();
+    engine.cancelDirectRequests({ windowKey: 'cancel-window' });
+    await engine.flushDirectLifecycle();
+
+    expect(sentMessagesOfType<{ type: 'PIECE_REQUEST' }>(transport, 'PIECE_REQUEST')).toHaveLength(1);
+    expect(engine.getOutstandingRequestCount(fileId, providerPeerId)).toBe(0);
+    expect(engine.getDirectLifecycleSnapshot()).toEqual({ outstandingDirect: 0, activeTimers: 0 });
+    await engine.dispose();
+  });
+
+  it('ignores wrong-peer frames without writing or completing the requested piece', async () => {
+    const receiverPeerId = 'peer_ingress_receiver' as PeerId;
+    const providerPeerId = 'peer_ingress_provider' as PeerId;
+    const intruderPeerId = 'peer_ingress_intruder' as PeerId;
+    const receiverTransport = new FakeTransport(receiverPeerId);
+    const intruderTransport = new FakeTransport(intruderPeerId);
+    intruderTransport.link(receiverPeerId, receiverTransport);
+    const storage = new MemoryStorageAdapter();
+    const manifest = await new ManifestGenerator().create(new Blob(['safe']), { pieceSize: 4, fileId });
+    const engine = new PonsWarpEngine(storage, undefined, undefined, undefined, receiverTransport);
+    await engine.joinSession(sessionId, [manifest]);
+    await engine.requestPieceWindow(providerPeerId, fileId, { maxInFlight: 1, controllerId: 'ingress-test', windowKey: 'ingress-window' });
+    const request = sentMessagesOfType<{ type: 'PIECE_REQUEST'; requestId: string }>(receiverTransport, 'PIECE_REQUEST')[0];
+
+    await intruderTransport.send(receiverPeerId, {
+      type: 'PIECE_CHUNK_HEADER',
+      fileId,
+      pieceIndex: 0,
+      chunkIndex: 0,
+      totalChunks: 1,
+      requestId: request.requestId,
+      payloadSize: 4
+    });
+    await intruderTransport.sendBinary(receiverPeerId, new TextEncoder().encode('evil').buffer);
+    await flushAsync();
+
+    expect(await storage.hasPiece(fileId, 0)).toBe(false);
+    expect(engine.getProgress(fileId).verifiedPieces).toBe(0);
+    engine.cancelDirectRequests({ windowKey: 'ingress-window' });
+    await engine.dispose();
+  });
+
+  it('emits a fully keyed lifecycle error when verified persistence fails', async () => {
+    const receiverPeerId = 'peer_persist_receiver' as PeerId;
+    const providerPeerId = 'peer_persist_provider' as PeerId;
+    const transport = new FakeTransport(receiverPeerId);
+    const storage = new MemoryStorageAdapter();
+    const payload = new TextEncoder().encode('persist');
+    const manifest = await new ManifestGenerator().create(new Blob([payload]), { pieceSize: payload.byteLength, fileId });
+    const engine = new PonsWarpEngine(storage, undefined, undefined, undefined, transport);
+    const lifecycleErrors: Array<Record<string, unknown>> = [];
+    engine.on('directLifecycleError', event => lifecycleErrors.push(event));
+    await engine.joinSession(sessionId, [manifest]);
+    await engine.requestPieceWindow(providerPeerId, fileId, { maxInFlight: 1, controllerId: 'persist-test', windowKey: 'persist-window' });
+    const request = sentMessagesOfType<{ type: 'PIECE_REQUEST'; requestId: string }>(transport, 'PIECE_REQUEST')[0];
+    vi.spyOn(storage, 'saveState').mockRejectedValueOnce(new Error('simulated persistence failure'));
+
+    const result = await engine.receivePiece({ fileId, pieceIndex: 0, requestId: request.requestId, data: payload.buffer });
+
+    expect(result).toMatchObject({ type: 'PIECE_REJECT', reason: 'persist_failed' });
+    expect(lifecycleErrors).toEqual([
+      expect.objectContaining({
+        phase: 'persist',
+        fileId,
+        pieceIndex: 0,
+        peerId: providerPeerId,
+        requestId: request.requestId,
+        controllerId: 'persist-test',
+        windowKey: 'persist-window',
+        generation: 0
+      })
+    ]);
+    expect(typeof lifecycleErrors[0]?.at).toBe('number');
+    expect(engine.getOutstandingRequestCount(fileId, providerPeerId)).toBe(0);
+    await expect(engine.flushDirectLifecycle()).rejects.toThrow('simulated persistence failure');
+    await engine.dispose();
+  });
+
+  it('reports storage failures with keyed storage phase and flush rejection', async () => {
+    const receiverPeerId = 'peer_storage_receiver' as PeerId;
+    const providerPeerId = 'peer_storage_provider' as PeerId;
+    const transport = new FakeTransport(receiverPeerId);
+    const storage = new MemoryStorageAdapter();
+    const payload = new TextEncoder().encode('storage');
+    const manifest = await new ManifestGenerator().create(new Blob([payload]), { pieceSize: payload.byteLength, fileId });
+    const engine = new PonsWarpEngine(storage, undefined, undefined, undefined, transport);
+    const lifecycleErrors: Array<Record<string, unknown>> = [];
+    engine.on('directLifecycleError', event => lifecycleErrors.push(event));
+    await engine.joinSession(sessionId, [manifest]);
+    await engine.requestPieceWindow(providerPeerId, fileId, {
+      maxInFlight: 1,
+      controllerId: 'storage-test',
+      windowKey: 'storage-window'
+    });
+    const request = sentMessagesOfType<{ type: 'PIECE_REQUEST'; requestId: string }>(transport, 'PIECE_REQUEST')[0];
+    vi.spyOn(storage, 'writePiece').mockRejectedValueOnce(new Error('simulated storage failure'));
+
+    const result = await engine.receivePiece({
+      fileId,
+      pieceIndex: 0,
+      requestId: request.requestId,
+      data: payload.buffer
+    });
+
+    expect(result).toMatchObject({ type: 'PIECE_REJECT', reason: 'storage_failed' });
+    expect(lifecycleErrors).toEqual([
+      expect.objectContaining({
+        phase: 'storage',
+        fileId,
+        pieceIndex: 0,
+        peerId: providerPeerId,
+        requestId: request.requestId,
+        controllerId: 'storage-test',
+        windowKey: 'storage-window',
+        generation: 0
+      })
+    ]);
+    await expect(engine.flushDirectLifecycle()).rejects.toThrow('simulated storage failure');
+    await engine.dispose();
+  });
+
+  it('bounds retired direct windows and cancellation tombstones', async () => {
+    const receiverPeerId = 'peer_metadata_receiver' as PeerId;
+    const providerPeerId = 'peer_metadata_provider' as PeerId;
+    const transport = new FakeTransport(receiverPeerId);
+    const storage = new MemoryStorageAdapter();
+    const payload = new Uint8Array([1, 2, 3, 4, 5, 6, 7]);
+    const manifest = await new ManifestGenerator().create(new Blob([payload]), { pieceSize: 1, fileId });
+    const engine = new PonsWarpEngine(storage, undefined, undefined, undefined, transport);
+    (engine as unknown as { maxDirectMetadataEntries: number }).maxDirectMetadataEntries = 4;
+    const terminalGenerations: number[] = [];
+    engine.on('requestTerminal', event => terminalGenerations.push(event.generation));
+    await engine.joinSession(sessionId, [manifest]);
+
+    for (let index = 0; index < 6; index += 1) {
+      const windowKey = `bounded-window-${index}`;
+      await engine.requestPieceWindow(providerPeerId, fileId, { maxInFlight: 1, windowKey });
+      engine.cancelDirectRequests({ windowKey });
+    }
+    const oldRequest = sentMessagesOfType<{ type: 'PIECE_REQUEST'; requestId: string; pieceIndex: number }>(transport, 'PIECE_REQUEST')[0];
+    const replay = await engine.receivePiece({
+      fileId,
+      pieceIndex: oldRequest.pieceIndex,
+      requestId: oldRequest.requestId,
+      data: payload.slice(oldRequest.pieceIndex, oldRequest.pieceIndex + 1).buffer
+    });
+    expect(replay).toMatchObject({ type: 'PIECE_REJECT', reason: 'unauthorized' });
+
+    await engine.requestPieceWindow(providerPeerId, fileId, { maxInFlight: 1, windowKey: 'bounded-window-0' });
+    engine.cancelDirectRequests({ windowKey: 'bounded-window-0' });
+    await engine.flushDirectLifecycle();
+
+    expect(engine.getDirectLifecycleSnapshot()).toEqual({ outstandingDirect: 0, activeTimers: 0 });
+    expect(engine.getDirectLifecycleMetadataSnapshot()).toEqual({ trackedWindows: 4, tombstones: 4 });
+    expect(terminalGenerations.at(-1)).toBeGreaterThan(terminalGenerations[0]);
+    await engine.dispose();
+  });

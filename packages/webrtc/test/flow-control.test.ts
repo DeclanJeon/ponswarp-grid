@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { DataChannelWrapper, PeerConnectionWrapper, WebRTCTransport, clampDataChannelChunkSize, shouldRequestMoreChunks, type DataChannelLike, type PeerConnectionLike } from '../src/index';
+import { DataChannelWrapper, PeerConnectionWrapper, SignalingBridge, WebRTCTransport, clampDataChannelChunkSize, shouldRequestMoreChunks, type DataChannelLike, type PeerConnectionLike, type SdpCapablePeerConnection, type SignalingRelay } from '../src/index';
 import type { PeerId } from '@ponswarp/core';
 
 class FakeDataChannel extends EventTarget implements DataChannelLike {
@@ -9,6 +9,7 @@ class FakeDataChannel extends EventTarget implements DataChannelLike {
   binaryType: BinaryType = 'blob';
   readonly sent: Array<string | ArrayBuffer | ArrayBufferView | Blob> = [];
   incrementBufferedOnSend = 0;
+  closeCalls = 0;
 
   send(data: string | ArrayBuffer | ArrayBufferView | Blob): void {
     this.sent.push(data);
@@ -16,6 +17,7 @@ class FakeDataChannel extends EventTarget implements DataChannelLike {
   }
 
   close(): void {
+    this.closeCalls += 1;
     this.readyState = 'closed';
     this.dispatchEvent(new Event('close'));
   }
@@ -51,6 +53,14 @@ class FakePeerConnection extends EventTarget implements PeerConnectionLike {
     this.dispatchEvent(Object.assign(new Event('datachannel'), { channel }));
     return channel;
   }
+}
+
+class RejectingSdpPeerConnection extends FakePeerConnection implements SdpCapablePeerConnection {
+  createOffer(): Promise<unknown> { return Promise.reject(new Error('offer failed')); }
+  createAnswer(): Promise<unknown> { return Promise.reject(new Error('answer failed')); }
+  setLocalDescription(): Promise<void> { return Promise.resolve(); }
+  setRemoteDescription(): Promise<void> { return Promise.reject(new Error('remote description failed')); }
+  addIceCandidate(): Promise<void> { return Promise.reject(new Error('candidate failed')); }
 }
 
 describe('PonsWarp backpressure extraction', () => {
@@ -100,6 +110,60 @@ describe('PonsWarp backpressure extraction', () => {
     await send;
     expect(channel.sent).toEqual(['queued']);
   });
+  it('emits one high and one low watermark event for a blocked send episode', async () => {
+    const channel = new FakeDataChannel();
+    channel.bufferedAmount = 10;
+    const wrapper = new DataChannelWrapper('peer_1' as PeerId, channel, {
+      chunkSize: 1,
+      highWaterMark: 10,
+      lowWaterMark: 4,
+      batchSize: 1,
+      prefetchBufferSize: 0
+    });
+    const events = [];
+    wrapper.on('watermark', event => events.push(event));
+
+    const first = wrapper.sendText('first');
+    const second = wrapper.sendText('second');
+    await Promise.resolve();
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      peerId: 'peer_1',
+      phase: 'high',
+      bufferedAmount: 10,
+      highWaterMark: 10,
+      lowWaterMark: 4
+    });
+    expect(events[0].timestamp).toEqual(expect.any(Number));
+
+    channel.drainTo(4);
+    await Promise.all([first, second]);
+    expect(events.map(event => event.phase)).toEqual(['high', 'low']);
+    expect(events[1]).toMatchObject({
+      peerId: 'peer_1',
+      phase: 'low',
+      bufferedAmount: 4,
+      highWaterMark: 10,
+      lowWaterMark: 4
+    });
+  });
+
+  it('does not emit watermark events for sends that remain below high watermark', async () => {
+    const channel = new FakeDataChannel();
+    const wrapper = new DataChannelWrapper('peer_1' as PeerId, channel, {
+      chunkSize: 1,
+      highWaterMark: 10,
+      lowWaterMark: 4,
+      batchSize: 1,
+      prefetchBufferSize: 0
+    });
+    const events = [];
+    wrapper.on('watermark', event => events.push(event));
+
+    await wrapper.sendText('direct');
+    channel.drainTo(0);
+    expect(events).toEqual([]);
+  });
 
   it('rejects queued sends when the channel closes before low watermark', async () => {
     const channel = new FakeDataChannel();
@@ -134,6 +198,51 @@ describe('PonsWarp backpressure extraction', () => {
     expect(channel).toBeInstanceOf(DataChannelWrapper);
     expect(channels).toHaveLength(1);
     expect(states).toEqual(['connected']);
+  });
+  it('closes and disposes the superseded channel before publishing its replacement', () => {
+    const peer = new FakePeerConnection();
+    const wrapper = new PeerConnectionWrapper('peer_1' as PeerId, peer);
+    const first = new FakeDataChannel();
+    const second = new FakeDataChannel();
+
+    wrapper.attachChannel(first);
+    const replacement = wrapper.attachChannel(second);
+
+    expect(first.closeCalls).toBe(1);
+    expect(first.readyState).toBe('closed');
+    expect(wrapper.getChannel()).toBe(replacement);
+    expect(replacement.channel).toBe(second);
+    expect(second.closeCalls).toBe(0);
+  });
+
+  it('reports signaling failures through the transport error callback', async () => {
+    let receive: ((envelope: { type: string; fromPeerId: PeerId; payload: Record<string, unknown> }) => void) | undefined;
+    const signaling: SignalingRelay = {
+      sendRelay: () => {},
+      onMessage: handler => {
+        receive = handler;
+        return () => {};
+      }
+    };
+    const connection = new RejectingSdpPeerConnection();
+    const transport = new WebRTCTransport();
+    transport.ensurePeer('peer_1' as PeerId, connection);
+    const errors: Error[] = [];
+    transport.onError(event => errors.push(event.error));
+    const bridge = new SignalingBridge({
+      transport,
+      signaling,
+      sessionId: 'session',
+      selfPeerId: 'self' as PeerId,
+      createPeerConnection: () => connection
+    });
+    bridge.start();
+
+    receive?.({ type: 'ICE_CANDIDATE', fromPeerId: 'peer_1' as PeerId, payload: { candidate: {} } });
+    receive?.({ type: 'WEBRTC_ANSWER', fromPeerId: 'peer_1' as PeerId, payload: { sdp: {} } });
+    await Promise.resolve();
+
+    expect(errors.map(error => error.message)).toEqual(['candidate failed', 'remote description failed']);
   });
 
   it('routes JSON and binary frames through WebRTCTransport', async () => {
@@ -179,5 +288,55 @@ describe('PonsWarp backpressure extraction', () => {
     channel.drainTo(4);
     await second;
     expect(channel.sent).toEqual(['first', 'second']);
+  });
+  it('preserves ordering across a large concurrent send burst', async () => {
+    const channel = new FakeDataChannel();
+    const wrapper = new DataChannelWrapper('peer_1' as PeerId, channel, {
+      chunkSize: 1,
+      highWaterMark: 100,
+      lowWaterMark: 40,
+      batchSize: 1,
+      prefetchBufferSize: 0
+    });
+
+    const sends = Array.from({ length: 32 }, (_, index) => wrapper.sendText(`chunk-${index}`));
+    await Promise.all(sends);
+
+    expect(channel.sent).toEqual(Array.from({ length: 32 }, (_, index) => `chunk-${index}`));
+  });
+
+  it('bounds queued payload bytes while backpressure is active', async () => {
+    const channel = new FakeDataChannel();
+    channel.bufferedAmount = 1;
+    const wrapper = new DataChannelWrapper('peer_1' as PeerId, channel, {
+      chunkSize: 64 * 1024,
+      highWaterMark: 1,
+      lowWaterMark: 0,
+      batchSize: 1,
+      prefetchBufferSize: 0
+    });
+    const queued = Array.from({ length: 4 }, () => wrapper.sendBinary(new Uint8Array(64 * 1024)).catch(error => error));
+
+    await expect(wrapper.sendBinary(new Uint8Array(64 * 1024))).rejects.toThrow(/send queue.*exceeded/);
+    channel.close();
+    await Promise.all(queued);
+  });
+  it('rejects a blocked send when the channel errors', async () => {
+    const channel = new FakeDataChannel();
+    channel.bufferedAmount = 10;
+    const wrapper = new DataChannelWrapper('peer_1' as PeerId, channel, {
+      chunkSize: 1,
+      highWaterMark: 10,
+      lowWaterMark: 4,
+      batchSize: 1,
+      prefetchBufferSize: 0
+    });
+
+    const send = wrapper.sendText('errored');
+    await Promise.resolve();
+    channel.dispatchEvent(new Event('error'));
+
+    await expect(send).rejects.toThrow(/errored/);
+    expect(channel.sent).toEqual([]);
   });
 });
