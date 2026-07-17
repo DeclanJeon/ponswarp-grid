@@ -491,17 +491,84 @@ function App() {
     });
   }
 
-  function handleFileSelection(file: (Blob & { name?: string; type?: string }) | null): void {
-    setSelectedFile(file);
-    setWebShare(file ? { status: 'file-selected', fileName: file.name ?? 'selected-file', sizeBytes: file.size } : { status: 'idle' });
+  function normalizeShareFiles(files: Array<Blob & { name?: string; type?: string }>): Array<Blob & { name?: string; type?: string }> {
+    return files.filter(file => file && file.size >= 0);
   }
 
+  function summarizeShareFiles(files: Array<Blob & { name?: string; type?: string }>): { fileName: string; sizeBytes: number } {
+    const sizeBytes = files.reduce((sum, file) => sum + file.size, 0);
+    if (files.length === 1) return { fileName: files[0].name ?? 'selected-file', sizeBytes };
+    return { fileName: `${files.length} items`, sizeBytes };
+  }
 
-  async function createWebShareLink(): Promise<void> {
+  async function filesFromFileList(list: FileList | null | undefined): Promise<Array<Blob & { name?: string; type?: string }>> {
+    if (!list?.length) return [];
+    return Array.from(list).map(file => file as Blob & { name?: string; type?: string });
+  }
+
+  async function filesFromDataTransfer(dataTransfer: DataTransfer): Promise<Array<Blob & { name?: string; type?: string }>> {
+    const items = dataTransfer.items;
+    if (!items?.length) return filesFromFileList(dataTransfer.files);
+
+    type Entry = { isFile: boolean; isDirectory: boolean; name: string; file: (cb: (file: File) => void, err?: (e: Error) => void) => void; createReader: () => { readEntries: (cb: (entries: Entry[]) => void, err?: (e: Error) => void) => void } };
+    const entries: Entry[] = [];
+    for (let i = 0; i < items.length; i += 1) {
+      const item = items[i];
+      const raw = (item as DataTransferItem & { webkitGetAsEntry?: () => unknown }).webkitGetAsEntry?.()
+        ?? (item as DataTransferItem & { getAsEntry?: () => unknown }).getAsEntry?.();
+      if (raw) entries.push(raw as Entry);
+    }
+    if (!entries.length) return filesFromFileList(dataTransfer.files);
+
+    const out: Array<Blob & { name?: string; type?: string }> = [];
+    const walk = async (entry: Entry, prefix: string): Promise<void> => {
+      if (entry.isFile) {
+        const file = await new Promise<File>((resolve, reject) => entry.file(resolve, reject));
+        const relative = prefix ? `${prefix}/${file.name}` : file.name;
+        const named = file as Blob & { name?: string; type?: string };
+        Object.defineProperty(named, 'name', { value: relative, configurable: true });
+        out.push(named);
+        return;
+      }
+      if (!entry.isDirectory) return;
+      const reader = entry.createReader();
+      const readBatch = (): Promise<Entry[]> => new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+      const nextPrefix = prefix ? `${prefix}/${entry.name}` : entry.name;
+      for (;;) {
+        const batch = await readBatch();
+        if (!batch.length) break;
+        for (const child of batch) await walk(child, nextPrefix);
+      }
+    };
+    for (const entry of entries) await walk(entry, '');
+    return out.length ? out : filesFromFileList(dataTransfer.files);
+  }
+
+  function handleFileSelection(file: (Blob & { name?: string; type?: string }) | null): void {
+    void handleShareFiles(file ? [file] : []);
+  }
+
+  function handleShareFiles(filesInput: Array<Blob & { name?: string; type?: string }>): void {
+    const files = normalizeShareFiles(filesInput);
+    if (!files.length) {
+      setSelectedFile(null);
+      setWebShare({ status: 'idle' });
+      return;
+    }
+    setSelectedFile(files[0]);
+    const summary = summarizeShareFiles(files);
+    setWebShare({ status: 'file-selected', fileName: summary.fileName, sizeBytes: summary.sizeBytes });
+    // Drop / pick / folder → open signaling room immediately (no extra CTA).
+    void createWebShareLink(files);
+  }
+
+  async function createWebShareLink(filesOverride?: Array<Blob & { name?: string; type?: string }>): Promise<void> {
     const generation = ++ownerRuntimeGeneration.current;
-    const file = selectedFile ?? namedBlob(DEFAULT_SAMPLE_PAYLOAD, DEFAULT_SAMPLE_FILE_NAME);
+    const files = normalizeShareFiles(filesOverride?.length ? filesOverride : selectedFile ? [selectedFile] : [namedBlob(DEFAULT_SAMPLE_PAYLOAD, DEFAULT_SAMPLE_FILE_NAME)]);
+    const primary = files[0];
+    const summary = summarizeShareFiles(files);
     setWebShare({ status: 'creating' });
-    setState({ status: 'running', logs: ['Creating a phone-ready WebRTC share link.'] });
+    setState({ status: 'running', logs: [`Opening transfer room for ${summary.fileName} (${files.length} file(s))…`] });
     let transport: WebRTCTransport | undefined;
     let engine: PonsWarpEngine | undefined;
     let runtime: OwnerRuntime | undefined;
@@ -515,7 +582,7 @@ function App() {
       transport = new WebRTCTransport();
       const storage = new MemoryStorageAdapter();
       engine = new PonsWarpEngine(storage, undefined, undefined, undefined, transport);
-      const session = await engine.createSession({ sessionId, files: [file], pieceSize: calculatePieceSize(file) });
+      const session = await engine.createSession({ sessionId, files, pieceSize: calculatePieceSize(primary) });
       if (generation !== ownerRuntimeGeneration.current) {
         await engine.dispose().catch(() => undefined);
         await transport.close().catch(() => undefined);
@@ -544,20 +611,20 @@ function App() {
       const link = coordinatorShare?.link ?? currentGetUrl(code, sessionId);
       const qrDataUrl = await createQrDataUrl(link);
       if (!isCurrentRuntime(runtime)) { await disposeOwnerRuntime(runtime); return; }
-      webShareFile.current = file;
+      webShareFile.current = primary;
       setWebShare({
         status: 'serving',
         code,
         sessionId,
         link,
         qrDataUrl,
-        fileName: file.name ?? DEFAULT_SAMPLE_FILE_NAME,
-        sizeBytes: file.size,
+        fileName: summary.fileName,
+        sizeBytes: summary.sizeBytes,
         expiresAt: Date.now() + SHARE_EXPIRY_MS,
         downloads: 0,
         devicesOnline: 1
       });
-      setState(current => ({ ...current, status: 'ready', sessionId, shareUrl: link, shareQrDataUrl: qrDataUrl, manifest, logs: [...current.logs, `Phone-ready sender online for ${manifest.name}.`, `Scan or open receiver link: ${link}`] }));
+      setState(current => ({ ...current, status: 'ready', sessionId, shareUrl: link, shareQrDataUrl: qrDataUrl, manifest, logs: [...current.logs, `Room online for ${summary.fileName} (${files.length} file(s), primary ${manifest.name}).`, `Scan or open receiver link: ${link}`] }));
       setWebGet({ status: 'idle', input: '' });
     } catch (error) {
       await (runtime ? disposeOwnerRuntime(runtime) : Promise.all([engine?.dispose().catch(() => undefined), transport?.close().catch(() => undefined)]));
@@ -1571,22 +1638,65 @@ function App() {
               <span className="round-icon" aria-hidden="true"><Icon name="upload" size={34} strokeWidth={2} /></span>
               <div>
                 <h2>Open a transfer room</h2>
-                <p>Pick a file to create a socket room, code, and QR.</p>
+                <p>Drop files or a folder — the room, code, and QR appear immediately.</p>
               </div>
             </div>
-            <label className="drop-zone" onDragOver={event => event.preventDefault()} onDrop={event => { event.preventDefault(); handleFileSelection(event.dataTransfer.files?.[0] ?? null); }}>
-              <input aria-label="Choose file to share" type="file" style={{ display: 'none' }} onChange={event => handleFileSelection(event.currentTarget.files?.[0] ?? null)} />
+            <label
+              className="drop-zone"
+              onDragOver={event => event.preventDefault()}
+              onDrop={event => {
+                event.preventDefault();
+                void filesFromDataTransfer(event.dataTransfer).then(files => handleShareFiles(files));
+              }}
+            >
+              <input
+                aria-label="Choose files to share"
+                type="file"
+                multiple
+                style={{ display: 'none' }}
+                onChange={event => {
+                  void filesFromFileList(event.currentTarget.files).then(files => {
+                    handleShareFiles(files);
+                    event.currentTarget.value = '';
+                  });
+                }}
+              />
               <span>
                 <span className="upload-glyph" aria-hidden="true"><Icon name="upload" size={40} strokeWidth={1.7} /></span>
-                <span className="drop-primary">{selectedFile ? `${selectedFile.name ?? 'selected file'} · ${formatBytes(selectedFile.size)}` : 'Drag & drop your file here'}</span>
+                <span className="drop-primary">
+                  {webShare.status === 'creating'
+                    ? 'Opening room…'
+                    : webShare.status === 'serving'
+                      ? `${webShare.fileName} · ${formatBytes(webShare.sizeBytes)}`
+                      : webShare.status === 'file-selected'
+                        ? `${webShare.fileName} · ${formatBytes(webShare.sizeBytes)}`
+                        : 'Drop files or a folder — room opens instantly'}
+                </span>
                 <span className="drop-secondary" style={{ display: 'block', margin: '2px 0 4px' }}>or</span>
-                <span className="primary-button" role="button"><Icon name="file" size={20} strokeWidth={2} />Choose file</span>
+                <span className="primary-button" role="button"><Icon name="file" size={20} strokeWidth={2} />Choose files</span>
               </span>
             </label>
-            {(selectedFile || webShare.status === 'creating') && (
-              <button onClick={() => void createWebShareLink()} disabled={webShare.status === 'creating'} className="primary-button" style={{ width: '100%', marginTop: 18 }}>
-                {webShare.status === 'creating' ? 'Opening room…' : 'Create room & code'}
-              </button>
+            <label className="primary-button" style={{ width: '100%', marginTop: 12, display: 'inline-flex', justifyContent: 'center', cursor: webShare.status === 'creating' ? 'wait' : 'pointer' }}>
+              <input
+                aria-label="Choose folder to share"
+                type="file"
+                // @ts-expect-error webkitdirectory is supported in Chromium browsers
+                webkitdirectory=""
+                directory=""
+                multiple
+                style={{ display: 'none' }}
+                disabled={webShare.status === 'creating'}
+                onChange={event => {
+                  void filesFromFileList(event.currentTarget.files).then(files => {
+                    handleShareFiles(files);
+                    event.currentTarget.value = '';
+                  });
+                }}
+              />
+              {webShare.status === 'creating' ? 'Opening room…' : 'Choose folder'}
+            </label>
+            {webShare.status === 'creating' && (
+              <p className="live-hint" style={{ marginTop: 12 }}>Creating socket room and share code…</p>
             )}
             {webShare.status === 'serving' && (
               <div data-testid="share-result" className="share-result">
