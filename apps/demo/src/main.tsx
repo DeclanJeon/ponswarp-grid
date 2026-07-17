@@ -230,26 +230,69 @@ async function registerCoordinatorBrowserShare(input: { code: string; sessionId:
   }
 }
 
+function pickShareSessionId(payload: Record<string, unknown>): SessionId | undefined {
+  const caps = (payload.capabilities && typeof payload.capabilities === 'object')
+    ? payload.capabilities as Record<string, unknown>
+    : {};
+  const data = (payload.data && typeof payload.data === 'object')
+    ? payload.data as Record<string, unknown>
+    : {};
+  const share = (payload.share && typeof payload.share === 'object')
+    ? payload.share as Record<string, unknown>
+    : {};
+  const nested = [payload, data, share, caps];
+  for (const row of nested) {
+    for (const key of ['sessionId', 'signalingSessionId', 'signaling_session_id'] as const) {
+      const value = row[key];
+      if (typeof value === 'string' && value.length > 0) return value as SessionId;
+    }
+    for (const key of ['joinUrl', 'join_url'] as const) {
+      const value = row[key];
+      if (typeof value === 'string') {
+        const sessionId = parseEmbeddedSessionId(value);
+        if (sessionId) return sessionId;
+      }
+    }
+  }
+  return undefined;
+}
+
+function pickShareMeta(payload: Record<string, unknown>): { fileName?: string; sizeBytes?: number; devicesOnline?: number } {
+  const data = (payload.data && typeof payload.data === 'object') ? payload.data as Record<string, unknown> : {};
+  const share = (payload.share && typeof payload.share === 'object') ? payload.share as Record<string, unknown> : {};
+  const file = (payload.file && typeof payload.file === 'object') ? payload.file as Record<string, unknown> : {};
+  const rows = [payload, data, share, file];
+  let fileName: string | undefined;
+  let sizeBytes: number | undefined;
+  let devicesOnline: number | undefined;
+  for (const row of rows) {
+    for (const key of ['name', 'fileName', 'file_name'] as const) {
+      const value = row[key];
+      if (typeof value === 'string' && value && !fileName) fileName = value;
+    }
+    for (const key of ['sizeBytes', 'size', 'fileSize'] as const) {
+      const value = row[key];
+      if (typeof value === 'number' && Number.isFinite(value) && sizeBytes === undefined) sizeBytes = value;
+    }
+    for (const key of ['devicesOnline', 'devices_online', 'onlineDevices'] as const) {
+      const value = row[key];
+      if (typeof value === 'number' && Number.isFinite(value) && devicesOnline === undefined) devicesOnline = value;
+    }
+  }
+  return { fileName, sizeBytes, devicesOnline };
+}
+
 async function resolveCoordinatorBrowserShare(code: string): Promise<BrowserShareResolution | null> {
   try {
     const response = await fetch(`${location.origin}/api/grid/v1/shares/${encodeURIComponent(code)}`, { cache: 'no-store' });
     if (!response.ok) return null;
-    const payload = await response.json() as {
-      name?: string;
-      fileName?: string;
-      sizeBytes?: number;
-      devicesOnline?: number;
-      sessionId?: string;
-      signalingSessionId?: string;
-      joinUrl?: string;
-      capabilities?: { signalingSessionId?: string; joinUrl?: string };
-    };
-    const sessionId = payload.sessionId ?? payload.signalingSessionId ?? payload.capabilities?.signalingSessionId ?? parseEmbeddedSessionId(payload.joinUrl ?? payload.capabilities?.joinUrl ?? '');
+    const payload = await response.json() as Record<string, unknown>;
+    const meta = pickShareMeta(payload);
     return {
-      sessionId: sessionId as SessionId | undefined,
-      fileName: payload.name ?? payload.fileName,
-      sizeBytes: payload.sizeBytes,
-      devicesOnline: payload.devicesOnline
+      sessionId: pickShareSessionId(payload),
+      fileName: meta.fileName,
+      sizeBytes: meta.sizeBytes,
+      devicesOnline: meta.devicesOnline
     };
   } catch {
     return null;
@@ -513,35 +556,89 @@ function App() {
 
   async function resolveWebGetInput(): Promise<void> {
     const input = webGet.status === 'idle' || webGet.status === 'resolving' || webGet.status === 'error' ? webGet.input : webGet.code;
-    const code = parseShareCode(input) || parseEmbeddedSessionId(input) || '';
+    const code = parseShareCode(input);
     const embeddedSessionId = parseEmbeddedSessionId(input);
-    if (!code) {
-      setWebGet({ status: 'error', input, code: 'missing_code', message: 'Paste a share code or link.', suggestedAction: 'Paste a link like https://warp.ponslink.com/get/8F3K-22Q9 or a PonsWarp receive link.' });
+    if (!code && !embeddedSessionId) {
+      setWebGet({ status: 'error', input, code: 'missing_code', message: 'Paste a share code or link.', suggestedAction: 'Paste an 8-character code or a grid.ponslink.com receive link.' });
       return;
     }
     setWebGet({ status: 'resolving', input });
-    await delay(120);
-    const localShare = webShare.status === 'serving' && isLocalShareMatch(webShare.code, code) ? webShare : null;
-    const coordinatorShare = !localShare ? await resolveCoordinatorBrowserShare(code) : null;
+    const localShare = webShare.status === 'serving' && code && isLocalShareMatch(webShare.code, code) ? webShare : null;
+    let coordinatorShare = !localShare && code ? await resolveCoordinatorBrowserShare(code) : null;
+    // Back-compat: older shares may be stored as XXXX-XXXX on the coordinator.
+    if (!localShare && !coordinatorShare && code.length === 8) {
+      const dashed = `${code.slice(0, 4)}-${code.slice(4)}`;
+      coordinatorShare = await resolveCoordinatorBrowserShare(dashed);
+    }
     const sessionId = embeddedSessionId ?? localShare?.sessionId ?? coordinatorShare?.sessionId;
     const metadata = resolveReceiveDisplayMetadata(localShare, coordinatorShare);
     const { fileName, sizeBytes } = metadata;
-    const helpText = sessionId ? 'Ready for a real browser WebRTC transfer with verified resume/download. File details will be verified with the sender before download starts.' : 'Remote source planning state. The app path handles very large files and offline resume.';
-    setWebGet({ status: 'ready', code, fileName, sizeBytes, devicesOnline: localShare?.devicesOnline ?? coordinatorShare?.devicesOnline ?? 1, helpText, sessionId });
+    const resolvedCode = code || (sessionId ? sessionId.slice(0, 8).toUpperCase() : '');
+    const devicesOnline = localShare?.devicesOnline ?? coordinatorShare?.devicesOnline ?? (sessionId ? 1 : 0);
+
+    if (sessionId) {
+      // Start browser WebRTC download immediately — no extra confirm step.
+      setWebGet({
+        status: 'ready',
+        code: resolvedCode,
+        fileName,
+        sizeBytes,
+        devicesOnline,
+        helpText: 'Connecting to sender for verified piece transfer…',
+        sessionId
+      });
+      await runWebGetDownloadWith({ code: resolvedCode, fileName, sessionId });
+      return;
+    }
+
+    if (localShare && webShareFile.current) {
+      setWebGet({
+        status: 'ready',
+        code: resolvedCode,
+        fileName,
+        sizeBytes,
+        devicesOnline,
+        helpText: 'Starting local verified download…',
+        sessionId: localShare.sessionId
+      });
+      await runWebGetDownloadWith({ code: resolvedCode, fileName, sessionId: localShare.sessionId });
+      return;
+    }
+
+    setWebGet({
+      status: 'error',
+      input,
+      code: 'sender_unreachable',
+      message: 'Could not start a browser download for this code.',
+      suggestedAction: 'Confirm the sender tab is still open and the code is correct. Same-network devices should connect automatically; try pasting the full link from the sender.'
+    });
   }
 
   async function runWebGetDownload(): Promise<void> {
     if (webGet.status !== 'ready') return;
     const { code, fileName, sessionId } = webGet;
+    await runWebGetDownloadWith({ code, fileName, sessionId });
+  }
+
+  async function runWebGetDownloadWith(input: { code: string; fileName: string; sessionId?: SessionId }): Promise<void> {
+    const { code, fileName, sessionId } = input;
     if (sessionId) {
       const joinUrl = currentJoinUrl(sessionId);
       window.history.replaceState(null, '', joinUrl);
       setWebGet({ status: 'downloading', code, fileName, progress: 0, speedBps: 0, securityLabel: 'Connecting WebRTC receiver' });
-      await joinSignaledReceiver(sessionId);
+      try {
+        await joinSignaledReceiver(sessionId);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        setWebGet({ status: 'error', input: code, code: 'transfer_failed', message, suggestedAction: 'Keep the sender tab open and try again.' });
+      }
       return;
     }
     const localFile = webShare.status === 'serving' && isLocalShareMatch(webShare.code, code) ? webShareFile.current : null;
-    if (!localFile) return;
+    if (!localFile) {
+      setWebGet({ status: 'error', input: code, code: 'no_local_file', message: 'No downloadable file found for this code in this browser.', suggestedAction: 'Open the share link on a device that can reach the online sender.' });
+      return;
+    }
     const securityLabel = 'Local browser download verified';
     setWebGet({ status: 'downloading', code, fileName, progress: 0, speedBps: 0, securityLabel: 'Secure transfer starting' });
     const startedAt = performance.now();
@@ -1309,7 +1406,7 @@ function App() {
               </div>
             </div>
             <div className="receive-form">
-              <input aria-label="Paste share code or link" className="receive-input" placeholder="Paste link or code" value={webGet.status === 'idle' || webGet.status === 'resolving' || webGet.status === 'error' ? webGet.input : webGet.code} onChange={event => setWebGet({ status: 'idle', input: event.currentTarget.value })} />
+              <input aria-label="Paste share code or link" className="receive-input" placeholder="8-character code or link" value={webGet.status === 'idle' || webGet.status === 'resolving' || webGet.status === 'error' ? webGet.input : webGet.code} onChange={event => setWebGet({ status: 'idle', input: event.currentTarget.value })} />
               <button className="arrow-button" onClick={() => void resolveWebGetInput()} aria-label="Find file"><Icon name="arrow-right" size={30} strokeWidth={2.2} /></button>
             </div>
             <div className="or-line">or</div>
@@ -1333,11 +1430,7 @@ function App() {
               <div data-testid="receive-ready" className="status-card">
                 <p><strong>{webGet.fileName}</strong> · {typeof webGet.sizeBytes === 'number' ? formatBytes(webGet.sizeBytes) : 'size verifying with sender'}</p>
                 <p className="live-hint">{webGet.devicesOnline} device online · secure transfer</p>
-                {webGet.helpText.startsWith('Remote') ? (
-                  <p className="live-hint">Open the app or CLI with this code to continue.</p>
-                ) : (
-                  <button onClick={() => void runWebGetDownload()} className="primary-button" style={{ width: '100%' }}>Download in browser</button>
-                )}
+                <button onClick={() => void runWebGetDownload()} className="primary-button" style={{ width: '100%' }}>Download</button>
                 <p>{webGet.helpText}</p>
               </div>
             )}

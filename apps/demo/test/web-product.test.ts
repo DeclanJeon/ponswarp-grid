@@ -1,20 +1,24 @@
 import { describe, expect, it } from 'vitest';
-import { createShareCode, formatBytes, isLocalShareMatch, parseShareCode, resolveReceiveDisplayMetadata } from '../src/web-product';
+import { createShareCode, formatBytes, isLocalShareMatch, normalizeShareCode, parseShareCode, resolveReceiveDisplayMetadata } from '../src/web-product';
 
 describe('web product helpers', () => {
-  it('extracts a share code from links and custom URLs', () => {
-    expect(parseShareCode('https://warp.ponslink.com/get/8f3k-22q9')).toBe('8F3K-22Q9');
-    expect(parseShareCode('ponswarp://get/abcd-1234')).toBe('ABCD-1234');
-    expect(parseShareCode('https://grid.ponslink.com/#/get/demo-1a2b?session=sess_signal_1')).toBe('DEMO-1A2B');
-    expect(parseShareCode('DEMO-1A2B')).toBe('DEMO-1A2B');
-    expect(parseShareCode('not-a-code')).toBe('');
+  it('parses continuous and legacy dashed share codes from links', () => {
+    expect(parseShareCode('https://warp.ponslink.com/get/8f3k22q9')).toBe('8F3K22Q9');
+    expect(parseShareCode('https://warp.ponslink.com/get/8f3k-22q9')).toBe('8F3K22Q9');
+    expect(parseShareCode('ponswarp://get/abcd1234')).toBe('ABCD1234');
+    expect(parseShareCode('https://grid.ponslink.com/#/get/demo1a2b?session=sess_signal_1')).toBe('DEMO1A2B');
+    expect(parseShareCode('https://grid.ponslink.com/#/get/MVAY-CQW3')).toBe('MVAYCQW3');
+    expect(parseShareCode('MVAYCQW3')).toBe('MVAYCQW3');
+    expect(parseShareCode('MVAY-CQW3')).toBe('MVAYCQW3');
+    expect(parseShareCode('nope')).toBe('');
+    expect(parseShareCode('SHORT')).toBe('');
+    expect(parseShareCode('TOO-LONG-CODE-HERE')).toBe('');
     expect(parseShareCode('')).toBe('');
   });
 
   it('keeps QR get links parseable when they include an embedded session query', () => {
-    const qrLink = 'https://grid.ponslink.com/#/get/C0DE-1234?session=sess_signal_123';
-
-    expect(parseShareCode(qrLink)).toBe('C0DE-1234');
+    const qrLink = 'https://grid.ponslink.com/#/get/C0DE1234?session=sess_signal_123';
+    expect(parseShareCode(qrLink)).toBe('C0DE1234');
   });
 
   it('uses only real receive metadata instead of fabricated archive details', () => {
@@ -38,16 +42,19 @@ describe('web product helpers', () => {
     expect(formatBytes(5 * 1024 ** 3)).toBe('5.0 GB');
   });
 
-  it('generates share codes in XXXX-XXXX format without demo prefix', () => {
+  it('generates 8-character share codes without dashes', () => {
     const code = createShareCode();
-    expect(code).toMatch(/^[A-Z2-9]{4}-[A-Z2-9]{4}$/);
+    expect(code).toMatch(/^[A-Z2-9]{8}$/);
+    expect(code).not.toContain('-');
     expect(code).not.toContain('DEMO');
+    expect(normalizeShareCode('AB12-CD34')).toBe('AB12CD34');
   });
 
   it('allows the browser MVP to distinguish local downloadable shares from remote planning states', () => {
-    expect(isLocalShareMatch('ABCD-EFGH', 'abcd-efgh')).toBe(true);
-    expect(isLocalShareMatch('ABCD-EFGH', 'WXYZ-9999')).toBe(false);
-    expect(isLocalShareMatch(undefined, 'WXYZ-9999')).toBe(false);
+    expect(isLocalShareMatch('ABCDEFGH', 'abcdefgh')).toBe(true);
+    expect(isLocalShareMatch('ABCD-EFGH', 'abcdefgh')).toBe(true);
+    expect(isLocalShareMatch('ABCDEFGH', 'WXYZ9999')).toBe(false);
+    expect(isLocalShareMatch(undefined, 'WXYZ9999')).toBe(false);
   });
 
   it('share codes round-trip through parseShareCode', () => {
@@ -55,6 +62,9 @@ describe('web product helpers', () => {
       const code = createShareCode();
       expect(parseShareCode(code)).toBe(code);
       expect(parseShareCode(`https://grid.ponslink.com/#/get/${code.toLowerCase()}?session=sess_1`)).toBe(code);
+      // legacy dashed links still normalize
+      const dashed = `${code.slice(0, 4)}-${code.slice(4)}`;
+      expect(parseShareCode(dashed)).toBe(code);
     }
   });
 });
