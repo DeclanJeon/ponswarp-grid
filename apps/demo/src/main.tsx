@@ -121,7 +121,26 @@ type FinalizedDownload = {
   assembledBytes: number;
   saveMode: 'blob-url' | 'file-picker' | 'opfs-blob' | 'unsupported';
   hint?: string;
+  autoDownloadTriggered?: boolean;
 };
+
+/** Start a browser download without requiring the user to click a Save link. */
+function triggerBrowserDownload(url: string, fileName: string): boolean {
+  try {
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = fileName || 'download.bin';
+    anchor.rel = 'noopener';
+    anchor.style.display = 'none';
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    return true;
+  } catch (error) {
+    console.warn('auto download failed', error);
+    return false;
+  }
+}
 
 function extensionForSaveName(name: string): string | undefined {
   const base = name.split(/[\\/]/).pop() ?? name;
@@ -190,13 +209,17 @@ async function finalizeReceivedDownload(input: {
   const saved = await storage.saveAssembledFile(fileId, manifest);
   if (saved.type === 'blob') {
     const downloadUrl = URL.createObjectURL(saved.blob);
+    const autoDownloadTriggered = triggerBrowserDownload(downloadUrl, manifest.name || 'download.bin');
     return {
       downloadUrl,
       assembledBytes: saved.bytes,
       saveMode: large ? 'opfs-blob' : 'blob-url',
-      hint: large
-        ? 'Large file assembled via streaming storage path. Use Save if the browser keeps the blob in OPFS/backing store.'
-        : undefined
+      autoDownloadTriggered,
+      hint: autoDownloadTriggered
+        ? 'Download started automatically.'
+        : (large
+          ? 'Large file ready. If the browser blocked auto-download, use Save file.'
+          : 'File ready. If auto-download was blocked, use Save file.')
     };
   }
   if (saved.type === 'stream') {
@@ -218,7 +241,15 @@ async function finalizeReceivedDownload(input: {
   }
 
   const blob = await storage.assembleFile(fileId, manifest);
-  return { downloadUrl: URL.createObjectURL(blob), assembledBytes: blob.size, saveMode: 'blob-url' };
+  const downloadUrl = URL.createObjectURL(blob);
+  const autoDownloadTriggered = triggerBrowserDownload(downloadUrl, manifest.name || 'download.bin');
+  return {
+    downloadUrl,
+    assembledBytes: blob.size,
+    saveMode: 'blob-url',
+    autoDownloadTriggered,
+    hint: autoDownloadTriggered ? 'Download started automatically.' : 'File ready. Use Save file if needed.'
+  };
 }
 
 function signalingUrl(): string {
@@ -1598,7 +1629,8 @@ function App() {
         await restoredReceiver.joinSession(runtime.sessionId);
         const restoredProgress = restoredReceiver.getProgress(manifest.fileId);
         if (restoredProgress.verifiedPieces !== restoredProgress.totalPieces) throw new Error(`Cannot assemble incomplete file: ${restoredProgress.verifiedPieces}/${restoredProgress.totalPieces} pieces verified`);
-        const finalized = await finalizeReceivedDownload({ storage: runtime.storage, fileId: manifest.fileId, manifest, preferPicker: true });
+        // preferPicker false: auto-download without forcing a save dialog (picker still available if auto path fails for huge files).
+        const finalized = await finalizeReceivedDownload({ storage: runtime.storage, fileId: manifest.fileId, manifest, preferPicker: false });
         transferDownloadUrl = finalized.downloadUrl;
         if (finalized.downloadUrl) {
           if (webDownloadUrl.current) URL.revokeObjectURL(webDownloadUrl.current);
@@ -1890,7 +1922,7 @@ function App() {
                 <p>{webGet.progress}% · {formatBytes(webGet.speedBps)}/s · {webGet.securityLabel}</p>
               </div>
             )}
-            {webGet.status === 'complete' && <p role="status" className="status-card"><strong>Complete:</strong> {webGet.outputName} · {webGet.verificationLabel}{webGet.downloadUrl ? <> · <a href={webGet.downloadUrl} download={webGet.outputName}>Save file</a></> : <> · saved via file picker / stream</>}</p>}
+            {webGet.status === 'complete' && <p role="status" className="status-card"><strong>Complete:</strong> {webGet.outputName} · {webGet.verificationLabel} · download started{webGet.downloadUrl ? <> · <a href={webGet.downloadUrl} download={webGet.outputName}>Save again</a></> : null}</p>}
             {webGet.status === 'error' && <p role="alert" className="error-text">{webGet.message}</p>}
           </section>
         </div>
