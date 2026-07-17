@@ -4,8 +4,16 @@
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
-  "bin": { "ponswarp": "./dist/cli.js", "ponswarp-grid": "./dist/cli.js" },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "ponswarp": "./dist/cli.js",
+    "ponswarp-grid": "./dist/cli.js"
+  },
   "dependencies": {
     "@ponswarp/core": "workspace:*",
     "@ponswarp/signaling": "workspace:*"

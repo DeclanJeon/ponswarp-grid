@@ -30,6 +30,23 @@ export function getCliStorageRoot(): string {
   return configured && configured.length > 0 ? configured : join(process.cwd(), '.ponswarp-grid');
 }
 
+
+/** Path-kind → app chunk sizes aligned with docs/21 / @ponswarp/webrtc profiles. */
+function chunkBytesForPathKind(pathKind: string | undefined): { kind: 'host' | 'srflx' | 'relay' | 'unknown'; chunkSizeBytes: number } {
+  const kind = (pathKind === 'host' || pathKind === 'srflx' || pathKind === 'relay' || pathKind === 'unknown')
+    ? pathKind
+    : 'unknown';
+  const chunkSizeBytes = kind === 'relay' ? 32 * 1024 : 64 * 1024;
+  return { kind, chunkSizeBytes };
+}
+
+function applyEnginePathKind(engine: PonsWarpEngine, pathKind: string | undefined): 'host' | 'srflx' | 'relay' | 'unknown' {
+  const { kind, chunkSizeBytes } = chunkBytesForPathKind(pathKind);
+  engine.applyTransferTuning({ chunkSizeBytes });
+  return kind;
+}
+
+
 interface CliSessionStorageRecord {
   role: 'owner' | 'receiver';
   bucket: string;
@@ -152,6 +169,8 @@ export async function runSend(command: SendCommand): Promise<void> {
     const ownerEndpoint = await transport.listen();
     const storage = new NodeFileStorageAdapter({ rootDir: join(getCliStorageRoot(), 'owners', safeStorageKey(command.session ?? String(process.pid))) });
     engine = new PonsWarpEngine(storage, undefined, undefined, undefined, transport);
+    const pathKind = applyEnginePathKind(engine, command.pathKind);
+    console.log(`Path tuning: ${pathKind} chunk=${engine.getTransferChunkBytes()} bytes`);
     source = await openNodeFileSource(command.file);
     const file = toBlobLikeFile(source);
     const session = await engine.createSession({
@@ -194,6 +213,8 @@ export async function runJoin(command: JoinCommand): Promise<number> {
     const receiverEndpoint = await transport.listen();
     const storage = new NodeFileStorageAdapter({ rootDir: join(getCliStorageRoot(), 'receivers', safeStorageKey(`${descriptor.sessionId}:${command.outDir}`)) });
     engine = new PonsWarpEngine(storage, undefined, undefined, undefined, transport);
+    const pathKind = applyEnginePathKind(engine, command.pathKind);
+    console.log(`Path tuning: ${pathKind} chunk=${engine.getTransferChunkBytes()} bytes`);
     await engine.joinSession(descriptor.sessionId, descriptor.manifests);
     const manifest = descriptor.manifests[0];
     if (!manifest) throw new Error('Join descriptor does not contain a file manifest');
@@ -225,10 +246,26 @@ export async function runJoin(command: JoinCommand): Promise<number> {
       const before = progress.verifiedPieces;
       let scheduledPeerId: PeerId;
       if (peerDescriptor) {
-        const scheduled = await engine.requestNextGridPiece(manifest.fileId, { ownerPeerId: descriptor.ownerPeerId, candidatePeers: [peerDescriptor.peerId, descriptor.ownerPeerId] });
-        if (scheduled.type !== 'scheduled') throw new Error(`No piece scheduled for CLI grid transfer: ${scheduled.reason}`);
-        scheduledPeerId = scheduled.peerId;
-        providerPieces.set(scheduledPeerId, (providerPieces.get(scheduledPeerId) ?? 0) + 1);
+        const results = await engine.requestGridPieceWindow(manifest.fileId, {
+          ownerPeerId: descriptor.ownerPeerId,
+          candidatePeers: [peerDescriptor.peerId, descriptor.ownerPeerId],
+          maxInFlightTotal: Math.max(1, command.transferWindow),
+          maxInFlightPerPeer: 2,
+          endgame: true,
+          endgameMaxPieces: 4
+        });
+        const scheduled = results.find(item => item.type === 'scheduled');
+        if (!scheduled || scheduled.type !== 'scheduled') {
+          const idle = results[0];
+          const reason = idle && idle.type !== 'scheduled' ? ('reason' in idle ? idle.reason : 'unknown') : 'no_available_peer';
+          if (engine.getOutstandingRequestCount(manifest.fileId) === 0) throw new Error(`No piece scheduled for CLI grid transfer: ${reason}`);
+          scheduledPeerId = descriptor.ownerPeerId;
+        } else {
+          scheduledPeerId = scheduled.peerId;
+          for (const item of results) {
+            if (item.type === 'scheduled') providerPieces.set(item.peerId, (providerPieces.get(item.peerId) ?? 0) + 1);
+          }
+        }
       } else {
         const scheduled = await engine.requestPieceWindow(descriptor.ownerPeerId, manifest.fileId, { maxInFlight: command.transferWindow });
         if (scheduled.length === 0 && engine.getOutstandingRequestCount(manifest.fileId, descriptor.ownerPeerId) === 0) throw new Error('No piece scheduled for CLI direct transfer');

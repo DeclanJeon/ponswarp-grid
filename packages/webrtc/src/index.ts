@@ -22,10 +22,125 @@ export const DEFAULT_FLOW_CONTROL_PROFILE: FlowControlProfile = {
 };
 
 export function clampDataChannelChunkSize(requestedBytes: number, maxMessageSize?: number | null): number {
-  const safeDefault = DEFAULT_FLOW_CONTROL_PROFILE.chunkSize;
   const protocolFloor = 16 * KIB;
-  const reportedMax = typeof maxMessageSize === 'number' && maxMessageSize > 0 ? maxMessageSize : safeDefault;
-  return Math.max(protocolFloor, Math.min(requestedBytes, reportedMax, safeDefault));
+  // Hard ceiling keeps SCTP friendly; allow room above the historical 16 KiB default
+  // when the peer reports a larger maxMessageSize (common browser values are 256 KiB+).
+  const hardCap = 256 * KIB;
+  const requested = Number.isFinite(requestedBytes) ? Math.floor(requestedBytes) : protocolFloor;
+  const reportedMax = typeof maxMessageSize === 'number' && maxMessageSize > 0
+    ? Math.floor(maxMessageSize)
+    : hardCap;
+  const upper = Math.min(hardCap, reportedMax);
+  if (requested <= 0) return protocolFloor;
+  // Prefer the requested size when it fits; never exceed the peer/protocol ceiling.
+  // Floor at 16 KiB only when the caller asked for at least that much, otherwise
+  // honor smaller diagnostic sizes that still fit under the ceiling.
+  if (requested < protocolFloor) return Math.min(requested, upper);
+  return Math.min(Math.max(requested, protocolFloor), upper);
+}
+
+/** ICE path kind used to pick bulk transfer watermarks / chunk targets. */
+export type CandidatePathKind = 'host' | 'srflx' | 'relay' | 'unknown';
+
+export interface TransferDiagnostics {
+  candidatePathKind?: CandidatePathKind | null;
+  availableOutgoingBitrateBps?: number | null;
+  rttMs?: number | null;
+}
+
+export interface TransferTuningProfile {
+  pathKind: CandidatePathKind;
+  chunkSizeBytes: number;
+  minInFlightBytes: number;
+  initialInFlightBytes: number;
+  maxInFlightBytes: number;
+  lowWaterBytes: number;
+}
+
+export const DIRECT_HOST_TRANSFER_TUNING_PROFILE: TransferTuningProfile = {
+  pathKind: 'host',
+  chunkSizeBytes: 64 * KIB,
+  minInFlightBytes: 2 * MIB,
+  initialInFlightBytes: 4 * MIB,
+  maxInFlightBytes: 8 * MIB,
+  lowWaterBytes: 1 * MIB
+};
+
+export const DIRECT_SRFLX_TRANSFER_TUNING_PROFILE: TransferTuningProfile = {
+  ...DIRECT_HOST_TRANSFER_TUNING_PROFILE,
+  pathKind: 'srflx',
+  maxInFlightBytes: 6 * MIB
+};
+
+export const RELAY_TRANSFER_TUNING_PROFILE: TransferTuningProfile = {
+  pathKind: 'relay',
+  chunkSizeBytes: 32 * KIB,
+  minInFlightBytes: 512 * KIB,
+  initialInFlightBytes: 1 * MIB,
+  maxInFlightBytes: 2 * MIB,
+  lowWaterBytes: 256 * KIB
+};
+
+export const UNKNOWN_TRANSFER_TUNING_PROFILE: TransferTuningProfile = {
+  ...DIRECT_HOST_TRANSFER_TUNING_PROFILE,
+  pathKind: 'unknown',
+  maxInFlightBytes: 4 * MIB
+};
+
+export function selectTransferTuningProfile(diagnostics?: Partial<TransferDiagnostics> | null): TransferTuningProfile {
+  switch (diagnostics?.candidatePathKind) {
+    case 'host':
+      return DIRECT_HOST_TRANSFER_TUNING_PROFILE;
+    case 'srflx':
+      return DIRECT_SRFLX_TRANSFER_TUNING_PROFILE;
+    case 'relay':
+      return RELAY_TRANSFER_TUNING_PROFILE;
+    default:
+      return UNKNOWN_TRANSFER_TUNING_PROFILE;
+  }
+}
+
+/**
+ * BDP-style in-flight target. Direct (host/srflx) paths use a more aggressive
+ * multiple because Chrome's availableOutgoingBitrate is often pessimistic on LAN.
+ * Ported from ponswarp transferFlowControl path profiles.
+ */
+export function selectInFlightTargetBytes(
+  profile: TransferTuningProfile,
+  diagnostics?: Partial<TransferDiagnostics> | null
+): number {
+  const direct = diagnostics?.candidatePathKind === 'host' || diagnostics?.candidatePathKind === 'srflx';
+  const bitrate = diagnostics?.availableOutgoingBitrateBps;
+  const rttMs = diagnostics?.rttMs;
+  if (
+    typeof bitrate === 'number' && Number.isFinite(bitrate) && bitrate > 0
+    && typeof rttMs === 'number' && Number.isFinite(rttMs) && rttMs > 0
+  ) {
+    const bdp = Math.floor((bitrate / 8) * Math.max(rttMs, 10) / 1000 * (direct ? 16 : 4));
+    return Math.max(profile.minInFlightBytes, Math.min(profile.maxInFlightBytes, Math.max(bdp, profile.initialInFlightBytes)));
+  }
+  return direct || diagnostics?.candidatePathKind === 'unknown'
+    ? profile.maxInFlightBytes
+    : profile.initialInFlightBytes;
+}
+
+export function calculateSendBudget(params: {
+  targetInFlightBytes: number;
+  bufferedAmountBytes: number;
+  paused?: boolean;
+}): number {
+  if (params.paused) return 0;
+  return Math.max(0, Math.floor(params.targetInFlightBytes) - Math.max(0, Math.floor(params.bufferedAmountBytes)));
+}
+
+export function flowControlProfileFromTuning(profile: TransferTuningProfile): FlowControlProfile {
+  return {
+    chunkSize: clampDataChannelChunkSize(profile.chunkSizeBytes),
+    highWaterMark: profile.maxInFlightBytes,
+    lowWaterMark: profile.lowWaterBytes,
+    batchSize: 1,
+    prefetchBufferSize: 0
+  };
 }
 
 export function shouldRequestMoreChunks(params: {
@@ -512,3 +627,94 @@ export class SignalingBridge {
     return null;
   }
 }
+
+/** Adaptive AIMD congestion controller (docs/24). App-layer pacing only. */
+export interface AdaptiveCongestionSnapshot {
+  cwndBytes: number;
+  estimatedRttMs: number;
+  estimatedBwBps: number;
+  recommendedBatchChunks: number;
+}
+
+export class AdaptiveCongestionController {
+  private cwndBytes: number;
+  private minCwnd: number;
+  private maxCwnd: number;
+  private estimatedRttMs = 10;
+  private estimatedBwBps = 0;
+  private minRtt = Infinity;
+  private lastUpdateTime = 0;
+  private chunkSizeBytes: number;
+  private started = false;
+  private readonly direct: boolean;
+
+  constructor(profile: TransferTuningProfile = DIRECT_HOST_TRANSFER_TUNING_PROFILE) {
+    this.minCwnd = profile.minInFlightBytes;
+    this.maxCwnd = profile.maxInFlightBytes;
+    this.cwndBytes = profile.initialInFlightBytes;
+    this.chunkSizeBytes = Math.max(1, profile.chunkSizeBytes);
+    this.direct = profile.pathKind === 'host' || profile.pathKind === 'srflx';
+  }
+
+  start(): void {
+    this.started = true;
+    this.lastUpdateTime = 0;
+  }
+
+  reset(profile?: TransferTuningProfile): void {
+    if (profile) {
+      this.minCwnd = profile.minInFlightBytes;
+      this.maxCwnd = profile.maxInFlightBytes;
+      this.cwndBytes = profile.initialInFlightBytes;
+      this.chunkSizeBytes = Math.max(1, profile.chunkSizeBytes);
+    }
+    this.estimatedRttMs = 10;
+    this.estimatedBwBps = 0;
+    this.minRtt = Infinity;
+    this.lastUpdateTime = 0;
+    this.started = false;
+  }
+
+  recordSend(_bytes: number): void {
+    // Reserved for future throughput samples; buffer-based control is primary.
+  }
+
+  updateFromCandidateStats(input: { rttMs?: number; availableOutgoingBitrateBps?: number }): void {
+    if (typeof input.rttMs === 'number' && Number.isFinite(input.rttMs) && input.rttMs > 0 && input.rttMs <= 10_000) {
+      this.estimatedRttMs = input.rttMs;
+      if (input.rttMs < this.minRtt) this.minRtt = input.rttMs;
+    }
+    if (typeof input.availableOutgoingBitrateBps === 'number' && Number.isFinite(input.availableOutgoingBitrateBps) && input.availableOutgoingBitrateBps > 0) {
+      this.estimatedBwBps = input.availableOutgoingBitrateBps;
+    }
+  }
+
+  updateBufferState(bufferedAmountBytes: number): AdaptiveCongestionSnapshot {
+    const now = Date.now();
+    if (this.started && this.lastUpdateTime > 0 && now - this.lastUpdateTime < 100) {
+      return this.getSnapshot();
+    }
+    const baseline = this.minRtt === Infinity ? 10 : this.minRtt;
+    const rttRatio = this.estimatedRttMs / Math.max(1, baseline);
+    const buffer = Math.max(0, bufferedAmountBytes);
+    if (rttRatio > 2.0 || buffer > this.cwndBytes) {
+      this.cwndBytes = Math.max(this.minCwnd, Math.floor(this.cwndBytes * 0.7));
+    } else if (rttRatio < 1.5 && buffer < this.cwndBytes * 0.8) {
+      const increase = this.direct || this.estimatedRttMs < 10 ? 256 * 1024 : 64 * 1024;
+      this.cwndBytes = Math.min(this.maxCwnd, this.cwndBytes + increase);
+    }
+    this.lastUpdateTime = now;
+    return this.getSnapshot();
+  }
+
+  getSnapshot(): AdaptiveCongestionSnapshot {
+    const recommendedBatchChunks = Math.max(1, Math.min(32, Math.floor((this.cwndBytes * 0.2) / this.chunkSizeBytes)));
+    return {
+      cwndBytes: this.cwndBytes,
+      estimatedRttMs: this.estimatedRttMs,
+      estimatedBwBps: this.estimatedBwBps,
+      recommendedBatchChunks
+    };
+  }
+}
+

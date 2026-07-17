@@ -14,6 +14,8 @@ export interface SendCommand extends BaseCommand {
   pieceSize: number;
   session?: string;
   keepOpen: boolean;
+  /** ICE path kind for transfer chunk tuning. Default unknown. */
+  pathKind: 'host' | 'srflx' | 'relay' | 'unknown';
 }
 
 export interface JoinCommand extends BaseCommand {
@@ -27,6 +29,7 @@ export interface JoinCommand extends BaseCommand {
   seedAfterComplete: boolean;
   maxPeers: number;
   transferWindow: number;
+  pathKind: 'host' | 'srflx' | 'relay' | 'unknown';
 }
 
 export interface ServeSignalCommand extends BaseCommand {
@@ -125,7 +128,7 @@ export function parseCliArgs(argv: readonly string[]): ParsedCliCommand {
 
 function parseSend(args: readonly string[]): SendCommand {
   const positionals: string[] = [];
-  const options = parseOptions(args, positionals, new Set(['signal', 'listen', 'advertise', 'piece-size', 'session', 'keep-open']));
+  const options = parseOptions(args, positionals, new Set(['signal', 'listen', 'advertise', 'piece-size', 'session', 'keep-open', 'path-kind']));
   const file = positionals[0];
   if (!file) throw new CliUsageError('send requires <file>');
   if (positionals.length > 1) throw new CliUsageError(`send accepts one file, got ${positionals.length}`);
@@ -137,13 +140,14 @@ function parseSend(args: readonly string[]): SendCommand {
     advertise: optionalStringOption(options, 'advertise'),
     pieceSize: positiveIntegerOption(options, 'piece-size', DEFAULT_PIECE_SIZE),
     session: optionalStringOption(options, 'session'),
-    keepOpen: booleanOption(options, 'keep-open')
+    keepOpen: booleanOption(options, 'keep-open'),
+    pathKind: pathKindOption(options, 'path-kind', 'unknown')
   };
 }
 
 function parseJoin(args: readonly string[]): JoinCommand {
   const positionals: string[] = [];
-  const options = parseOptions(args, positionals, new Set(['signal', 'listen', 'advertise', 'out', 'peer', 'seed-after-complete', 'max-peers', 'transfer-window']));
+  const options = parseOptions(args, positionals, new Set(['signal', 'listen', 'advertise', 'out', 'peer', 'seed-after-complete', 'max-peers', 'transfer-window', 'path-kind']));
   const session = positionals[0];
   if (!session) throw new CliUsageError('join requires <session-or-url>');
   if (positionals.length > 1) throw new CliUsageError(`join accepts one session, got ${positionals.length}`);
@@ -157,7 +161,8 @@ function parseJoin(args: readonly string[]): JoinCommand {
     peer: optionalStringOption(options, 'peer'),
     seedAfterComplete: booleanOption(options, 'seed-after-complete'),
     maxPeers: positiveIntegerOption(options, 'max-peers', DEFAULT_MAX_PEERS),
-    transferWindow: positiveIntegerOption(options, 'transfer-window', DEFAULT_TRANSFER_WINDOW)
+    transferWindow: positiveIntegerOption(options, 'transfer-window', DEFAULT_TRANSFER_WINDOW),
+    pathKind: pathKindOption(options, 'path-kind', 'unknown')
   };
 }
 
@@ -370,12 +375,21 @@ function tcpPortOption(options: Map<string, string | true>, key: string, fallbac
   return value;
 }
 
+function pathKindOption(options: Map<string, string | true>, name: string, fallback: 'host' | 'srflx' | 'relay' | 'unknown'): 'host' | 'srflx' | 'relay' | 'unknown' {
+  const raw = options.get(name);
+  if (raw === undefined) return fallback;
+  if (raw === true) throw new CliUsageError(`--${name} requires host|srflx|relay|unknown`);
+  const value = String(raw).toLowerCase();
+  if (value === 'host' || value === 'srflx' || value === 'relay' || value === 'unknown') return value;
+  throw new CliUsageError(`--${name} must be host|srflx|relay|unknown`);
+}
+
 export function usage(): string {
   return `PonsWarp Grid CLI
 
 Usage:
-  ponswarp send <file> [--signal auto|ws://host:port/ws] [--listen host:port] [--advertise ws://host:port] [--piece-size bytes] [--session id] [--keep-open]
-  ponswarp join <session-or-url> --out <dir> [--signal auto|ws://host:port/ws] [--listen host:port] [--advertise ws://host:port] [--peer ponswarp-peer://...] [--seed-after-complete] [--max-peers n] [--transfer-window n]
+  ponswarp send <file> [--signal auto|ws://host:port/ws] [--listen host:port] [--advertise ws://host:port] [--piece-size bytes] [--session id] [--keep-open] [--path-kind host|srflx|relay|unknown]
+  ponswarp join <session-or-url> --out <dir> [--signal auto|ws://host:port/ws] [--listen host:port] [--advertise ws://host:port] [--peer ponswarp-peer://...] [--seed-after-complete] [--max-peers n] [--transfer-window n] [--path-kind host|srflx|relay|unknown]
   ponswarp serve-signal [--host 0.0.0.0] [--port 8787]
   ponswarp node start --workspace <id> --node-id <id> --public-key <key> [--coordinator http://host] [--display-name name] [--direct-join ponswarp://join/...] [--json] [--dry-run]
   ponswarp publish <file> --workspace <id> --node-id <id> [--coordinator http://host] [--piece-size bytes] [--json] [--dry-run]

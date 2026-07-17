@@ -1,5 +1,6 @@
 import { StrictMode, useEffect, useRef, useState, type ReactNode } from 'react';
 import { createRoot } from 'react-dom/client';
+import './styles.css';
 import QRCode from 'qrcode';
 import {
   MemoryStorageAdapter,
@@ -1225,570 +1226,7 @@ function App() {
 
   return (
     <main className="grid-shell">
-      <style>{`
-        :root {
-          color-scheme: dark;
-          --grid-bg: #03102c;
-          --grid-ink: #f7fbff;
-          --grid-muted: #aebee0;
-          --grid-line: rgba(146, 203, 255, 0.34);
-          --grid-card: rgba(8, 35, 78, 0.72);
-          --grid-card-strong: rgba(12, 45, 93, 0.84);
-          --grid-blue: #2d7dff;
-          --grid-cyan: #25d9ff;
-          --grid-glow: rgba(37, 217, 255, 0.42);
-        }
-        * { box-sizing: border-box; }
-        .grid-product svg { display: block; flex: none; }
-        body { margin: 0; background: #03102c; }
-        .grid-shell {
-          min-height: 100vh;
-          margin: 0;
-          padding: 24px 40px 34px;
-          overflow-x: hidden;
-          font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-          color: var(--grid-ink);
-          background:
-            radial-gradient(circle at 18% 82%, rgba(37, 126, 255, 0.62), transparent 31%),
-            radial-gradient(circle at 86% 81%, rgba(12, 109, 255, 0.46), transparent 27%),
-            radial-gradient(circle at 50% 45%, rgba(19, 217, 255, 0.18), transparent 22%),
-            linear-gradient(180deg, #020a20 0%, #06163a 52%, #0c5dd9 140%);
-        }
-        .grid-product {
-          position: relative;
-          width: min(100%, 1600px);
-          min-height: calc(100vh - 58px);
-          margin: 0 auto;
-          isolation: isolate;
-        }
-        .grid-product::before {
-          content: "";
-          position: absolute;
-          inset: 54px 0 auto;
-          height: 1px;
-          background: linear-gradient(90deg, transparent, rgba(156, 203, 255, 0.24), transparent);
-          z-index: -1;
-        }
-        .topbar {
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          gap: 24px;
-          min-height: 58px;
-        }
-        .brand {
-          display: inline-flex;
-          align-items: center;
-          gap: 14px;
-          font-size: 28px;
-          font-weight: 850;
-          letter-spacing: -0.04em;
-        }
-        .brand-mark {
-          width: 44px;
-          height: 44px;
-          border-radius: 12px;
-          background:
-            radial-gradient(circle at 32% 28%, #6ff4ff, transparent 27%),
-            linear-gradient(135deg, #196bff 10%, #27e5ff 52%, #705cff 100%);
-          box-shadow: 0 0 28px rgba(37, 217, 255, 0.38);
-          position: relative;
-        }
-        .brand-mark::after {
-          content: "";
-          position: absolute;
-          inset: 11px 10px 10px 12px;
-          border-radius: 5px 5px 10px 5px;
-          background: #07163a;
-          clip-path: polygon(0 0, 88% 0, 88% 64%, 42% 64%, 42% 100%, 0 100%);
-        }
-        .brand-accent { color: #8f8aff; font-weight: 760; }
-        .how-pill {
-          display: inline-flex;
-          align-items: center;
-          gap: 10px;
-          border: 1px solid rgba(166, 206, 255, 0.18);
-          border-radius: 999px;
-          padding: 11px 18px;
-          color: #d9e7ff;
-          background: rgba(7, 20, 50, 0.62);
-          box-shadow: inset 0 1px 0 rgba(255,255,255,0.08), 0 14px 40px rgba(0,0,0,0.18);
-          text-decoration: none;
-          font-weight: 650;
-        }
-        .how-pill { transition: background 160ms ease, border-color 160ms ease, color 160ms ease; }
-        .how-pill:hover {
-          background: rgba(7, 20, 50, 0.82);
-          border-color: rgba(166, 206, 255, 0.42);
-          color: #fff;
-        }
-        .hero {
-          position: relative;
-          min-height: 384px;
-          padding: 30px 0 0;
-          text-align: center;
-        }
-        .hero h1 {
-          margin: 0;
-          font-size: clamp(58px, 7.1vw, 96px);
-          line-height: 1.05;
-          letter-spacing: -0.075em;
-          text-shadow: 0 14px 56px rgba(0,0,0,0.3);
-        }
-        .hero p {
-          margin: 16px 0 0;
-          color: #c8d7f2;
-          font-size: clamp(19px, 2.1vw, 25px);
-          letter-spacing: -0.025em;
-        }
-        .device {
-          position: absolute;
-          bottom: -12px;
-          opacity: 0.98;
-          filter: drop-shadow(0 30px 48px rgba(0,0,0,0.34));
-          z-index: -1;
-        }
-        .laptop {
-          left: 10.5%;
-          width: 318px;
-          height: 180px;
-          border: 2px solid rgba(130, 190, 255, 0.86);
-          border-radius: 12px 12px 5px 5px;
-          transform: perspective(520px) rotateX(3deg) rotateY(-13deg) rotateZ(-2deg);
-          background: linear-gradient(135deg, rgba(28, 81, 159, 0.28), rgba(3, 18, 53, 0.88));
-          box-shadow: inset 0 0 38px rgba(45, 125, 255, 0.32), 0 0 20px rgba(83, 165, 255, 0.24);
-        }
-        .laptop::before {
-          content: "";
-          position: absolute;
-          left: 88px;
-          top: 72px;
-          width: 62px;
-          height: 44px;
-          border-radius: 5px;
-          background: rgba(25, 107, 255, 0.42);
-          border: 2px solid rgba(48, 145, 255, 0.88);
-        }
-        .laptop::after {
-          content: "";
-          position: absolute;
-          left: 8px;
-          bottom: -38px;
-          width: 348px;
-          height: 38px;
-          transform: skewX(28deg);
-          border-radius: 0 0 15px 15px;
-          background: linear-gradient(90deg, rgba(63, 139, 255, 0.28), rgba(150, 215, 255, 0.82), rgba(35, 89, 166, 0.22));
-        }
-        .phone {
-          right: 11.4%;
-          bottom: -8px;
-          width: 112px;
-          height: 198px;
-          border: 2px solid rgba(130, 190, 255, 0.9);
-          border-radius: 25px;
-          background: linear-gradient(160deg, rgba(28, 75, 147, 0.42), rgba(3, 18, 53, 0.86));
-          box-shadow: inset 0 0 32px rgba(45, 125, 255, 0.26), 0 0 22px rgba(83, 165, 255, 0.25);
-        }
-        .phone::before {
-          content: "";
-          position: absolute;
-          left: 29px;
-          top: 86px;
-          width: 54px;
-          height: 40px;
-          border-radius: 5px;
-          background: rgba(25, 107, 255, 0.42);
-          border: 2px solid rgba(48, 145, 255, 0.88);
-        }
-        .beam {
-          position: absolute;
-          left: 24%;
-          right: 20%;
-          bottom: 74px;
-          height: 88px;
-          z-index: 0;
-          pointer-events: none;
-        }
-        .beam::before,
-        .beam::after {
-          content: "";
-          position: absolute;
-          inset: 12px 0;
-          border-radius: 999px;
-          background:
-            radial-gradient(circle at 18% 38%, rgba(255,255,255,0.9) 0 2px, transparent 3px),
-            radial-gradient(circle at 37% 65%, rgba(121,217,255,0.9) 0 2px, transparent 3px),
-            radial-gradient(circle at 63% 28%, rgba(255,255,255,0.85) 0 2px, transparent 3px),
-            radial-gradient(circle at 84% 52%, rgba(121,217,255,0.9) 0 2px, transparent 3px),
-            linear-gradient(92deg, transparent 0%, rgba(39, 151, 255, 0.22) 11%, rgba(37, 217, 255, 0.96) 48%, rgba(26, 136, 255, 0.74) 82%, transparent 100%);
-          filter: blur(0.4px) drop-shadow(0 0 16px var(--grid-glow));
-          clip-path: polygon(0 42%, 88% 31%, 88% 18%, 100% 50%, 88% 82%, 88% 66%, 0 57%);
-        }
-        .beam::after {
-          inset: 30px 7% 22px;
-          opacity: 0.74;
-          filter: blur(5px);
-        }
-        .file-capsule {
-          position: absolute;
-          left: 50%;
-          bottom: 92px;
-          transform: translateX(-50%);
-          display: flex;
-          align-items: center;
-          gap: 16px;
-          min-width: 274px;
-          padding: 20px 28px;
-          border: 2px solid rgba(137, 237, 255, 0.9);
-          border-radius: 42px;
-          background: linear-gradient(135deg, rgba(135, 111, 255, 0.82), rgba(17, 170, 255, 0.88));
-          box-shadow: 0 0 28px rgba(37,217,255,0.74), inset 0 1px 0 rgba(255,255,255,0.36);
-          text-align: left;
-          z-index: 2;
-        }
-        .file-icon {
-          width: 40px;
-          height: 46px;
-          border: 3px solid rgba(255,255,255,0.92);
-          border-radius: 4px;
-          position: relative;
-        }
-        .file-icon::after {
-          content: "";
-          position: absolute;
-          right: -3px;
-          top: -3px;
-          width: 14px;
-          height: 14px;
-          border-left: 3px solid rgba(255,255,255,0.92);
-          border-bottom: 3px solid rgba(255,255,255,0.92);
-          background: rgba(95,170,255,0.95);
-        }
-        .file-name { display: block; font-size: 18px; font-weight: 800; }
-        .file-size { display: block; color: #e2edff; font-size: 17px; }
-        .shield-badge {
-          margin-left: auto;
-          width: 43px;
-          height: 43px;
-          border-radius: 17px;
-          display: grid;
-          place-items: center;
-          background: rgba(255,255,255,0.17);
-          color: #ffffff;
-          border: 2px solid rgba(214, 249, 255, 0.58);
-        }
-        .panel-grid {
-          display: grid;
-          grid-template-columns: repeat(2, minmax(0, 1fr));
-          gap: 32px;
-          margin: -20px auto 28px;
-          max-width: 1275px;
-        }
-        .action-card {
-          min-height: 348px;
-          border: 1px solid rgba(146, 203, 255, 0.28);
-          border-radius: 24px;
-          padding: 28px 34px;
-          background: linear-gradient(145deg, rgba(11, 39, 88, 0.9), rgba(5, 20, 52, 0.62));
-          box-shadow: inset 0 1px 0 rgba(255,255,255,0.11), 0 24px 70px rgba(0,0,0,0.28), 0 0 44px rgba(42, 136, 255, 0.1);
-          backdrop-filter: blur(18px);
-        }
-        .card-head {
-          display: grid;
-          grid-template-columns: 74px 1fr;
-          gap: 18px;
-          align-items: center;
-          margin-bottom: 24px;
-        }
-        .round-icon {
-          width: 72px;
-          height: 72px;
-          border-radius: 50%;
-          display: grid;
-          place-items: center;
-          color: white;
-          font-size: 38px;
-          font-weight: 760;
-          background: linear-gradient(135deg, #735bff, #186fff);
-          box-shadow: 0 14px 35px rgba(40, 109, 255, 0.4), inset 0 1px 0 rgba(255,255,255,0.22);
-        }
-        .receive-card .round-icon { background: linear-gradient(135deg, #14d6ff, #1464d9); }
-        .action-card h2 {
-          margin: 0 0 4px;
-          font-size: 31px;
-          line-height: 1.05;
-          letter-spacing: -0.04em;
-        }
-        .action-card p { margin: 0; color: #c4d4f0; font-size: 16px; }
-        .drop-zone {
-          display: grid;
-          place-items: center;
-          min-height: 198px;
-          border: 1.5px dashed rgba(176, 211, 255, 0.52);
-          border-radius: 18px;
-          background: rgba(3, 16, 43, 0.33);
-          text-align: center;
-          cursor: pointer;
-          transition: border-color 160ms ease, transform 160ms ease, background 160ms ease;
-        }
-        .drop-zone:hover {
-          border-color: rgba(132, 226, 255, 0.86);
-          background: rgba(10, 35, 83, 0.54);
-        }
-        .upload-glyph {
-          display: grid;
-          place-items: center;
-          margin: 0 auto 14px;
-          width: 64px;
-          height: 64px;
-          border-radius: 18px;
-          color: #bcd8ff;
-          background: rgba(37, 126, 255, 0.14);
-          border: 1px solid rgba(146, 203, 255, 0.28);
-        }
-        .drop-primary { color: #dfeaff; font-size: 18px; }
-        .drop-secondary { color: #9eafd0; font-size: 15px; }
-        .primary-button {
-          display: inline-flex;
-          align-items: center;
-          justify-content: center;
-          gap: 12px;
-          min-width: 250px;
-          margin-top: 8px;
-          border: 0;
-          border-radius: 17px;
-          padding: 15px 23px;
-          background: linear-gradient(180deg, #3a9dff, #1d58f0);
-          color: #fff;
-          font-size: 21px;
-          font-weight: 800;
-          box-shadow: 0 12px 30px rgba(25, 107, 255, 0.42), inset 0 1px 0 rgba(255,255,255,0.28);
-          cursor: pointer;
-        }
-        .primary-button { transition: transform 80ms ease, filter 80ms ease; }
-        .primary-button:hover { transform: translateY(-1px); filter: brightness(1.05); }
-        .primary-button:active { transform: translateY(0); filter: brightness(0.97); }
-        .primary-button:disabled { opacity: 0.64; cursor: wait; }
-        .share-result {
-          margin-top: 18px;
-          padding: 18px;
-          border: 1px solid rgba(114, 197, 255, 0.42);
-          border-radius: 20px;
-          background: rgba(8, 37, 84, 0.72);
-        }
-        .share-result a { color: #8fe9ff; word-break: break-all; }
-        .receive-form {
-          display: flex;
-          align-items: center;
-          gap: 0;
-          width: 100%;
-          margin-top: 2px;
-          border: 1px solid rgba(120, 174, 255, 0.42);
-          border-radius: 18px;
-          background: rgba(13, 35, 80, 0.72);
-          overflow: hidden;
-          box-shadow: inset 0 1px 0 rgba(255,255,255,0.08);
-        }
-        .receive-form:focus-within {
-          border-color: rgba(37, 217, 255, 0.72);
-          box-shadow: 0 0 0 3px rgba(37, 217, 255, 0.18);
-          transition: border-color 160ms ease, box-shadow 160ms ease;
-        }
-        .receive-input {
-          min-width: 0;
-          flex: 1;
-          border: 0;
-          outline: 0;
-          padding: 21px 23px;
-          color: #edf6ff;
-          background: transparent;
-          font: inherit;
-          font-size: 19px;
-        }
-        .receive-input::placeholder { color: #b7c4df; }
-        .arrow-button {
-          width: 76px;
-          align-self: stretch;
-          display: grid;
-          place-items: center;
-          border: 0;
-          color: #fff;
-          background: linear-gradient(135deg, #43d9ff, #1776e7);
-          cursor: pointer;
-          box-shadow: -12px 0 30px rgba(37,217,255,0.18);
-          transition: filter 100ms ease, transform 100ms ease;
-        }
-        .arrow-button:hover { filter: brightness(1.12); }
-        .arrow-button:active { filter: brightness(0.95); transform: scale(0.97); }
-        .or-line {
-          display: grid;
-          grid-template-columns: 1fr auto 1fr;
-          gap: 18px;
-          align-items: center;
-          margin: 22px 0;
-          color: #b9c7df;
-        }
-        .or-line::before,
-        .or-line::after {
-          content: "";
-          height: 1px;
-          background: linear-gradient(90deg, transparent, rgba(143, 190, 255, 0.24));
-        }
-        .or-line::after { background: linear-gradient(90deg, rgba(143, 190, 255, 0.24), transparent); }
-        .qr-row {
-          display: grid;
-          grid-template-columns: 86px 1fr 52px;
-          gap: 18px;
-          align-items: center;
-          min-height: 92px;
-          padding: 14px;
-          border: 1px solid rgba(120, 174, 255, 0.26);
-          border-radius: 14px;
-          background: rgba(8, 28, 67, 0.62);
-        }
-        .qr-faux {
-          display: grid;
-          place-items: center;
-          width: 68px;
-          height: 68px;
-          border-radius: 10px;
-          color: #061639;
-          background-color: #fff;
-        }
-        .camera-button {
-          width: 50px;
-          height: 50px;
-          border: 1px solid rgba(143, 190, 255, 0.18);
-          border-radius: 50%;
-          display: grid;
-          place-items: center;
-          background: rgba(255,255,255,0.05);
-          color: #dceaff;
-        }
-        .status-card {
-          margin-top: 18px;
-          padding: 18px;
-          border: 1px solid rgba(114, 197, 255, 0.42);
-          border-radius: 18px;
-          background: rgba(6, 31, 73, 0.72);
-        }
-        .status-card a { color: #8fe9ff; }
-        .status-card progress,
-        .developer-panel progress {
-          width: 100%;
-          height: 12px;
-          accent-color: #32d5ff;
-        }
-        .trust-strip {
-          display: grid;
-          grid-template-columns: repeat(4, minmax(0, 1fr));
-          gap: 0;
-          max-width: 1280px;
-          margin: 0 auto;
-          border: 1px solid rgba(135, 198, 255, 0.28);
-          border-radius: 24px;
-          background: linear-gradient(135deg, rgba(9, 35, 82, 0.82), rgba(5, 22, 58, 0.64));
-          box-shadow: inset 0 1px 0 rgba(255,255,255,0.08), 0 20px 60px rgba(0,0,0,0.22);
-          backdrop-filter: blur(18px);
-          overflow: hidden;
-        }
-        .trust-item {
-          display: grid;
-          grid-template-columns: 62px 1fr;
-          gap: 15px;
-          align-items: start;
-          padding: 20px 25px;
-          min-height: 92px;
-          border-left: 1px solid rgba(135, 198, 255, 0.18);
-        }
-        .trust-item:first-child { border-left: 0; }
-        .trust-icon {
-          width: 52px;
-          height: 52px;
-          border-radius: 50%;
-          display: grid;
-          place-items: center;
-          border: 1px solid rgba(143, 190, 255, 0.34);
-          background: rgba(255,255,255,0.04);
-          color: #e7f4ff;
-          font-size: 27px;
-          padding-top: 2px;
-        }
-        .trust-title { margin: 0; color: #fff; font-size: 18px; font-weight: 820; }
-        .trust-copy { margin: 3px 0 0; color: #c4d4f0; font-size: 13px; line-height: 1.25; }
-        .trust-icon-live { position: relative; }
-        .online-dot {
-          position: absolute;
-          top: 2px;
-          right: 2px;
-          width: 12px;
-          height: 12px;
-          border-radius: 50%;
-          background: #42ee8b;
-          border: 2px solid #0a2350;
-          box-shadow: 0 0 16px rgba(66,238,139,0.65);
-        }
-        .developer-panel {
-          max-width: 1280px;
-          margin: 26px auto 0;
-          border: 1px solid rgba(143, 190, 255, 0.18);
-          border-radius: 20px;
-          padding: 16px 20px;
-          background: rgba(3, 13, 34, 0.46);
-          color: #dce8ff;
-        }
-        .developer-panel summary {
-          cursor: pointer;
-          font-weight: 800;
-          color: #9fb9e7;
-        }
-        .developer-panel button {
-          margin: 6px 8px 6px 0;
-          border: 1px solid rgba(135, 198, 255, 0.26);
-          border-radius: 12px;
-          padding: 9px 12px;
-          background: rgba(255,255,255,0.05);
-          color: #eef6ff;
-        }
-        .developer-panel a { color: #8fe9ff; }
-        .developer-panel section { border-top: 1px solid rgba(143, 190, 255, 0.15); padding-top: 16px; margin-top: 16px; }
-        .error-text { color: #ff9ea8; font-weight: 800; }
-        @media (max-width: 980px) {
-          .grid-shell { padding: 20px; }
-          .hero { min-height: 320px; }
-          .panel-grid, .trust-strip { grid-template-columns: 1fr; }
-          .trust-item { border-left: 0; border-top: 1px solid rgba(135, 198, 255, 0.18); }
-          .trust-item:first-child { border-top: 0; }
-          .device, .beam, .file-capsule { opacity: 0.44; }
-          .laptop { left: 0; }
-          .phone { right: 4%; }
-        }
-        @media (max-width: 680px) {
-          .topbar { align-items: flex-start; }
-          .brand { font-size: 22px; }
-          .how-pill { display: none; }
-          .hero { min-height: 300px; }
-          .hero h1 { font-size: 48px; }
-          .hero p { font-size: 17px; }
-          .panel-grid { margin-top: 0; gap: 20px; }
-          .action-card { padding: 24px; min-height: 0; }
-          .card-head { grid-template-columns: 56px 1fr; }
-          .round-icon { width: 56px; height: 56px; }
-          .qr-row { grid-template-columns: 68px 1fr 44px; gap: 12px; }
-          .camera-button { width: 44px; height: 44px; }
-          .primary-button { min-width: 0; width: 100%; font-size: 19px; }
-        }
-        @media (max-width: 420px) {
-          .grid-shell { padding: 16px 14px 24px; }
-          .hero h1 { font-size: 40px; }
-          .action-card { padding: 20px; }
-          .drop-zone { min-height: 168px; }
-          .receive-input { padding: 17px 18px; font-size: 17px; }
-          .arrow-button { width: 60px; }
-        }
-      `}</style>
-      <div className="grid-product">
+<div className="grid-product">
         <nav className="topbar" aria-label="Primary">
           <div className="brand" aria-label="PonsWarp Grid">
             <span className="brand-mark" aria-hidden="true" />
@@ -1800,16 +1238,27 @@ function App() {
           </a>
         </nav>
 
+        <div className="grid-noise" aria-hidden="true" />
         <section className="hero" aria-label="PonsWarp Grid intro">
-          <h1>Send files directly</h1>
-          <p>Direct device-to-device. Fast, private, simple.</p>
-          <div className="device laptop" aria-hidden="true" />
-          <div className="device phone" aria-hidden="true" />
-          <div className="beam" aria-hidden="true" />
-          <div className="file-capsule" aria-hidden="true">
-            <span className="file-icon" />
-            <span><span className="file-name">Report.pdf</span><span className="file-size">2.4 GB</span></span>
-            <span className="shield-badge"><Icon name="shield" size={24} strokeWidth={2} /></span>
+          <p className="hero-kicker"><span className="hero-kicker-dot" aria-hidden="true" />Piece-based P2P · resume · verify</p>
+          <h1>Files move device to device</h1>
+          <p>No cloud upload of your payload. WebRTC pieces, local resume, SHA-256 checks — keep the sender tab open and share a link.</p>
+          <div className="mesh-motif" aria-hidden="true">
+            <svg viewBox="0 0 420 120" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M40 70 C 100 20, 160 120, 220 60 S 340 10, 380 55" stroke="url(#g)" strokeWidth="1.5" opacity="0.7" />
+              <circle cx="40" cy="70" r="5" fill="#5ef0c0" />
+              <circle cx="220" cy="60" r="6" fill="#8b7cff" />
+              <circle cx="380" cy="55" r="5" fill="#5ef0c0" />
+              <circle cx="140" cy="55" r="3" fill="#fff" opacity="0.5" />
+              <circle cx="300" cy="45" r="3" fill="#fff" opacity="0.5" />
+              <defs>
+                <linearGradient id="g" x1="40" y1="70" x2="380" y2="55" gradientUnits="userSpaceOnUse">
+                  <stop stopColor="#5ef0c0" />
+                  <stop offset="0.5" stopColor="#8b7cff" />
+                  <stop offset="1" stopColor="#5ef0c0" />
+                </linearGradient>
+              </defs>
+            </svg>
           </div>
         </section>
 
@@ -1838,14 +1287,15 @@ function App() {
             )}
             {webShare.status === 'serving' && (
               <div data-testid="share-result" className="share-result">
-                <p><strong>Share code:</strong> {webShare.code}</p>
+                <p><strong>Share code</strong></p>
+                <p className="share-code">{webShare.code}</p>
                 <p><strong>Link:</strong> <a href={webShare.link}>{webShare.link}</a></p>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap', margin: '12px 0' }}>
-                  <img src={webShare.qrDataUrl} alt={`QR code for ${webShare.code}`} width={128} height={128} style={{ borderRadius: 14, border: '1px solid rgba(143,190,255,0.42)', background: '#fff', padding: 8 }} />
-                  <p style={{ maxWidth: 280, margin: 0, color: '#d9f4ff', fontWeight: 800 }}>Scan this QR code with a phone to open the receive page instantly.</p>
+                <div className="qr-frame">
+                  <img src={webShare.qrDataUrl} alt={`QR code for ${webShare.code}`} width={128} height={128} />
+                  <p>Scan on a phone to open receive instantly. Sender must stay online.</p>
                 </div>
                 <p><strong>This device is online.</strong> Downloads: {webShare.downloads}</p>
-                <p style={{ color: '#8fe9ff' }}>Keep this tab open while sharing.</p>
+                <p className="live-hint">Keep this tab open while sharing.</p>
               </div>
             )}
           </section>
@@ -1882,9 +1332,9 @@ function App() {
             {webGet.status === 'ready' && (
               <div data-testid="receive-ready" className="status-card">
                 <p><strong>{webGet.fileName}</strong> · {typeof webGet.sizeBytes === 'number' ? formatBytes(webGet.sizeBytes) : 'size verifying with sender'}</p>
-                <p style={{ color: '#8fe9ff' }}>{webGet.devicesOnline} device online · secure transfer</p>
+                <p className="live-hint">{webGet.devicesOnline} device online · secure transfer</p>
                 {webGet.helpText.startsWith('Remote') ? (
-                  <p style={{ borderRadius: 16, padding: '14px 16px', background: 'rgba(37, 126, 255, 0.18)', color: '#d9f4ff', fontWeight: 800 }}>Open the app or CLI with this code to continue.</p>
+                  <p className="live-hint">Open the app or CLI with this code to continue.</p>
                 ) : (
                   <button onClick={() => void runWebGetDownload()} className="primary-button" style={{ width: '100%' }}>Download in browser</button>
                 )}

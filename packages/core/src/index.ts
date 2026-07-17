@@ -84,7 +84,90 @@ export interface TransferProgress {
 
 export const CORE_PROTOCOL_VERSION = 'ponswarp-grid/1.0.0' as const;
 
-const DEFAULT_TRANSFER_CHUNK_BYTES = 64 * 1024;
+export const DEFAULT_TRANSFER_CHUNK_BYTES = 64 * 1024;
+export const MAX_TRANSFER_CHUNK_BYTES = 256 * 1024;
+
+/** Clamp application transfer chunk size to a safe positive integer range. */
+export function clampTransferChunkBytes(requestedBytes: number, maxBytes = MAX_TRANSFER_CHUNK_BYTES): number {
+  const floor = 1;
+  const cap = Math.max(floor, Math.floor(maxBytes));
+  if (!Number.isFinite(requestedBytes)) return DEFAULT_TRANSFER_CHUNK_BYTES;
+  const requested = Math.floor(requestedBytes);
+  if (requested <= 0) return DEFAULT_TRANSFER_CHUNK_BYTES;
+  return Math.min(Math.max(requested, floor), cap);
+}
+
+
+// --- Hybrid assist arming policy (docs/22); default off ---
+export type HybridPathKind = 'host' | 'srflx' | 'relay' | 'unknown' | string;
+
+export interface HybridPeerCaps {
+  hybridHttp: boolean;
+}
+
+export interface HybridArmDecision {
+  armed: boolean;
+  reason: string;
+}
+
+/** Default hybrid floor: 4 MiB (avoid small-file cloud cost). */
+export const HYBRID_MIN_BYTES = 4 * 1024 * 1024;
+/** Observed throughput below this (MB/s) on non-direct paths may arm assist. */
+export const HYBRID_TRIGGER_MBps = 1.5;
+/** Elevated RTT (ms) that can arm hybrid on direct/unknown paths. */
+export const HYBRID_ELEVATED_RTT_MS = 200;
+/** Compile-time style default: hybrid assist off unless caller sets compileEnabled. */
+export const HYBRID_COMPILE_ENABLED_DEFAULT = false;
+
+export interface HybridAssistPort {
+  /** Optional injectable cloud/object plane; not required for arm policy tests. */
+  upload?(object: Uint8Array, meta: { fileId: FileId; sessionId?: SessionId }): Promise<{ url: string }>;
+  download?(url: string, onChunk: (bytes: Uint8Array) => void | Promise<void>): Promise<void>;
+}
+
+export function shouldArmHybrid(params: {
+  compileEnabled?: boolean;
+  remoteCaps?: HybridPeerCaps | null;
+  totalBytes: number;
+  cloudApiConfigured: boolean;
+  minBytes?: number;
+  pathKind?: HybridPathKind | null;
+  rttMs?: number | null;
+  observedMBps?: number | null;
+  triggerMBps?: number;
+  elevatedRttMs?: number;
+  force?: boolean;
+}): HybridArmDecision {
+  const compileEnabled = params.compileEnabled ?? HYBRID_COMPILE_ENABLED_DEFAULT;
+  if (!compileEnabled) return { armed: false, reason: 'compile-flag-off' };
+  if (!params.cloudApiConfigured) return { armed: false, reason: 'cloud-api-unconfigured' };
+  if (!params.remoteCaps?.hybridHttp) return { armed: false, reason: 'remote-caps-missing' };
+  const minBytes = params.minBytes ?? HYBRID_MIN_BYTES;
+  if (params.totalBytes < minBytes) return { armed: false, reason: `below-min-bytes:${minBytes}` };
+  if (params.force) return { armed: true, reason: 'force' };
+
+  const pathKind = (params.pathKind || 'unknown').toLowerCase();
+  const rttMs = typeof params.rttMs === 'number' && Number.isFinite(params.rttMs) ? params.rttMs : null;
+  const elevatedRtt = params.elevatedRttMs ?? HYBRID_ELEVATED_RTT_MS;
+  const trigger = params.triggerMBps ?? HYBRID_TRIGGER_MBps;
+  const observed = typeof params.observedMBps === 'number' && Number.isFinite(params.observedMBps) ? params.observedMBps : null;
+
+  if (pathKind === 'host' || pathKind === 'srflx') {
+    if (rttMs !== null && rttMs >= elevatedRtt) return { armed: true, reason: `elevated-rtt:${Math.round(rttMs)}ms` };
+    if (observed !== null && observed > 0 && observed < trigger) return { armed: true, reason: `slow-direct:${observed.toFixed(2)}MBps` };
+    return { armed: false, reason: `direct-path:${pathKind}` };
+  }
+  if (pathKind === 'relay') return { armed: true, reason: 'path-relay' };
+  if (pathKind === 'unknown') {
+    if (rttMs !== null && rttMs >= elevatedRtt) return { armed: true, reason: `unknown-elevated-rtt:${Math.round(rttMs)}ms` };
+    if (observed !== null && observed > 0 && observed < trigger) return { armed: true, reason: `unknown-slow:${observed.toFixed(2)}MBps` };
+    return { armed: false, reason: 'path-unknown-not-slow' };
+  }
+  if (observed !== null && observed > 0 && observed < trigger) return { armed: true, reason: `path-${pathKind}-slow` };
+  if (rttMs !== null && rttMs >= elevatedRtt) return { armed: true, reason: `path-${pathKind}-elevated-rtt` };
+  return { armed: false, reason: `path-${pathKind}-not-slow` };
+}
+
 
 export interface PersistedPeerState {
   peerId: PeerId;
@@ -191,6 +274,8 @@ export interface DirectLifecycleOptions {
   clearTimeout?: (handle: ReturnType<typeof globalThis.setTimeout>) => void;
   directTimeoutMs?: number;
   directWindowCap?: number;
+  /** Application chunk size for piece send loops. Default 65536. */
+  transferChunkBytes?: number;
 }
 
 export interface DirectCancelSelector {
@@ -316,6 +401,19 @@ export interface GridScheduleOptions {
   maxRequestsPerPeer?: number;
   requestLeaseMs?: number;
   now?: number;
+  /** When remaining missing pieces are at or below this, allow multi-provider endgame. Default 4. */
+  endgameMaxPieces?: number;
+  /** Concurrent providers per piece in endgame. Default 2. */
+  endgameMaxProviders?: number;
+  /** Enable endgame multi-fetch. Default true. */
+  endgame?: boolean;
+}
+
+export interface GridWindowOptions extends GridScheduleOptions {
+  /** Total outstanding grid requests for this file. Default 1. */
+  maxInFlightTotal?: number;
+  /** Per-peer outstanding cap (alias of maxRequestsPerPeer when set). */
+  maxInFlightPerPeer?: number;
 }
 
 export interface PieceWindowOptions extends DirectRequestOptions {
@@ -833,11 +931,19 @@ export class PeerHealthTable {
 
   markSuccess(peerId: PeerId, bytes: number, elapsedMs: number, now = Date.now()): void {
     const current = this.get(peerId);
-    const throughput = elapsedMs > 0 ? (bytes / elapsedMs) * 1000 : current.averageThroughputBps;
+    // Zero-byte ACK samples must not collapse averageThroughputBps to 0
+    // (PIECE_ACK historically called markSuccess with bytes=0).
+    const sample = elapsedMs > 0 && bytes > 0 ? (bytes / elapsedMs) * 1000 : undefined;
+    const previous = current.averageThroughputBps;
+    const averageThroughputBps = sample === undefined
+      ? previous
+      : previous && previous > 0
+        ? previous * 0.7 + sample * 0.3
+        : sample;
     this.set(peerId, {
       successfulPieces: current.successfulPieces + 1,
       recentFailures: Math.max(0, current.recentFailures - 1),
-      averageThroughputBps: throughput,
+      averageThroughputBps,
       lastSuccessAt: now,
       connectionState: 'connected'
     });
@@ -899,6 +1005,7 @@ export class PonsWarpEngine {
   private disposed = false;
   private defaultDirectTimeout = 300_000;
   private directWindowCap?: number;
+  private transferChunkBytes = DEFAULT_TRANSFER_CHUNK_BYTES;
 
   constructor(
     private readonly storage: StorageAdapter,
@@ -916,7 +1023,27 @@ export class PonsWarpEngine {
     assertPositiveSafeInteger(this.defaultDirectTimeout, 'directTimeoutMs');
     this.directWindowCap = lifecycleOptions.directWindowCap;
     if (this.directWindowCap !== undefined) assertPositiveSafeInteger(this.directWindowCap, 'directWindowCap');
+    if (lifecycleOptions.transferChunkBytes !== undefined) {
+      this.transferChunkBytes = clampTransferChunkBytes(lifecycleOptions.transferChunkBytes);
+    }
     if (transport) this.bindTransport(transport);
+  }
+
+  getTransferChunkBytes(): number {
+    return this.transferChunkBytes;
+  }
+
+  setTransferChunkBytes(bytes: number): void {
+    this.transferChunkBytes = clampTransferChunkBytes(bytes);
+  }
+
+  /**
+   * Apply a path-tuning recommendation to engine send chunk size.
+   * Does not mutate transport flow control (caller owns DataChannel profile).
+   */
+  applyTransferTuning(input: { chunkSizeBytes: number; maxBytes?: number }): { transferChunkBytes: number } {
+    this.transferChunkBytes = clampTransferChunkBytes(input.chunkSizeBytes, input.maxBytes ?? MAX_TRANSFER_CHUNK_BYTES);
+    return { transferChunkBytes: this.transferChunkBytes };
   }
 
   on<T extends keyof EngineEvents>(type: T, handler: EventHandler<EngineEvents[T]>): Unsubscribe {
@@ -1175,18 +1302,24 @@ export class PonsWarpEngine {
     const activePerPeer = new Map<PeerId, number>();
     for (const request of this.outstandingRequests.values()) activePerPeer.set(request.peerId, (activePerPeer.get(request.peerId) ?? 0) + 1);
 
+    // Rarity uses full advertised provider counts (capacity-unfiltered) so a busy
+    // sole provider still ranks its pieces as rarest-first, matching BitTorrent.
     const ranked = missingPieces
       .map(index => {
         const retryCount = manager.getPieceState(index).retryCount;
+        const allProviders = this.availability.getProviders(fileId, index, now);
+        const nonOwnerProviders = allProviders.filter(provider => provider.peerId !== options.ownerPeerId);
+        const rarityCount = nonOwnerProviders.length > 0 ? nonOwnerProviders.length : allProviders.length;
         const providers = this.rankProviders(fileId, index, candidates, options.ownerPeerId, maxRequestsPerPeer, activePerPeer, now);
-        return { index, retryCount, providers };
+        return { index, retryCount, providers, rarityCount };
       })
       .filter(item => !this.availability.getLease(fileId, item.index))
       .sort((a, b) => {
         const aHasReceiver = a.providers.some(provider => provider.role !== 'owner') ? 1 : 0;
         const bHasReceiver = b.providers.some(provider => provider.role !== 'owner') ? 1 : 0;
         if (aHasReceiver !== bHasReceiver) return bHasReceiver - aHasReceiver;
-        const rarity = a.providers.filter(provider => provider.role !== 'owner').length - b.providers.filter(provider => provider.role !== 'owner').length;
+        // Lower rarityCount = rarer piece.
+        const rarity = a.rarityCount - b.rarityCount;
         if (rarity !== 0) return rarity;
         const retry = a.retryCount - b.retryCount;
         return retry !== 0 ? retry : a.index - b.index;
@@ -1208,6 +1341,114 @@ export class PonsWarpEngine {
     }
 
     return { type: 'idle', reason: 'no_available_peer' };
+  }
+
+  /**
+   * Fill a bounded grid request window across peers (docs/23).
+   * Returns only newly scheduled results. Respects leases and endgame multi-provider.
+   */
+  async requestGridPieceWindow(fileId: FileId, options: GridWindowOptions): Promise<GridScheduleResult[]> {
+    const maxInFlightTotal = options.maxInFlightTotal ?? 1;
+    assertPositiveSafeInteger(maxInFlightTotal, 'maxInFlightTotal');
+    const maxInFlightPerPeer = options.maxInFlightPerPeer ?? options.maxRequestsPerPeer ?? 1;
+    assertPositiveSafeInteger(maxInFlightPerPeer, 'maxInFlightPerPeer');
+    const scheduleOptions: GridScheduleOptions = {
+      ...options,
+      maxRequestsPerPeer: maxInFlightPerPeer
+    };
+    const scheduled: GridScheduleResult[] = [];
+    while (this.countOutstandingRequestsForFile(fileId) < maxInFlightTotal) {
+      const endgame = await this.maybeScheduleEndgamePiece(fileId, scheduleOptions);
+      const result = endgame ?? await this.requestNextGridPiece(fileId, scheduleOptions);
+      if (result.type !== 'scheduled') {
+        if (scheduled.length === 0) scheduled.push(result);
+        break;
+      }
+      scheduled.push(result);
+      // Bump active count for next iteration ranking via outstanding map
+    }
+    return scheduled;
+  }
+
+  /**
+   * Endgame: when few pieces remain, schedule a second provider for a leased piece
+   * if capacity allows. Uses local tombstones for late losers after first verify.
+   */
+  private async maybeScheduleEndgamePiece(fileId: FileId, options: GridScheduleOptions): Promise<GridScheduleResult | null> {
+    if (options.endgame === false) return null;
+    const manager = this.requireManager(fileId);
+    const missing = manager.getMissingPieces();
+    const endgameMax = options.endgameMaxPieces ?? 4;
+    if (missing.length === 0 || missing.length > endgameMax) return null;
+    const now = options.now ?? Date.now();
+    this.expireRequestLeases(now);
+    const maxProviders = options.endgameMaxProviders ?? 2;
+    const maxPerPeer = options.maxRequestsPerPeer ?? 1;
+    const candidates = new Set(options.candidatePeers ?? []);
+    candidates.add(options.ownerPeerId);
+    const activePerPeer = new Map<PeerId, number>();
+    for (const request of this.outstandingRequests.values()) {
+      if (request.fileId === fileId) activePerPeer.set(request.peerId, (activePerPeer.get(request.peerId) ?? 0) + 1);
+    }
+    // Prefer pieces that already have one outstanding request (need a second provider)
+    for (const pieceIndex of missing) {
+      const outstandingForPiece = [...this.outstandingRequests.entries()].filter(([, r]) => r.fileId === fileId && r.pieceIndex === pieceIndex);
+      if (outstandingForPiece.length === 0 || outstandingForPiece.length >= maxProviders) continue;
+      const usedPeers = new Set(outstandingForPiece.map(([, r]) => r.peerId));
+      const providers = this.rankProviders(fileId, pieceIndex, candidates, options.ownerPeerId, maxPerPeer, activePerPeer, now)
+        .filter(p => !usedPeers.has(p.peerId));
+      const provider = providers[0];
+      if (!provider) continue;
+      const requestId = this.createRequestId(fileId, pieceIndex);
+      const leaseMs = options.requestLeaseMs ?? 15_000;
+      // Endgame: do not replace primary lease; track via outstanding only
+      manager.markRequested(pieceIndex, provider.peerId);
+      this.outstandingRequests.set(requestId, {
+        fileId,
+        pieceIndex,
+        peerId: provider.peerId,
+        requestedAt: now,
+        gridOptions: options,
+        endgame: true
+      } as any);
+      await this.sendPieceRequest(provider.peerId, fileId, pieceIndex, requestId);
+      return {
+        type: 'scheduled',
+        pieceIndex,
+        peerId: provider.peerId,
+        requestId,
+        reason: 'fastest_peer'
+      };
+    }
+    return null;
+  }
+
+  /** Cancel competing endgame requests for a piece after first verify. */
+  cancelCompetingGridRequests(fileId: FileId, pieceIndex: number, keepRequestId: string): void {
+    for (const [requestId, request] of [...this.outstandingRequests]) {
+      if (request.fileId !== fileId || request.pieceIndex !== pieceIndex || requestId === keepRequestId) continue;
+      this.outstandingRequests.delete(requestId);
+      this.incomingChunks.delete(requestId);
+      this.directTombstones.add(requestId);
+      for (const [peerId, header] of this.pendingChunks) {
+        if (header.requestId === requestId) this.pendingChunks.delete(peerId);
+      }
+      // Best-effort cancel notify (optional wire)
+      void this.requireTransport().send(request.peerId, {
+        type: 'PIECE_CANCEL',
+        fileId,
+        pieceIndex,
+        requestId
+      } as any).catch(() => undefined);
+    }
+  }
+
+  private countOutstandingRequestsForFile(fileId: FileId): number {
+    let count = 0;
+    for (const request of this.outstandingRequests.values()) {
+      if (request.fileId === fileId) count += 1;
+    }
+    return count;
   }
 
   expireRequestLeases(now = Date.now()): void {
@@ -1310,6 +1551,7 @@ export class PonsWarpEngine {
       return { type: 'PIECE_REJECT', fileId: input.fileId, pieceIndex: input.pieceIndex, requestId: input.requestId, reason: 'persist_failed' };
     }
     if (!this.finalizeDirectRequest(input.requestId, 'verified')) this.outstandingRequests.delete(input.requestId);
+    this.cancelCompetingGridRequests(input.fileId, input.pieceIndex, input.requestId);
     if (this.knownPeers.size > 0) await this.broadcastPieceMap(input.fileId, [...this.knownPeers]);
     this.events.emit('pieceVerified', { fileId: input.fileId, pieceIndex: input.pieceIndex });
     this.events.emit('progress', manager.getProgress());
@@ -1396,6 +1638,12 @@ export class PonsWarpEngine {
         this.peerHealth.markSuccess(outstanding.peerId, 0, Math.max(1, Date.now() - outstanding.requestedAt));
       }
       if (!this.finalizeDirectRequest(requestId, 'acknowledged')) this.outstandingRequests.delete(requestId);
+      return;
+    }
+    if (type === 'PIECE_CANCEL') {
+      const requestId = requireStringField(message, 'requestId');
+      // Provider may ignore; receiver-side tombstones already set. No-op safe.
+      this.directTombstones.add(requestId);
       return;
     }
     if (type === 'PIECE_REJECT') {
@@ -1570,7 +1818,7 @@ export class PonsWarpEngine {
       return;
     }
 
-    const chunkSize = Math.min(DEFAULT_TRANSFER_CHUNK_BYTES, data.byteLength || DEFAULT_TRANSFER_CHUNK_BYTES);
+    const chunkSize = Math.min(this.transferChunkBytes, data.byteLength || this.transferChunkBytes);
     const totalChunks = Math.max(1, Math.ceil(data.byteLength / chunkSize));
     for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
       const offset = chunkIndex * chunkSize;

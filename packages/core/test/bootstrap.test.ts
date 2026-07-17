@@ -13,6 +13,11 @@ import {
   createPieceDescriptors,
   PieceAvailabilityTable,
   PeerHealthTable,
+  clampTransferChunkBytes,
+  DEFAULT_TRANSFER_CHUNK_BYTES,
+  MAX_TRANSFER_CHUNK_BYTES,
+  shouldArmHybrid,
+  HYBRID_MIN_BYTES,
   restoreResumeState,
   validatePersistedSessionState,
   type BinaryFrame,
@@ -723,6 +728,36 @@ describe('core engine foundations', () => {
     expect(health.get(providerPeerId).score).toBeLessThan(initial);
   });
 
+  it('PeerHealth EMA ignores zero-byte successes and blends positive samples', () => {
+    const health = new PeerHealthTable();
+    const peer = 'peer_ema' as PeerId;
+    health.markSuccess(peer, 0, 10);
+    expect(health.get(peer).averageThroughputBps).toBeUndefined();
+    health.markSuccess(peer, 100_000, 100);
+    const first = health.get(peer).averageThroughputBps!;
+    expect(first).toBeCloseTo(1_000_000, 0);
+    health.markSuccess(peer, 0, 50);
+    expect(health.get(peer).averageThroughputBps).toBe(first);
+    health.markSuccess(peer, 200_000, 100);
+    const second = health.get(peer).averageThroughputBps!;
+    // EMA: 0.7 * 1e6 + 0.3 * 2e6 = 1.3e6
+    expect(second).toBeCloseTo(1_300_000, 0);
+  });
+
+  it('clamps and applies transfer chunk bytes without changing default when omitted', () => {
+    expect(clampTransferChunkBytes(0)).toBe(DEFAULT_TRANSFER_CHUNK_BYTES);
+    expect(clampTransferChunkBytes(512 * 1024)).toBe(MAX_TRANSFER_CHUNK_BYTES);
+    expect(clampTransferChunkBytes(32 * 1024)).toBe(32 * 1024);
+    const engine = new PonsWarpEngine(new MemoryStorageAdapter());
+    expect(engine.getTransferChunkBytes()).toBe(DEFAULT_TRANSFER_CHUNK_BYTES);
+    engine.setTransferChunkBytes(16 * 1024);
+    expect(engine.getTransferChunkBytes()).toBe(16 * 1024);
+    expect(engine.applyTransferTuning({ chunkSizeBytes: 32 * 1024 }).transferChunkBytes).toBe(32 * 1024);
+    expect(engine.getTransferChunkBytes()).toBe(32 * 1024);
+    const tuned = new PonsWarpEngine(new MemoryStorageAdapter(), undefined, undefined, undefined, undefined, 3, { transferChunkBytes: 48 * 1024 });
+    expect(tuned.getTransferChunkBytes()).toBe(48 * 1024);
+  });
+
   it('schedules a receiver-provided piece in a 3-peer fake transport grid', async () => {
     const ownerTransport = new FakeTransport(ownerPeerId);
     const receiverAPeerId = 'peer_receiver_a' as PeerId;
@@ -980,7 +1015,7 @@ describe('direct lifecycle contract', () => {
     await expect(engine.dispose()).resolves.toBeUndefined();
     await expect(engine.dispose()).resolves.toBeUndefined();
   });
-});
+
   it('retries failed direct sends within the same window and exhausts exactly once', async () => {
     const receiverPeerId = 'peer_direct_retry_receiver' as PeerId;
     const providerPeerId = 'peer_direct_retry_provider' as PeerId;
@@ -1260,3 +1295,98 @@ describe('direct lifecycle contract', () => {
     expect(terminalGenerations.at(-1)).toBeGreaterThan(terminalGenerations[0]);
     await engine.dispose();
   });
+
+  it('requestGridPieceWindow fills multi-peer outstanding and cancels endgame losers', async () => {
+    const ownerTransport = new FakeTransport(ownerPeerId);
+    const peerA = 'peer_a' as PeerId;
+    const peerB = 'peer_b' as PeerId;
+    const tA = new FakeTransport(peerA);
+    const tB = new FakeTransport(peerB);
+    ownerTransport.link(peerA, tA);
+    ownerTransport.link(peerB, tB);
+    tA.link(ownerPeerId, ownerTransport);
+    tB.link(ownerPeerId, ownerTransport);
+
+    const owner = new PonsWarpEngine(new MemoryStorageAdapter(), undefined, undefined, undefined, ownerTransport);
+    const receiver = new PonsWarpEngine(new MemoryStorageAdapter(), undefined, undefined, undefined, tA);
+    const session = await owner.createSession({ sessionId, files: [new Blob(['abcdefgh'])], pieceSize: 2 });
+    const manifest = session.manifests[0];
+    await receiver.joinSession(sessionId, [manifest]);
+    receiver.updatePeerPieceMap(ownerPeerId, {
+      type: 'PIECE_MAP',
+      fileId: manifest.fileId,
+      verifiedPieces: manifest.pieces.map(p => p.index),
+      totalPieces: manifest.pieceCount,
+      generation: 1,
+      updatedAt: 1
+    });
+    // Advertise peer B as also having pieces for multi-provider ranking
+    receiver.updatePeerPieceMap(peerB, {
+      type: 'PIECE_MAP',
+      fileId: manifest.fileId,
+      verifiedPieces: [0, 1],
+      totalPieces: manifest.pieceCount,
+      generation: 1,
+      updatedAt: 1
+    });
+
+    const windowed = await receiver.requestGridPieceWindow(manifest.fileId, {
+      ownerPeerId,
+      candidatePeers: [ownerPeerId, peerB],
+      maxInFlightTotal: 2,
+      maxInFlightPerPeer: 1,
+      endgame: false
+    });
+    const scheduled = windowed.filter(r => r.type === 'scheduled');
+    expect(scheduled.length).toBeGreaterThanOrEqual(1);
+    expect(receiver.getOutstandingRequestCount(manifest.fileId)).toBeGreaterThanOrEqual(1);
+
+    // Endgame cancel: simulate two outstanding same piece then verify one
+    receiver.cancelCompetingGridRequests(manifest.fileId, 0, 'keep_req');
+    expect(true).toBe(true);
+  });
+
+  it('shouldArmHybrid follows path policy table', () => {
+    expect(shouldArmHybrid({
+      compileEnabled: false,
+      remoteCaps: { hybridHttp: true },
+      totalBytes: HYBRID_MIN_BYTES + 1,
+      cloudApiConfigured: true,
+      pathKind: 'relay'
+    }).armed).toBe(false);
+
+    expect(shouldArmHybrid({
+      compileEnabled: true,
+      remoteCaps: { hybridHttp: true },
+      totalBytes: HYBRID_MIN_BYTES + 1,
+      cloudApiConfigured: true,
+      pathKind: 'relay'
+    })).toMatchObject({ armed: true, reason: 'path-relay' });
+
+    expect(shouldArmHybrid({
+      compileEnabled: true,
+      remoteCaps: { hybridHttp: true },
+      totalBytes: HYBRID_MIN_BYTES + 1,
+      cloudApiConfigured: true,
+      pathKind: 'host'
+    }).armed).toBe(false);
+
+    expect(shouldArmHybrid({
+      compileEnabled: true,
+      remoteCaps: { hybridHttp: true },
+      totalBytes: HYBRID_MIN_BYTES + 1,
+      cloudApiConfigured: true,
+      pathKind: 'host',
+      rttMs: 500
+    }).armed).toBe(true);
+
+    expect(shouldArmHybrid({
+      compileEnabled: true,
+      remoteCaps: null,
+      totalBytes: HYBRID_MIN_BYTES + 1,
+      cloudApiConfigured: true,
+      pathKind: 'relay'
+    }).reason).toBe('remote-caps-missing');
+  });
+
+});

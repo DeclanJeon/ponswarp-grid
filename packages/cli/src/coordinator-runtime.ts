@@ -195,7 +195,8 @@ export async function runDownload(command: DownloadCommand): Promise<void> {
       peer: directTransfer.peer,
       seedAfterComplete: false,
       maxPeers: 8,
-      transferWindow: 1
+      transferWindow: 1,
+      pathKind: 'unknown'
     });
     if (transferExitCode !== 0) throw new Error(`Direct join transfer failed with exit code ${transferExitCode}`);
   }
@@ -484,7 +485,8 @@ function createCoordinatorJoinCommand(command: GetCommand, hint: DirectTransferH
     peer: hint.peer,
     seedAfterComplete: false,
     maxPeers: 8,
-    transferWindow: 1
+    transferWindow: 1,
+    pathKind: 'unknown'
   };
 }
 function printResult<T>(json: boolean, envelope: CoordinatorEnvelope<T>): void {

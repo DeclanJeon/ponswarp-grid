@@ -206,3 +206,17 @@ A final browser smoke run exposed an independent small-file bottleneck: files at
 After the final evidence hardening, the strict network matrix passes NET-001, NET-002, NET-003, NET-007, and NET-008. NET-004 and NET-006 remain missing, while NET-005 is inconclusive because the historical TURN artifacts are prose, omit current positive transfer fields, or do not prove UDP blocking. This conservative reclassification does not erase the observed transfers; it prevents legacy evidence from authorizing a release claim. The operational decision remains hold-1, with no Window 2 or full TURN-readiness claim.
 
 Frozen non-goals are unchanged: no wire-protocol or storage-format migration, no TURN/infrastructure change, no cryptographic weakening, no fabricated benchmark or gain claim, and no grid-path pipelining.
+
+## Related improvement program (2026-07-17)
+
+This document remains the source of truth for **request window** and **provider serialization**. Broader algorithm audit and phased follow-ups:
+
+| Doc | Focus |
+|---|---|
+| `docs/20-logic-algorithm-audit-scorecard.md` | Scorecard, findings A–K, phase gates |
+| `docs/21-path-aware-transfer-tuning-design.md` | ICE path profiles, engine chunk size (phase-1) |
+| `docs/22-hybrid-assist-port-design.md` | Hybrid HTTP assist port (phase-3) |
+| `docs/23-grid-scheduler-endgame-design.md` | Multi-peer grid window + endgame (phase-2) |
+| `docs/24-adaptive-congestion-control-design.md` | AIMD controller (phase-4) |
+
+P0 code fixes (clamp, PeerHealth EMA, rarest rarity count) are recorded in doc 20 and must not be regressed by window work.

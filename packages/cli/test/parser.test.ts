@@ -16,7 +16,8 @@ describe('PonsWarp CLI parser', () => {
       signal: 'auto',
       listen: '127.0.0.1:0',
       pieceSize: 1024 * 1024,
-      keepOpen: false
+      keepOpen: false,
+      pathKind: 'unknown'
     });
 
     expect(parseCliArgs([
@@ -36,8 +37,15 @@ describe('PonsWarp CLI parser', () => {
       advertise: 'ws://10.0.0.2:5000',
       pieceSize: 262144,
       session: 'sess_cli',
-      keepOpen: true
+      keepOpen: true,
+      pathKind: 'unknown'
     });
+
+    expect(parseCliArgs(['send', 'demo.bin', '--path-kind', 'relay'])).toMatchObject({
+      command: 'send',
+      pathKind: 'relay'
+    });
+    expect(() => parseCliArgs(['send', 'demo.bin', '--path-kind', 'wifi'])).toThrow(/path-kind/);
   });
 
   it('parses join defaults and options', () => {
@@ -46,7 +54,8 @@ describe('PonsWarp CLI parser', () => {
       session: 'sess_1',
       outDir: '.',
       seedAfterComplete: false,
-      maxPeers: 8
+      maxPeers: 8,
+      pathKind: 'unknown'
     });
 
     expect(parseCliArgs(['join', 'ponswarp://join/sess_1', '--out', 'downloads', '--peer', 'ponswarp-peer://abc', '--seed-after-complete', '--max-peers', '3'])).toMatchObject({
@@ -63,8 +72,10 @@ describe('PonsWarp CLI parser', () => {
     expect(parseCliArgs(['join', 'sess_1', '--transfer-window', '3'])).toMatchObject({
       command: 'join',
       session: 'sess_1',
-      transferWindow: 3
+      transferWindow: 3,
+      pathKind: 'unknown'
     });
+    expect(parseCliArgs(['join', 'sess_1', '--path-kind', 'host'])).toMatchObject({ pathKind: 'host' });
 
     expect(() => parseCliArgs(['join', 'sess_1', '--transfer-window', '0'])).toThrow(/positive integer/);
   });

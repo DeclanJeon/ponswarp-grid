@@ -31,6 +31,13 @@
 | `10-release-qa-gates.md` | 릴리스 QA 게이트 | mesh API load, abuse/rate-limit, cleanup/retention, restart/DR, metrics/log, rollback/go/no-go 체크리스트 |
 | `11-multi-device-qa-report-template.md` | 멀티 디바이스 QA 보고서 템플릿 | desktop/mobile, LAN/NAT, reconnect, restart, large-file/resume, 3+ peer grid 검증 기록 양식 |
 | `18-external-network-qa-playbook.md` | 외부망 QA 플레이북 | strict network matrix를 통과하기 위해 필요한 실제 외부망/UDP 차단/TURN TCP-TLS 검증 절차와 artifact 형식 |
+| `19-transfer-performance-design.md` | 전송 성능 설계 | request window, provider serialization, hold-1 운영 계약 |
+| `20-logic-algorithm-audit-scorecard.md` | 로직/알고리즘 감사 스코어카드 | 2026-07-17 채점, findings A–K, 개선 페이즈 게이트 |
+| `21-path-aware-transfer-tuning-design.md` | 경로 인식 전송 튜닝 | ICE path profile, BDP, engine chunk size, demo/CLI wiring (phase-1) |
+| `22-hybrid-assist-port-design.md` | Hybrid HTTP assist 이식 | shouldArmHybrid 정책, 페이즈 3 MVP |
+| `23-grid-scheduler-endgame-design.md` | Grid 스케줄러/엔드게임 | rarest-first, multi-peer window, endgame cancel |
+| `24-adaptive-congestion-control-design.md` | 적응형 혼잡 제어 | RTT/AIMD 컨트롤러 이식 범위 (phase-4) |
+| `25-ui-ux-redesign-2026.md` | 2026 UI/UX 전면 재설계 | Award-product 비주얼 시스템, 반응형, 접근성 |
 
 ---
 
@@ -142,6 +149,7 @@ MVP 성공 기준은 다음이다.
 | 대회 제출 문안 변경 | `06-contest-dev-report-draft.md` |
 | 작업 우선순위 변경 | `07-implementation-tickets.md` |
 | 릴리스/운영 QA 기준 변경 | `10-release-qa-gates.md`, `11-multi-device-qa-report-template.md`, `18-external-network-qa-playbook.md` |
+| 로직/성능 알고리즘 감사·개선 | `20-logic-algorithm-audit-scorecard.md`, `21`–`24` 설계서, `19-transfer-performance-design.md` |
 
 ---
 

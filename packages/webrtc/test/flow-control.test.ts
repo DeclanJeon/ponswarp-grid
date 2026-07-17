@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { DataChannelWrapper, PeerConnectionWrapper, SignalingBridge, WebRTCTransport, clampDataChannelChunkSize, shouldRequestMoreChunks, type DataChannelLike, type PeerConnectionLike, type SdpCapablePeerConnection, type SignalingRelay } from '../src/index';
+import { AdaptiveCongestionController, DataChannelWrapper, PeerConnectionWrapper, SignalingBridge, WebRTCTransport, clampDataChannelChunkSize, shouldRequestMoreChunks, RELAY_TRANSFER_TUNING_PROFILE, type DataChannelLike, type PeerConnectionLike, type SdpCapablePeerConnection, type SignalingRelay } from '../src/index';
 import type { PeerId } from '@ponswarp/core';
 
 class FakeDataChannel extends EventTarget implements DataChannelLike {
@@ -64,9 +64,31 @@ class RejectingSdpPeerConnection extends FakePeerConnection implements SdpCapabl
 }
 
 describe('PonsWarp backpressure extraction', () => {
-  it('keeps chunk sizes within SCTP-safe bounds', () => {
-    expect(clampDataChannelChunkSize(1024)).toBe(16 * 1024);
-    expect(clampDataChannelChunkSize(64 * 1024, 32 * 1024)).toBe(16 * 1024);
+  it('keeps chunk sizes within SCTP-safe bounds while honoring peer maxMessageSize', () => {
+    expect(clampDataChannelChunkSize(1024)).toBe(1024);
+    expect(clampDataChannelChunkSize(64 * 1024, 32 * 1024)).toBe(32 * 1024);
+    expect(clampDataChannelChunkSize(64 * 1024)).toBe(64 * 1024);
+    expect(clampDataChannelChunkSize(512 * 1024, 1024 * 1024)).toBe(256 * 1024);
+    expect(clampDataChannelChunkSize(8 * 1024)).toBe(8 * 1024);
+  });
+
+  it('selects path-aware in-flight targets from ICE diagnostics', async () => {
+    const { selectTransferTuningProfile, selectInFlightTargetBytes, calculateSendBudget, flowControlProfileFromTuning } = await import('../src/index');
+    const relay = selectTransferTuningProfile({ candidatePathKind: 'relay' });
+    expect(relay.pathKind).toBe('relay');
+    expect(relay.maxInFlightBytes).toBeLessThan(selectTransferTuningProfile({ candidatePathKind: 'host' }).maxInFlightBytes);
+    const bdpTarget = selectInFlightTargetBytes(relay, {
+      candidatePathKind: 'relay',
+      availableOutgoingBitrateBps: 8_000_000,
+      rttMs: 80
+    });
+    expect(bdpTarget).toBeGreaterThanOrEqual(relay.minInFlightBytes);
+    expect(bdpTarget).toBeLessThanOrEqual(relay.maxInFlightBytes);
+    expect(calculateSendBudget({ targetInFlightBytes: 1_000_000, bufferedAmountBytes: 250_000 })).toBe(750_000);
+    expect(calculateSendBudget({ targetInFlightBytes: 1_000_000, bufferedAmountBytes: 0, paused: true })).toBe(0);
+    const flow = flowControlProfileFromTuning(relay);
+    expect(flow.highWaterMark).toBe(relay.maxInFlightBytes);
+    expect(flow.lowWaterMark).toBe(relay.lowWaterBytes);
   });
 
   it('requests more chunks only when active peers can accept data', () => {
@@ -338,5 +360,33 @@ describe('PonsWarp backpressure extraction', () => {
 
     await expect(send).rejects.toThrow(/errored/);
     expect(channel.sent).toEqual([]);
+  });
+});
+
+describe("AdaptiveCongestionController", () => {
+  it("multiplicative decrease when buffer exceeds cwnd and additive increase when clear", () => {
+    const ctl = new AdaptiveCongestionController(RELAY_TRANSFER_TUNING_PROFILE);
+    ctl.start();
+    const initial = ctl.getSnapshot().cwndBytes;
+    ctl.updateFromCandidateStats({ rttMs: 20 });
+    // force congestion via huge buffer
+    const afterDrop = ctl.updateBufferState(initial * 2);
+    expect(afterDrop.cwndBytes).toBeLessThanOrEqual(Math.floor(initial * 0.7) + 1);
+    // wait tick
+    const t0 = Date.now();
+    while (Date.now() - t0 < 110) { /* spin */ }
+    ctl.updateFromCandidateStats({ rttMs: 15 });
+    const afterInc = ctl.updateBufferState(0);
+    expect(afterInc.cwndBytes).toBeGreaterThanOrEqual(afterDrop.cwndBytes);
+    expect(afterInc.recommendedBatchChunks).toBeGreaterThanOrEqual(1);
+  });
+
+  it("ignores invalid rtt samples", () => {
+    const ctl = new AdaptiveCongestionController();
+    ctl.start();
+    ctl.updateFromCandidateStats({ rttMs: 0 });
+    ctl.updateFromCandidateStats({ rttMs: -1 });
+    ctl.updateFromCandidateStats({ rttMs: 50 });
+    expect(ctl.getSnapshot().estimatedRttMs).toBe(50);
   });
 });
