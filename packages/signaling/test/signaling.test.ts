@@ -347,27 +347,55 @@ describe('SignalingGateway server runtime', () => {
     }
   });
 
-  it('returns structured not-implemented responses for unsupported coordinator share routes', async () => {
+  it('registers and resolves browser share codes to signaling sessions', async () => {
     const runtime = createSignalingHttpServer({ config: { host: '127.0.0.1', port: 0, publicBaseUrl: 'http://localhost:5173', heartbeatIntervalMs: 1000 } });
     await runtime.listen();
     try {
       const address = runtime.server.address();
       if (!address || typeof address !== 'object') throw new Error('server address unavailable');
-      const cases = [
-        { method: 'POST', path: '/api/grid/v1/workspaces/demo/shares', body: { fileId: 'file_1' } },
-        { method: 'GET', path: '/api/grid/v1/shares/ABCD-1234' },
-        { method: 'GET', path: '/api/grid/v1/shares/ABCD-1234/candidates' }
-      ];
+      const base = `http://127.0.0.1:${address.port}`;
 
-      for (const route of cases) {
-        const response = await fetch(`http://127.0.0.1:${address.port}${route.path}`, {
-          method: route.method,
-          headers: route.body ? { 'content-type': 'application/json' } : undefined,
-          body: route.body ? JSON.stringify(route.body) : undefined
-        });
-        expect(response.status).toBe(501);
-        expect(await response.json()).toMatchObject({ error: 'not_implemented' });
-      }
+      const publish = await fetch(`${base}/api/grid/v1/workspaces/browser/files`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ fileId: 'file_1', name: 'demo.bin', sizeBytes: 9, pieceSize: 4, pieceCount: 3, nodeId: 'owner_1' })
+      });
+      expect(publish.status).toBe(200);
+
+      const share = await fetch(`${base}/api/grid/v1/workspaces/browser/shares`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          fileId: 'file_1',
+          fileName: 'demo.bin',
+          sizeBytes: 9,
+          createdByNodeId: 'owner_1',
+          ttlSeconds: 3600,
+          requestedCode: 'ABCD1234',
+          capabilities: {
+            browser: true,
+            signalingSessionId: 'sess_signal_1',
+            joinUrl: 'http://localhost:5173/#/join/sess_signal_1',
+            pieceSize: 4
+          }
+        })
+      });
+      expect(share.status).toBe(200);
+      const shareBody = await share.json() as { code: string; signalingSessionId: string };
+      expect(shareBody.code).toBe('ABCD1234');
+      expect(shareBody.signalingSessionId).toBe('sess_signal_1');
+
+      const resolved = await fetch(`${base}/api/grid/v1/shares/ABCD1234`);
+      expect(resolved.status).toBe(200);
+      expect(await resolved.json()).toMatchObject({
+        code: 'ABCD1234',
+        signalingSessionId: 'sess_signal_1',
+        name: 'demo.bin',
+        sizeBytes: 9
+      });
+
+      const missing = await fetch(`${base}/api/grid/v1/shares/ZZZZZZZZ`);
+      expect(missing.status).toBe(404);
     } finally {
       await runtime.close();
     }

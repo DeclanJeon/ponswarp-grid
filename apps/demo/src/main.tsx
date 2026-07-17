@@ -213,6 +213,9 @@ async function registerCoordinatorBrowserShare(input: { code: string; sessionId:
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         fileId: input.manifest.fileId,
+        fileName: input.manifest.name,
+        sizeBytes: input.manifest.size,
+        pieceCount: input.manifest.pieceCount,
         createdByNodeId: input.ownerPeerId,
         ttlSeconds: 24 * 60 * 60,
         requestedCode: input.code,
@@ -221,14 +224,22 @@ async function registerCoordinatorBrowserShare(input: { code: string; sessionId:
           directTransfer: true,
           signalingSessionId: input.sessionId,
           joinUrl: currentJoinUrl(input.sessionId),
-          pieceSize: input.manifest.pieceSize
+          pieceSize: input.manifest.pieceSize,
+          fileName: input.manifest.name,
+          sizeBytes: input.manifest.size
         }
       })
     });
     if (!response.ok) return null;
     const share = await response.json() as { code?: string; link?: string; getUrl?: string };
     const code = typeof share.code === 'string' ? share.code : input.code;
-    const link = typeof share.link === 'string' ? share.link : typeof share.getUrl === 'string' ? share.getUrl : `${location.origin}${location.pathname}${location.search}#/get/${encodeURIComponent(code)}`;
+    // Always embed session so receivers work even if share registry lookup fails.
+    const fallback = currentGetUrl(code, input.sessionId);
+    const link = typeof share.link === 'string' && share.link.includes('session=')
+      ? share.link
+      : typeof share.getUrl === 'string' && share.getUrl.includes('session=')
+        ? share.getUrl
+        : fallback;
     return { code, link };
   } catch {
     return null;
@@ -420,8 +431,8 @@ function App() {
     if (!match?.[1]) return;
     const full = `${location.origin}${location.pathname}${location.search}${location.hash}`;
     setWebGet({ status: 'idle', input: full });
-    // Code/QR/link path: resolve and enter socket room immediately.
-    window.setTimeout(() => { void resolveWebGetInput(); }, 250);
+    // Pass explicit input — setState is async and resolve must not read stale webGet.
+    window.setTimeout(() => { void resolveWebGetInput(full); }, 250);
   }, []);
   useEffect(() => {
     const match = location.hash.match(/^#\/join\/(.+)$/);
@@ -608,7 +619,9 @@ function App() {
       const coordinatorShare = await registerCoordinatorBrowserShare({ code: localCode, sessionId, ownerPeerId, manifest });
       if (!isCurrentRuntime(runtime)) { await disposeOwnerRuntime(runtime); return; }
       const code = coordinatorShare?.code ?? localCode;
-      const link = coordinatorShare?.link ?? currentGetUrl(code, sessionId);
+      const link = (coordinatorShare?.link && coordinatorShare.link.includes(sessionId))
+        ? coordinatorShare.link
+        : currentGetUrl(code, sessionId);
       const qrDataUrl = await createQrDataUrl(link);
       if (!isCurrentRuntime(runtime)) { await disposeOwnerRuntime(runtime); return; }
       webShareFile.current = primary;
@@ -636,8 +649,8 @@ function App() {
     }
   }
 
-  async function resolveWebGetInput(): Promise<void> {
-    const input = webGet.status === 'idle' || webGet.status === 'resolving' || webGet.status === 'error' ? webGet.input : webGet.code;
+  async function resolveWebGetInput(inputOverride?: string): Promise<void> {
+    const input = (inputOverride ?? (webGet.status === 'idle' || webGet.status === 'resolving' || webGet.status === 'error' ? webGet.input : webGet.code)).trim();
     const code = parseShareCode(input);
     const embeddedSessionId = parseEmbeddedSessionId(input);
     if (!code && !embeddedSessionId) {
@@ -691,8 +704,8 @@ function App() {
       status: 'error',
       input,
       code: 'sender_unreachable',
-      message: 'Could not start a browser download for this code.',
-      suggestedAction: 'Confirm the sender tab is still open and the code is correct. Same-network devices should connect automatically; try pasting the full link from the sender.'
+      message: 'Could not resolve this code to an active transfer room.',
+      suggestedAction: 'Use the full link from the sender (includes session=), keep the sender tab open, and confirm the share was created after the latest update.'
     });
   }
 

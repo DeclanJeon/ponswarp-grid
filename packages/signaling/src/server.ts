@@ -285,15 +285,105 @@ export class SignalingGateway {
 export interface SignalingHttpServer {
   server: HttpServer;
   gateway: SignalingGateway;
+  shareRegistry: BrowserShareRegistry;
   listen(): Promise<void>;
   close(): Promise<void>;
 }
 
-export function createSignalingHttpServer(input: { config?: Partial<SignalingServerConfig>; roomManager?: RoomManager } = {}): SignalingHttpServer {
+/** In-memory browser share codes → signaling session (code/QR receive path). */
+export type BrowserShareRecord = {
+  code: string;
+  sessionId: SessionId;
+  fileId: string;
+  fileName: string;
+  sizeBytes: number;
+  pieceSize: number;
+  pieceCount: number;
+  ownerPeerId: PeerId;
+  joinUrl: string;
+  expiresAt: number;
+  createdAt: number;
+};
+
+export class BrowserShareRegistry {
+  private readonly byCode = new Map<string, BrowserShareRecord>();
+
+  constructor(private readonly now: () => number = () => Date.now()) {}
+
+  normalizeCode(code: string): string {
+    return code.toUpperCase().replace(/[^A-Z0-9]/g, '');
+  }
+
+  put(input: {
+    code: string;
+    sessionId: SessionId;
+    fileId: string;
+    fileName: string;
+    sizeBytes: number;
+    pieceSize: number;
+    pieceCount: number;
+    ownerPeerId: PeerId;
+    joinUrl: string;
+    ttlMs: number;
+  }): BrowserShareRecord {
+    this.cleanup();
+    const code = this.normalizeCode(input.code);
+    if (code.length < 6) throw new Error('Share code too short');
+    const createdAt = this.now();
+    const record: BrowserShareRecord = {
+      code,
+      sessionId: input.sessionId,
+      fileId: input.fileId,
+      fileName: input.fileName,
+      sizeBytes: input.sizeBytes,
+      pieceSize: input.pieceSize,
+      pieceCount: input.pieceCount,
+      ownerPeerId: input.ownerPeerId,
+      joinUrl: input.joinUrl,
+      createdAt,
+      expiresAt: createdAt + Math.max(60_000, input.ttlMs)
+    };
+    this.byCode.set(code, record);
+    return record;
+  }
+
+  get(code: string): BrowserShareRecord | undefined {
+    this.cleanup();
+    const normalized = this.normalizeCode(code);
+    const record = this.byCode.get(normalized);
+    if (!record) return undefined;
+    if (record.expiresAt <= this.now()) {
+      this.byCode.delete(normalized);
+      return undefined;
+    }
+    return record;
+  }
+
+  cleanup(): number {
+    const now = this.now();
+    let removed = 0;
+    for (const [code, record] of this.byCode) {
+      if (record.expiresAt <= now) {
+        this.byCode.delete(code);
+        removed += 1;
+      }
+    }
+    return removed;
+  }
+}
+
+
+export function createSignalingHttpServer(input: { config?: Partial<SignalingServerConfig>; roomManager?: RoomManager; shareRegistry?: BrowserShareRegistry } = {}): SignalingHttpServer {
   const config = { ...DEFAULT_SIGNALING_SERVER_CONFIG, ...input.config };
   const gateway = new SignalingGateway(input.roomManager ?? new RoomManager(), config);
-  const server = createServer((request, response) => handleHttpRequest(request, response, config));
-  const interval = setInterval(() => gateway.cleanupStalePeers(), config.heartbeatIntervalMs);
+  const shareRegistry = input.shareRegistry ?? new BrowserShareRegistry();
+  const server = createServer((request, response) => {
+    void handleHttpRequest(request, response, config, shareRegistry);
+  });
+  const interval = setInterval(() => {
+    gateway.cleanupStalePeers();
+    shareRegistry.cleanup();
+  }, config.heartbeatIntervalMs);
   interval.unref?.();
 
   server.on('upgrade', (request, socket) => {
@@ -329,6 +419,7 @@ export function createSignalingHttpServer(input: { config?: Partial<SignalingSer
   return {
     server,
     gateway,
+    shareRegistry,
     listen: () => new Promise((resolve, reject) => {
       server.once('error', reject);
       server.listen(config.port, config.host, () => {
@@ -343,7 +434,7 @@ export function createSignalingHttpServer(input: { config?: Partial<SignalingSer
   };
 }
 
-function handleHttpRequest(request: IncomingMessage, response: ServerResponse, config: SignalingServerConfig): void {
+async function handleHttpRequest(request: IncomingMessage, response: ServerResponse, config: SignalingServerConfig, shareRegistry: BrowserShareRegistry): Promise<void> {
   if (request.url === '/healthz') {
     writeJson(response, 200, {
       status: 'ok',
@@ -385,17 +476,137 @@ function handleHttpRequest(request: IncomingMessage, response: ServerResponse, c
     writeJson(response, 200, createIceResponse(config), { 'cache-control': 'no-cache' });
     return;
   }
-  if (request.url?.startsWith('/api/grid/v1/shares') || request.url?.startsWith('/api/grid/v1/workspaces')) {
+  const url = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`);
+  const path = url.pathname.replace(/\/+$/, '') || '/';
+
+  // Browser share registry (code → signaling session) for product receive path.
+  if (request.method === 'POST' && path === '/api/grid/v1/workspaces/browser/files') {
+    const body = await readJsonBody(request);
+    if (!body || typeof body.fileId !== 'string') {
+      writeJson(response, 400, { error: 'invalid_body', message: 'fileId required' });
+      return;
+    }
+    writeJson(response, 200, { ok: true, fileId: body.fileId, published: true });
+    return;
+  }
+
+  if (request.method === 'POST' && path === '/api/grid/v1/workspaces/browser/shares') {
+    const body = await readJsonBody(request);
+    if (!body || typeof body !== 'object') {
+      writeJson(response, 400, { error: 'invalid_body' });
+      return;
+    }
+    const caps = (body.capabilities && typeof body.capabilities === 'object') ? body.capabilities as Record<string, unknown> : {};
+    const sessionId = String(caps.signalingSessionId ?? body.signalingSessionId ?? '');
+    const joinUrl = String(caps.joinUrl ?? body.joinUrl ?? '');
+    const codeRaw = String(body.requestedCode ?? body.code ?? '');
+    const fileId = String(body.fileId ?? '');
+    const ownerPeerId = String(body.createdByNodeId ?? body.ownerPeerId ?? '');
+    if (!sessionId || !codeRaw || !fileId) {
+      writeJson(response, 400, { error: 'invalid_body', message: 'requestedCode, fileId, capabilities.signalingSessionId required' });
+      return;
+    }
+    const ttlSeconds = typeof body.ttlSeconds === 'number' && body.ttlSeconds > 0 ? body.ttlSeconds : 86_400;
+    try {
+      const record = shareRegistry.put({
+        code: codeRaw,
+        sessionId: sessionId as SessionId,
+        fileId,
+        fileName: String(body.fileName ?? caps.fileName ?? fileId),
+        sizeBytes: Number(body.sizeBytes ?? caps.sizeBytes ?? 0) || 0,
+        pieceSize: Number(caps.pieceSize ?? body.pieceSize ?? 0) || 0,
+        pieceCount: Number(body.pieceCount ?? caps.pieceCount ?? 0) || 0,
+        ownerPeerId: ownerPeerId as PeerId,
+        joinUrl: joinUrl || `${config.publicBaseUrl.replace(/\/$/, '')}/#/join/${sessionId}`,
+        ttlMs: ttlSeconds * 1000
+      });
+      const link = `${config.publicBaseUrl.replace(/\/$/, '')}/#/get/${encodeURIComponent(record.code)}?session=${encodeURIComponent(record.sessionId)}`;
+      writeJson(response, 200, {
+        code: record.code,
+        link,
+        getUrl: link,
+        fileId: record.fileId,
+        signalingSessionId: record.sessionId,
+        joinUrl: record.joinUrl,
+        expiresAt: record.expiresAt
+      });
+    } catch (error) {
+      writeJson(response, 400, { error: 'share_failed', message: error instanceof Error ? error.message : String(error) });
+    }
+    return;
+  }
+
+  if (request.method === 'GET' && path.startsWith('/api/grid/v1/shares/')) {
+    const rest = path.slice('/api/grid/v1/shares/'.length);
+    const [codePart, maybeCandidates] = rest.split('/');
+    const code = decodeURIComponent(codePart ?? '');
+    if (maybeCandidates === 'candidates') {
+      const record = shareRegistry.get(code);
+      if (!record) {
+        writeJson(response, 404, { error: 'not_found' });
+        return;
+      }
+      writeJson(response, 200, {
+        providers: [{
+          nodeId: record.ownerPeerId,
+          online: true,
+          endpointHints: [{ kind: 'ponswarp-join', value: record.joinUrl }]
+        }]
+      }, { 'cache-control': 'no-store' });
+      return;
+    }
+    const record = shareRegistry.get(code);
+    if (!record) {
+      writeJson(response, 404, { error: 'not_found' });
+      return;
+    }
+    writeJson(response, 200, {
+      code: record.code,
+      fileId: record.fileId,
+      name: record.fileName,
+      fileName: record.fileName,
+      sizeBytes: record.sizeBytes,
+      signalingSessionId: record.sessionId,
+      sessionId: record.sessionId,
+      joinUrl: record.joinUrl,
+      capabilities: {
+        browser: true,
+        directTransfer: true,
+        signalingSessionId: record.sessionId,
+        joinUrl: record.joinUrl,
+        pieceSize: record.pieceSize
+      },
+      expiresAt: record.expiresAt
+    }, { 'cache-control': 'no-store' });
+    return;
+  }
+
+  if (path.startsWith('/api/grid/v1/shares') || path.startsWith('/api/grid/v1/workspaces')) {
     writeJson(response, 501, {
       error: 'not_implemented',
       service: config.serviceName,
-      message: 'This TypeScript signaling server exposes ICE and WebSocket signaling only; production coordinator share/workspace APIs are served by the external grid coordinator.',
+      message: 'Unsupported coordinator route on the TypeScript signaling server.',
       expectedExternalService: 'ponswarp-grid-coordinator'
     });
     return;
   }
   response.writeHead(404, { 'content-type': 'application/json' });
   response.end(JSON.stringify({ error: 'not_found' }));
+}
+
+async function readJsonBody(request: IncomingMessage): Promise<Record<string, unknown> | null> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of request) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    if (chunks.reduce((n, c) => n + c.length, 0) > 1_000_000) return null;
+  }
+  if (!chunks.length) return {};
+  try {
+    const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
 }
 
 function createIceResponse(config: SignalingServerConfig): { iceServers: RTCIceServerLike[]; ttlSeconds: number; relayPolicyRecommended: boolean } {
