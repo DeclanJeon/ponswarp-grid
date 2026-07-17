@@ -4,7 +4,7 @@ import './styles.css';
 import QRCode from 'qrcode';
 import {
   MemoryStorageAdapter,
-  createBrowserStorageAdapter,
+  createBrowserStorageAdapter, DEFAULT_SAFE_ASSEMBLE_BYTES,
   PonsWarpEngine,
   type BinaryFrame,
   type FileManifest,
@@ -115,6 +115,96 @@ async function createPersistentStorage(sessionId: SessionId): Promise<{ adapter:
   const result = await createBrowserStorageAdapter({ sessionId });
   return { adapter: result.adapter, kind: result.kind, warnings: result.warnings.map(warning => `${warning.kind}:${warning.code}`) };
 }
+
+type FinalizedDownload = {
+  downloadUrl?: string;
+  assembledBytes: number;
+  saveMode: 'blob-url' | 'file-picker' | 'opfs-blob' | 'unsupported';
+  hint?: string;
+};
+
+async function openSaveWritable(suggestedName: string): Promise<WritableStream<Uint8Array> | null> {
+  const picker = (globalThis as typeof globalThis & {
+    showSaveFilePicker?: (options?: {
+      suggestedName?: string;
+      types?: Array<{ description?: string; accept: Record<string, string[]> }>;
+    }) => Promise<{ createWritable: () => Promise<WritableStream<Uint8Array>> }>;
+  }).showSaveFilePicker;
+  if (typeof picker !== 'function') return null;
+  try {
+    const handle = await picker({
+      suggestedName,
+      types: [{ description: 'Received file', accept: { 'application/octet-stream': ['.*'] } }]
+    });
+    return await handle.createWritable();
+  } catch (error) {
+    // User cancel should not fail the transfer; fall through to other sinks.
+    if (error instanceof DOMException && (error.name === 'AbortError' || error.name === 'NotAllowedError')) return null;
+    throw error;
+  }
+}
+
+/**
+ * Finalize a completed transfer without forcing a single giant in-RAM assembly path.
+ * Order: File System Access stream → saveAssembledFile (OPFS stream / piece stream) → small Blob URL only under threshold.
+ */
+async function finalizeReceivedDownload(input: {
+  storage: StorageAdapter;
+  fileId: FileManifest['fileId'];
+  manifest: FileManifest;
+  preferPicker?: boolean;
+}): Promise<FinalizedDownload> {
+  const { storage, fileId, manifest } = input;
+  const large = manifest.size > DEFAULT_SAFE_ASSEMBLE_BYTES;
+
+  if (input.preferPicker !== false) {
+    const sink = await openSaveWritable(manifest.name || 'download.bin');
+    if (sink) {
+      const result = await storage.saveAssembledFile(fileId, manifest, sink);
+      if (result.type === 'stream' || result.type === 'blob') {
+        return {
+          assembledBytes: result.bytes,
+          saveMode: 'file-picker',
+          hint: 'Saved via browser file picker (streamed; no full in-memory reassembly).'
+        };
+      }
+    }
+  }
+
+  const saved = await storage.saveAssembledFile(fileId, manifest);
+  if (saved.type === 'blob') {
+    const downloadUrl = URL.createObjectURL(saved.blob);
+    return {
+      downloadUrl,
+      assembledBytes: saved.bytes,
+      saveMode: large ? 'opfs-blob' : 'blob-url',
+      hint: large
+        ? 'Large file assembled via streaming storage path. Use Save if the browser keeps the blob in OPFS/backing store.'
+        : undefined
+    };
+  }
+  if (saved.type === 'stream') {
+    return { assembledBytes: saved.bytes, saveMode: 'file-picker', hint: 'Streamed to sink.' };
+  }
+
+  // Last resort: piece stream into Blob (may be memory-heavy; only if save path unsupported).
+  if (large) {
+    const sink = await openSaveWritable(manifest.name || 'download.bin');
+    if (sink) {
+      await storage.createReadablePieceStream(fileId, manifest).pipeTo(sink);
+      return {
+        assembledBytes: manifest.size,
+        saveMode: 'file-picker',
+        hint: 'Saved via streamed piece export.'
+      };
+    }
+    throw new Error(`${saved.reason || 'Unable to export large file'}. Use a Chromium browser with the File System Access API, or enable OPFS storage.`);
+  }
+
+  const blob = await storage.assembleFile(fileId, manifest);
+  return { downloadUrl: URL.createObjectURL(blob), assembledBytes: blob.size, saveMode: 'blob-url' };
+}
+
 function signalingUrl(): string {
   const explicit = new URLSearchParams(location.search).get('signal');
   if (explicit) return explicit;
@@ -1048,9 +1138,9 @@ function App() {
       restoredReceiver = new PonsWarpEngine(storageResult.adapter);
       await restoredReceiver.joinSession(sessionId);
       const restoredProgress = restoredReceiver.getProgress(manifest.fileId);
-      const saveResult = await storageResult.adapter.saveAssembledFile(manifest.fileId, manifest);
-      const savedBytes = saveResult.type === 'unsupported' ? manifest.size : saveResult.bytes;
-      const downloadUrl = saveResult.type === 'blob' ? URL.createObjectURL(saveResult.blob) : undefined;
+      const finalized = await finalizeReceivedDownload({ storage: storageResult.adapter, fileId: manifest.fileId, manifest, preferPicker: false });
+      const savedBytes = finalized.assembledBytes;
+      const downloadUrl = finalized.downloadUrl;
       setState(current => ({
         ...current,
         status: 'complete',
@@ -1064,7 +1154,7 @@ function App() {
         assembledBytes: savedBytes,
         logs: [
           ...current.logs,
-          `${label}: final save result ${saveResult.type} (${savedBytes} bytes).`,
+          `${label}: final save result ${savedBytes} bytes.`,
           `${label}: browser transfer + reload resume QA complete.`
         ]
       }));
@@ -1414,7 +1504,9 @@ function App() {
       // joinSession may already have run in SESSION_JOINED; safe to re-join with same manifest.
       await runtime.engine.joinSession(runtime.sessionId, [manifest]);
       let progress = runtime.engine.getProgress(manifest.fileId);
-      const transferWindow = await transferWindowSize();
+      const configuredWindow = await transferWindowSize();
+      // Large files need a bit more pipeline; still capped for browser stability.
+      const transferWindow = manifest.size > 64 * 1024 * 1024 ? Math.max(configuredWindow, 4) : configuredWindow;
       controller.beginTransferMetrics();
       const ownerPc = runtime.peerConnections.get(runtime.ownerPeerId);
       const rtcStart = ownerPc ? await readRtcSnapshot(ownerPc) : { bytes: 0 };
@@ -1490,15 +1582,19 @@ function App() {
         await restoredReceiver.joinSession(runtime.sessionId);
         const restoredProgress = restoredReceiver.getProgress(manifest.fileId);
         if (restoredProgress.verifiedPieces !== restoredProgress.totalPieces) throw new Error(`Cannot assemble incomplete file: ${restoredProgress.verifiedPieces}/${restoredProgress.totalPieces} pieces verified`);
-        const assembledFile = await runtime.storage.assembleFile(manifest.fileId, manifest);
-        const downloadUrl = URL.createObjectURL(assembledFile);
-        transferDownloadUrl = downloadUrl;
+        const finalized = await finalizeReceivedDownload({ storage: runtime.storage, fileId: manifest.fileId, manifest, preferPicker: true });
+        transferDownloadUrl = finalized.downloadUrl;
+        if (finalized.downloadUrl) {
+          if (webDownloadUrl.current) URL.revokeObjectURL(webDownloadUrl.current);
+          webDownloadUrl.current = finalized.downloadUrl;
+        }
         controller.recordResumeValidation(restoredProgress.verifiedPieces, 0, 'passed');
         await recordRtcMetrics(ownerPc, controller, manifest.size, transferWindow, rtcStart.bytes);
         await controller.dispose('succeeded');
         exposeTransferMetrics(controller);
-        setState(current => ({ ...current, status: 'complete', manifest, progress, restoredProgress, downloadUrl, assembledBytes: assembledFile.size, storageKind: storageKinds.current.get(runtime.sessionId), shareUrl: currentJoinUrl(runtime.sessionId), logs: [...current.logs, `Room transfer complete; assembled ${assembledFile.size} bytes.`] }));
-        setWebGet({ status: 'complete', code: runtime.sessionId.slice(0, 8).toUpperCase(), outputName: manifest.name, verificationLabel: 'fully verified', downloadUrl });
+        const sizeLabel = formatBytes(finalized.assembledBytes);
+        setState(current => ({ ...current, status: 'complete', manifest, progress, restoredProgress, downloadUrl: finalized.downloadUrl, assembledBytes: finalized.assembledBytes, storageKind: storageKinds.current.get(runtime.sessionId), shareUrl: currentJoinUrl(runtime.sessionId), logs: [...current.logs, `Room transfer complete; ${sizeLabel} via ${finalized.saveMode}.`, ...(finalized.hint ? [finalized.hint] : [])] }));
+        setWebGet({ status: 'complete', code: runtime.sessionId.slice(0, 8).toUpperCase(), outputName: manifest.name, verificationLabel: 'fully verified', downloadUrl: finalized.downloadUrl });
         setWebShare(current => current.status === 'serving' ? { ...current, downloads: current.downloads + 1 } : current);
       } finally {
         await restoredReceiver.dispose().catch(() => undefined);
@@ -1541,8 +1637,18 @@ function App() {
       const restored = await engine.resumeFile(manifest.fileId);
       setState(current => ({ ...current, status: 'resuming_transfer', logs: [...current.logs, 'Re-hashing verified pieces before trusting resume state.'] }));
       const progress = engine.getProgress(manifest.fileId);
-      const assembledFile = progress.verifiedPieces === progress.totalPieces ? await storageResult.adapter.assembleFile(manifest.fileId, manifest) : undefined;
-      const downloadUrl = assembledFile ? URL.createObjectURL(assembledFile) : undefined;
+      let downloadUrl: string | undefined;
+      let assembledBytes: number | undefined;
+      if (progress.verifiedPieces === progress.totalPieces) {
+        const finalized = await finalizeReceivedDownload({ storage: storageResult.adapter, fileId: manifest.fileId, manifest, preferPicker: false });
+        downloadUrl = finalized.downloadUrl;
+        assembledBytes = finalized.assembledBytes;
+        if (downloadUrl) {
+          if (webDownloadUrl.current) URL.revokeObjectURL(webDownloadUrl.current);
+          webDownloadUrl.current = downloadUrl;
+        }
+        pushLog(`Restored complete file (${formatBytes(finalized.assembledBytes)}) via ${finalized.saveMode}.`);
+      }
       setState(current => ({
         ...current,
         status: progress.verifiedPieces === progress.totalPieces ? 'complete' : 'ready',
@@ -1551,7 +1657,7 @@ function App() {
         progress,
         restoredProgress: progress,
         downloadUrl,
-        assembledBytes: assembledFile?.size,
+        assembledBytes,
         storageKind: storageResult.kind,
         shareUrl: currentJoinUrl(sessionId),
         logs: [
@@ -1768,7 +1874,7 @@ function App() {
                 <p>{webGet.progress}% · {formatBytes(webGet.speedBps)}/s · {webGet.securityLabel}</p>
               </div>
             )}
-            {webGet.status === 'complete' && <p role="status" className="status-card"><strong>Complete:</strong> {webGet.outputName} · {webGet.verificationLabel}{webGet.downloadUrl ? <> · <a href={webGet.downloadUrl} download={webGet.outputName}>Save file</a></> : null}</p>}
+            {webGet.status === 'complete' && <p role="status" className="status-card"><strong>Complete:</strong> {webGet.outputName} · {webGet.verificationLabel}{webGet.downloadUrl ? <> · <a href={webGet.downloadUrl} download={webGet.outputName}>Save file</a></> : <> · saved via file picker / stream</>}</p>}
             {webGet.status === 'error' && <p role="alert" className="error-text">{webGet.message}</p>}
           </section>
         </div>

@@ -307,7 +307,8 @@ describe('core engine foundations', () => {
     };
     await storage.writePiece(fileId, 0, new Uint8Array([1]).buffer);
     await expect(storage.assembleFile(fileId, manifest)).rejects.toMatchObject({ code: 'storage:assembly_too_large' });
-    await expect(storage.saveAssembledFile(fileId, manifest)).resolves.toMatchObject({ type: 'unsupported' });
+    // Without a sink, large files still export via piece stream (not multi-GB simultaneous RAM assemble API).
+    await expect(storage.saveAssembledFile(fileId, manifest)).resolves.toMatchObject({ type: 'blob', bytes: 1 });
     const streamed: number[] = [];
     const sink = new WritableStream<Uint8Array>({ write(chunk) { streamed.push(...chunk); } });
     await expect(storage.saveAssembledFile(fileId, manifest, sink)).resolves.toMatchObject({ type: 'stream', bytes: manifest.size });

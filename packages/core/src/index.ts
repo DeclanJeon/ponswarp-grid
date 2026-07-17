@@ -2157,7 +2157,7 @@ export type SaveFileResult =
   | { type: 'stream'; bytes: number }
   | { type: 'unsupported'; reason: string };
 
-const DEFAULT_SAFE_ASSEMBLE_BYTES = 256 * 1024 * 1024;
+export const DEFAULT_SAFE_ASSEMBLE_BYTES = 256 * 1024 * 1024;
 
 export type StorageKind = 'opfs' | 'indexeddb' | 'memory';
 export type StoragePersistence = 'persistent' | 'best_effort' | 'memory_only';
@@ -2339,7 +2339,24 @@ export class OPFSStorageAdapter implements StorageAdapter {
   }
 
   async saveAssembledFile(fileId: FileId, manifest: FileManifest, sink?: WritableStream<Uint8Array>): Promise<SaveFileResult> {
-    return saveAssembledFileFromStorage(this, fileId, manifest, sink);
+    if (sink) {
+      await this.createReadablePieceStream(fileId, manifest).pipeTo(sink);
+      return { type: 'stream', bytes: manifest.size };
+    }
+    // Stream pieces into a single OPFS file so large downloads never re-buffer every piece into a giant in-memory Blob graph.
+    const root = this.requireRoot();
+    const assembledRoot = await root.getDirectoryHandle('assembled', { create: true });
+    const safeId = fileId.replace(/[^A-Za-z0-9._-]+/g, '_');
+    const handle = await assembledRoot.getFileHandle(`${safeId}.bin`, { create: true });
+    const writable = await handle.createWritable();
+    try {
+      await this.createReadablePieceStream(fileId, manifest).pipeTo(writable);
+    } catch (error) {
+      try { await writable.abort(); } catch { /* ignore */ }
+      throw error;
+    }
+    const file = await handle.getFile();
+    return { type: 'blob', blob: file, bytes: file.size };
   }
   async cleanup(sessionId: SessionId): Promise<void> {
     if (!globalThis.navigator?.storage?.getDirectory) return;
@@ -2657,9 +2674,30 @@ async function saveAssembledFileFromStorage(storage: StorageAdapter, fileId: Fil
     await storage.createReadablePieceStream(fileId, manifest).pipeTo(sink);
     return { type: 'stream', bytes: manifest.size };
   }
-  if (manifest.size > DEFAULT_SAFE_ASSEMBLE_BYTES) return { type: 'unsupported', reason: 'file exceeds safe Blob assembly threshold' };
-  const blob = await storage.assembleFile(fileId, manifest);
+  if (manifest.size <= DEFAULT_SAFE_ASSEMBLE_BYTES) {
+    const blob = await storage.assembleFile(fileId, manifest);
+    return { type: 'blob', blob, bytes: blob.size };
+  }
+  // Large files: stream piece-by-piece into Blob parts (one piece resident at a time from storage).
+  // Prefer OPFS adapter override or a WritableStream sink (File System Access) when available.
+  const blob = await assembleBlobFromPieceStream(storage, fileId, manifest);
   return { type: 'blob', blob, bytes: blob.size };
+}
+
+async function assembleBlobFromPieceStream(storage: Pick<StorageAdapter, 'createReadablePieceStream'>, fileId: FileId, manifest: FileManifest): Promise<Blob> {
+  const parts: BlobPart[] = [];
+  const reader = storage.createReadablePieceStream(fileId, manifest).getReader();
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      // Copy so the ReadableStream can release its underlying buffer.
+      parts.push(value.slice().buffer);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return new Blob(parts, { type: manifest.mimeType || 'application/octet-stream' });
 }
 function assertSafeNonNegativeInteger(value: number, name: string): void {
   if (!Number.isSafeInteger(value) || value < 0) {
