@@ -62,6 +62,8 @@ type OwnerRuntime = {
   transport: WebRTCTransport;
   engine: PonsWarpEngine;
   peerConnections: Map<PeerId, RTCPeerConnection>;
+  /** Live room members including owner (signaling-visible). */
+  roomPeerIds: Set<PeerId>;
 };
 
 type ReceiverRuntime = {
@@ -73,10 +75,13 @@ type ReceiverRuntime = {
   transport: WebRTCTransport;
   engine: PonsWarpEngine;
   storage: StorageAdapter;
-  pc?: RTCPeerConnection;
-  pendingIce: RTCIceCandidateInit[];
+  /** All mesh peer connections keyed by remote peerId. */
+  peerConnections: Map<PeerId, RTCPeerConnection>;
+  pendingIce: Map<PeerId, RTCIceCandidateInit[]>;
+  roomPeerIds: Set<PeerId>;
   manifest?: FileManifest;
   completed: boolean;
+  transferAbort?: AbortController;
 };
 
 function namedBlob(text: string, name: string, type = 'text/plain'): Blob & { name: string; type: string } { const blob = new Blob([text], { type }) as Blob & { name: string; type: string }; Object.defineProperty(blob, 'name', { value: name }); return blob; }
@@ -376,9 +381,11 @@ function App() {
   async function disposeReceiverRuntime(runtime: ReceiverRuntime | null): Promise<void> {
     if (!runtime) return;
     if (receiverRuntime.current === runtime) receiverRuntime.current = null;
+    runtime.transferAbort?.abort();
     await runtime.client.close().catch(() => undefined);
-    runtime.pc?.close();
-    runtime.pc = undefined;
+    for (const pc of runtime.peerConnections.values()) pc.close();
+    runtime.peerConnections.clear();
+    runtime.pendingIce.clear();
     await runtime.engine.dispose().catch(() => undefined);
     await runtime.transport.close().catch(() => undefined);
   }
@@ -410,14 +417,21 @@ function App() {
   }, []);
   useEffect(() => {
     const match = location.hash.match(/^#\/get\/(.+)$/);
-    if (match?.[1]) setWebGet({ status: 'idle', input: `${location.origin}${location.pathname}${location.search}${location.hash}` });
+    if (!match?.[1]) return;
+    const full = `${location.origin}${location.pathname}${location.search}${location.hash}`;
+    setWebGet({ status: 'idle', input: full });
+    // Code/QR/link path: resolve and enter socket room immediately.
+    window.setTimeout(() => { void resolveWebGetInput(); }, 250);
   }, []);
   useEffect(() => {
     const match = location.hash.match(/^#\/join\/(.+)$/);
     const sessionId = match?.[1] as SessionId | undefined;
     if (!sessionId || autoJoinedSession.current === sessionId) return;
     autoJoinedSession.current = sessionId;
-    window.setTimeout(() => { void joinSignaledReceiver(); }, 250);
+    window.setTimeout(() => {
+      setWebGet({ status: 'downloading', code: sessionId.slice(0, 8).toUpperCase(), fileName: 'Shared file', progress: 0, speedBps: 0, securityLabel: 'Joining transfer room…' });
+      void joinSignaledReceiver(sessionId);
+    }, 250);
   }, []);
   const pushLog = (entry: string) => setState(current => ({ ...current, logs: [...current.logs, entry] }));
 
@@ -509,7 +523,7 @@ function App() {
       }
       const manifest = session.manifests[0];
       const client = new BrowserSignalingClient({ url: signalingUrl() });
-      runtime = { generation, peerId: ownerPeerId, sessionId, client, transport, engine, peerConnections: new Map() };
+      runtime = { generation, peerId: ownerPeerId, sessionId, client, transport, engine, peerConnections: new Map(), roomPeerIds: new Set([ownerPeerId]) };
       ownerRuntime.current = runtime;
       client.onMessage(envelope => {
         void handleOwnerSignal(runtime!, envelope).catch(error => {
@@ -521,7 +535,8 @@ function App() {
       await client.connect();
       if (!isCurrentRuntime(runtime)) { await disposeOwnerRuntime(runtime); return; }
       pushLog(`ICE servers loaded: ${ice.iceServers?.length ?? 0}.`);
-      client.createSession({ ownerPeerId, files: [manifest], sessionId, mode: 'direct' });
+      // Room is always a mesh session; receiver picks direct vs grid by room size.
+      client.createSession({ ownerPeerId, files: [manifest], sessionId, mode: 'grid' });
       const localCode = createShareCode();
       const coordinatorShare = await registerCoordinatorBrowserShare({ code: localCode, sessionId, ownerPeerId, manifest });
       if (!isCurrentRuntime(runtime)) { await disposeOwnerRuntime(runtime); return; }
@@ -1022,7 +1037,7 @@ function App() {
       }
       const manifest = session.manifests[0];
       const client = new BrowserSignalingClient({ url: signalingUrl() });
-      runtime = { generation, peerId: ownerPeerId, sessionId, client, transport, engine, peerConnections: new Map() };
+      runtime = { generation, peerId: ownerPeerId, sessionId, client, transport, engine, peerConnections: new Map(), roomPeerIds: new Set([ownerPeerId]) };
       ownerRuntime.current = runtime;
       client.onMessage(envelope => {
         void handleOwnerSignal(runtime!, envelope).catch(error => {
@@ -1034,7 +1049,8 @@ function App() {
       await client.connect();
       if (!isCurrentRuntime(runtime)) { await disposeOwnerRuntime(runtime); return; }
       pushLog(`ICE servers loaded: ${ice.iceServers?.length ?? 0}.`);
-      client.createSession({ ownerPeerId, files: [manifest], sessionId, mode: 'direct' });
+      // Room is always a mesh session; receiver picks direct vs grid by room size.
+      client.createSession({ ownerPeerId, files: [manifest], sessionId, mode: 'grid' });
       const shareUrl = currentJoinUrl(sessionId);
       const shareQrDataUrl = await createQrDataUrl(shareUrl);
       if (!isCurrentRuntime(runtime)) { await disposeOwnerRuntime(runtime); return; }
@@ -1072,7 +1088,20 @@ function App() {
       const storage = storageResult.adapter;
       engine = new PonsWarpEngine(storage, undefined, undefined, undefined, transport);
       const client = new BrowserSignalingClient({ url: signalingUrl() });
-      runtime = { generation, peerId, sessionId, client, transport, engine, storage, pendingIce: [], completed: false };
+      runtime = {
+        generation,
+        peerId,
+        sessionId,
+        client,
+        transport,
+        engine,
+        storage,
+        peerConnections: new Map(),
+        pendingIce: new Map(),
+        roomPeerIds: new Set([peerId]),
+        completed: false,
+        transferAbort: new AbortController()
+      };
       receiverRuntime.current = runtime;
       client.onMessage(envelope => {
         void handleReceiverSignal(runtime!, envelope).catch(error => {
@@ -1083,7 +1112,7 @@ function App() {
       client.onError(error => { if (isCurrentRuntime(runtime!)) pushLog(`Receiver signaling error: ${error.message}`); });
       await client.connect();
       if (!isCurrentRuntime(runtime)) { await disposeReceiverRuntime(runtime); return; }
-      pushLog(`ICE servers loaded: ${ice.iceServers?.length ?? 0}.`);
+      pushLog(`ICE servers loaded: ${ice.iceServers?.length ?? 0}. Joining socket room ${sessionId}.`);
       client.joinSession({ sessionId, peerId });
     } catch (error) {
       await (runtime ? disposeReceiverRuntime(runtime) : Promise.all([engine?.dispose().catch(() => undefined), transport?.close().catch(() => undefined)]));
@@ -1101,7 +1130,34 @@ function App() {
       setState(current => ({ ...current, status: 'error', error: message, logs: [...current.logs, `Sender signaling error: ${message}`] }));
       return;
     }
-    if (envelope.type === 'PEER_JOINED') { pushLog(`Peer joined: ${(envelope.payload as { peerId: string }).peerId}`); return; }
+    if (envelope.type === 'SESSION_CREATED') {
+      runtime.roomPeerIds.add(runtime.peerId);
+      pushLog(`Socket room ready: ${runtime.sessionId}`);
+      return;
+    }
+    if (envelope.type === 'PEER_JOINED') {
+      const peerId = (envelope.payload as { peerId: PeerId }).peerId;
+      runtime.roomPeerIds.add(peerId);
+      setWebShare(current => current.status === 'serving'
+        ? { ...current, devicesOnline: Math.max(current.devicesOnline, runtime.roomPeerIds.size) }
+        : current);
+      pushLog(`Peer joined room: ${peerId} (${runtime.roomPeerIds.size} online)`);
+      return;
+    }
+    if (envelope.type === 'PEER_LEFT') {
+      const peerId = (envelope.payload as { peerId: PeerId }).peerId;
+      runtime.roomPeerIds.delete(peerId);
+      const pc = runtime.peerConnections.get(peerId);
+      if (pc) {
+        pc.close();
+        runtime.peerConnections.delete(peerId);
+      }
+      setWebShare(current => current.status === 'serving'
+        ? { ...current, devicesOnline: Math.max(1, runtime.roomPeerIds.size) }
+        : current);
+      pushLog(`Peer left room: ${peerId}`);
+      return;
+    }
     if (envelope.type === 'ICE_CANDIDATE') {
       const candidate = (envelope.payload as { candidate: RTCIceCandidateInit }).candidate;
       const pc = envelope.fromPeerId ? runtime.peerConnections.get(envelope.fromPeerId) : undefined;
@@ -1110,16 +1166,38 @@ function App() {
     }
     if (envelope.type !== 'WEBRTC_OFFER' || !envelope.fromPeerId) return;
     const receiverPeerId = envelope.fromPeerId;
+    runtime.roomPeerIds.add(receiverPeerId);
     const pc = new RTCPeerConnection(rtcConfig());
-    attachRtcDiagnostics(`Sender ${receiverPeerId}`, pc);
+    attachRtcDiagnostics(`Sender↔${receiverPeerId}`, pc);
     runtime.peerConnections.set(receiverPeerId, pc);
     runtime.transport.ensurePeer(receiverPeerId, pc);
-    pc.addEventListener('icecandidate', event => { if (event.candidate) sendIce(runtime.client, runtime.sessionId, runtime.peerId, receiverPeerId, event.candidate.toJSON()); });
+    pc.addEventListener('icecandidate', event => {
+      if (event.candidate) sendIce(runtime.client, runtime.sessionId, runtime.peerId, receiverPeerId, event.candidate.toJSON());
+    });
     await pc.setRemoteDescription((envelope.payload as { sdp: RTCSessionDescriptionInit }).sdp);
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
     runtime.client.sendRelay(makeSignal('WEBRTC_ANSWER', runtime.sessionId, runtime.peerId, receiverPeerId, { sdp: answer }));
     pushLog(`Answered WebRTC offer from ${receiverPeerId}.`);
+  }
+
+  async function ensureMeshPeerConnection(runtime: ReceiverRuntime, remotePeerId: PeerId, createOffer: boolean): Promise<RTCPeerConnection> {
+    const existing = runtime.peerConnections.get(remotePeerId);
+    if (existing) return existing;
+    const pc = new RTCPeerConnection(rtcConfig());
+    attachRtcDiagnostics(`Receiver↔${remotePeerId}`, pc);
+    runtime.peerConnections.set(remotePeerId, pc);
+    pc.addEventListener('icecandidate', event => {
+      if (event.candidate) sendIce(runtime.client, runtime.sessionId, runtime.peerId, remotePeerId, event.candidate.toJSON());
+    });
+    const peer = runtime.transport.ensurePeer(remotePeerId, pc);
+    if (createOffer) {
+      peer.createDataChannel('ponswarp-grid/data', { ordered: true });
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      runtime.client.sendRelay(makeSignal('WEBRTC_OFFER', runtime.sessionId, runtime.peerId, remotePeerId, { sdp: offer }));
+    }
+    return pc;
   }
 
   async function handleReceiverSignal(runtime: ReceiverRuntime, envelope: SignalingEnvelope): Promise<void> {
@@ -1128,41 +1206,116 @@ function App() {
       const payload = envelope.payload as { code?: string; message?: string };
       const message = payload.message ?? payload.code ?? 'Signaling error';
       setState(current => ({ ...current, status: 'error', error: message, logs: [...current.logs, `Receiver signaling error: ${message}`] }));
+      setWebGet(current => current.status === 'downloading'
+        ? { status: 'error', input: current.code, code: 'transfer_failed', message, suggestedAction: 'Confirm the sender room is still open.' }
+        : current);
       return;
     }
-    if (envelope.type === 'ICE_CANDIDATE') {
+    if (envelope.type === 'ICE_CANDIDATE' && envelope.fromPeerId) {
       const candidate = (envelope.payload as { candidate: RTCIceCandidateInit }).candidate;
-      if (runtime.pc?.remoteDescription) await runtime.pc.addIceCandidate(candidate); else runtime.pendingIce.push(candidate);
+      const pc = runtime.peerConnections.get(envelope.fromPeerId);
+      if (pc?.remoteDescription) await pc.addIceCandidate(candidate);
+      else {
+        const queue = runtime.pendingIce.get(envelope.fromPeerId) ?? [];
+        queue.push(candidate);
+        runtime.pendingIce.set(envelope.fromPeerId, queue);
+      }
+      return;
+    }
+    if (envelope.type === 'PEER_JOINED') {
+      const peerId = (envelope.payload as { peerId: PeerId }).peerId;
+      if (peerId === runtime.peerId) return;
+      runtime.roomPeerIds.add(peerId);
+      // Deterministic mesh: lower peerId offers to higher peerId (avoid glare).
+      const shouldOffer = runtime.peerId < peerId;
+      if (shouldOffer && runtime.manifest) {
+        await ensureMeshPeerConnection(runtime, peerId, true);
+        pushLog(`Mesh offer sent to room peer ${peerId}.`);
+      }
+      return;
+    }
+    if (envelope.type === 'PEER_LEFT') {
+      const peerId = (envelope.payload as { peerId: PeerId }).peerId;
+      runtime.roomPeerIds.delete(peerId);
+      const pc = runtime.peerConnections.get(peerId);
+      if (pc) {
+        pc.close();
+        runtime.peerConnections.delete(peerId);
+      }
+      runtime.pendingIce.delete(peerId);
+      pushLog(`Room peer left: ${peerId}`);
       return;
     }
     if (envelope.type === 'SESSION_JOINED') {
-      const payload = envelope.payload as { ownerPeerId: PeerId; files: FileManifest[] };
+      const payload = envelope.payload as { ownerPeerId: PeerId; files: FileManifest[]; peers?: Array<{ peerId: PeerId }> };
       const manifest = payload.files[0];
       runtime.manifest = manifest;
       runtime.ownerPeerId = payload.ownerPeerId;
-      const pc = new RTCPeerConnection(rtcConfig());
-      attachRtcDiagnostics(`Receiver ${payload.ownerPeerId}`, pc);
-      runtime.pc = pc;
-      pc.addEventListener('icecandidate', event => { if (event.candidate && runtime.ownerPeerId) sendIce(runtime.client, runtime.sessionId, runtime.peerId, runtime.ownerPeerId, event.candidate.toJSON()); });
-      const peer = runtime.transport.ensurePeer(payload.ownerPeerId, pc);
-      peer.createDataChannel('ponswarp-grid/data', { ordered: true });
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      runtime.client.sendRelay(makeSignal('WEBRTC_OFFER', runtime.sessionId, runtime.peerId, payload.ownerPeerId, { sdp: offer }));
-      setState(current => ({ ...current, manifest, storageKind: storageKinds.current.get(runtime.sessionId), shareUrl: currentJoinUrl(runtime.sessionId), logs: [...current.logs, 'Receiver joined signaling session and sent WebRTC offer.'] }));
+      runtime.roomPeerIds.add(payload.ownerPeerId);
+      for (const peer of payload.peers ?? []) runtime.roomPeerIds.add(peer.peerId);
+      await runtime.engine.joinSession(runtime.sessionId, [manifest]);
+      // Connect to owner immediately (always offer to owner as receiver).
+      await ensureMeshPeerConnection(runtime, payload.ownerPeerId, true);
+      // Mesh with other receivers already in the room.
+      for (const peer of payload.peers ?? []) {
+        if (peer.peerId === runtime.peerId || peer.peerId === payload.ownerPeerId) continue;
+        if (runtime.peerId < peer.peerId) await ensureMeshPeerConnection(runtime, peer.peerId, true);
+      }
+      setWebGet(current => current.status === 'downloading' || current.status === 'ready'
+        ? { status: 'downloading', code: current.status === 'downloading' ? current.code : (current as { code: string }).code, fileName: manifest.name, progress: 0, speedBps: 0, securityLabel: 'Room joined — connecting peers…' }
+        : { status: 'downloading', code: runtime.sessionId.slice(0, 8).toUpperCase(), fileName: manifest.name, progress: 0, speedBps: 0, securityLabel: 'Room joined — connecting peers…' });
+      setState(current => ({ ...current, manifest, storageKind: storageKinds.current.get(runtime.sessionId), shareUrl: currentJoinUrl(runtime.sessionId), logs: [...current.logs, `Joined socket room ${runtime.sessionId}; mesh offers sent.`] }));
       return;
     }
-    if (envelope.type === 'WEBRTC_ANSWER' && runtime.ownerPeerId && runtime.pc && !runtime.completed) {
-      await runtime.pc.setRemoteDescription((envelope.payload as { sdp: RTCSessionDescriptionInit }).sdp);
-      for (const candidate of runtime.pendingIce.splice(0)) await runtime.pc.addIceCandidate(candidate);
-      await waitForTransportChannel(runtime.transport, runtime.ownerPeerId);
-      await completeReceiverTransfer(runtime);
+    if (envelope.type === 'WEBRTC_OFFER' && envelope.fromPeerId) {
+      const remotePeerId = envelope.fromPeerId;
+      runtime.roomPeerIds.add(remotePeerId);
+      let pc = runtime.peerConnections.get(remotePeerId);
+      if (!pc) {
+        pc = new RTCPeerConnection(rtcConfig());
+        attachRtcDiagnostics(`Receiver↔${remotePeerId}`, pc);
+        runtime.peerConnections.set(remotePeerId, pc);
+        runtime.transport.ensurePeer(remotePeerId, pc);
+        pc.addEventListener('icecandidate', event => {
+          if (event.candidate) sendIce(runtime.client, runtime.sessionId, runtime.peerId, remotePeerId, event.candidate.toJSON());
+        });
+      }
+      await pc.setRemoteDescription((envelope.payload as { sdp: RTCSessionDescriptionInit }).sdp);
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      runtime.client.sendRelay(makeSignal('WEBRTC_ANSWER', runtime.sessionId, runtime.peerId, remotePeerId, { sdp: answer }));
+      for (const candidate of runtime.pendingIce.get(remotePeerId) ?? []) await pc.addIceCandidate(candidate);
+      runtime.pendingIce.delete(remotePeerId);
+      pushLog(`Answered mesh offer from ${remotePeerId}.`);
+      if (!runtime.completed && runtime.ownerPeerId && remotePeerId === runtime.ownerPeerId) {
+        await waitForTransportChannel(runtime.transport, runtime.ownerPeerId);
+        void completeReceiverTransfer(runtime).catch(error => {
+          if (isCurrentRuntime(runtime)) recordAsyncError('Receiver transfer failed', error);
+        });
+      }
+      return;
+    }
+    if (envelope.type === 'WEBRTC_ANSWER' && envelope.fromPeerId) {
+      const remotePeerId = envelope.fromPeerId;
+      const pc = runtime.peerConnections.get(remotePeerId);
+      if (!pc) return;
+      await pc.setRemoteDescription((envelope.payload as { sdp: RTCSessionDescriptionInit }).sdp);
+      for (const candidate of runtime.pendingIce.get(remotePeerId) ?? []) await pc.addIceCandidate(candidate);
+      runtime.pendingIce.delete(remotePeerId);
+      pushLog(`Mesh answer accepted from ${remotePeerId}.`);
+      if (!runtime.completed && runtime.ownerPeerId && remotePeerId === runtime.ownerPeerId) {
+        await waitForTransportChannel(runtime.transport, runtime.ownerPeerId);
+        void completeReceiverTransfer(runtime).catch(error => {
+          if (isCurrentRuntime(runtime)) recordAsyncError('Receiver transfer failed', error);
+        });
+      }
     }
   }
 
   async function completeReceiverTransfer(runtime: ReceiverRuntime): Promise<void> {
     if (!isCurrentRuntime(runtime)) return;
     if (runtime.completed || !runtime.ownerPeerId) return;
+    runtime.completed = true; // guard re-entry while transfer runs
     const controller = new DirectTransferController(runtime.engine, `run_${runtime.sessionId}`, {
       onTransportFatal: handler => {
         const removeError = runtime.transport.onError(event => handler({ peerId: event.peerId, error: event.error }));
@@ -1173,25 +1326,80 @@ function App() {
       }
     });
     let transferDownloadUrl: string | undefined;
+    const startedAt = performance.now();
     try {
       const manifest = runtime.manifest;
       if (!manifest) throw new Error('Receiver did not receive a manifest');
       controller.setTransfer({ fileBytes: manifest.size, pieceBytes: manifest.pieceSize, pieceCount: manifest.pieceCount, hashMode: 'sha256' });
+      // joinSession may already have run in SESSION_JOINED; safe to re-join with same manifest.
       await runtime.engine.joinSession(runtime.sessionId, [manifest]);
       let progress = runtime.engine.getProgress(manifest.fileId);
       const transferWindow = await transferWindowSize();
       controller.beginTransferMetrics();
-      const rtcStart = runtime.pc ? await readRtcSnapshot(runtime.pc) : { bytes: 0 };
+      const ownerPc = runtime.peerConnections.get(runtime.ownerPeerId);
+      const rtcStart = ownerPc ? await readRtcSnapshot(ownerPc) : { bytes: 0 };
+
+      const roomReceivers = () => [...runtime.roomPeerIds].filter(id => id !== runtime.peerId);
+      const useGrid = () => roomReceivers().length >= 2; // owner + self + at least one more peer ⇒ multi-peer room
+
       while (progress.verifiedPieces < progress.totalPieces) {
+        if (runtime.transferAbort?.signal.aborted) throw new Error('Transfer aborted');
         const before = progress.verifiedPieces;
-        const terminals = await controller.requestWindow(runtime.ownerPeerId, manifest.fileId, { controllerId: 'browser-direct', windowKey: `${runtime.sessionId}:${manifest.fileId}`, maxInFlight: transferWindow });
-        const scheduled = Array.from({ length: terminals.length });
-        if (scheduled.length === 0 && runtime.engine.getOutstandingRequestCount(manifest.fileId, runtime.ownerPeerId) === 0) throw new Error(`No provider scheduled piece after ${progress.verifiedPieces}/${progress.totalPieces} verified`);
-        progress = await waitForPieceProgress(runtime.engine, manifest.fileId, before);
-        pushLog(`Signaled WebRTC transferred piece ${progress.verifiedPieces}/${progress.totalPieces} verified (${scheduled.length} request(s) queued, window ${transferWindow}).`);
+        if (useGrid()) {
+          const candidatePeers = roomReceivers();
+          // Wait briefly for mesh channels to non-owner peers (best-effort).
+          for (const peerId of candidatePeers) {
+            if (peerId === runtime.ownerPeerId) continue;
+            try { await waitForTransportChannel(runtime.transport, peerId, 2_000); } catch { /* owner path still works */ }
+          }
+          const scheduled = await runtime.engine.requestGridPieceWindow(manifest.fileId, {
+            ownerPeerId: runtime.ownerPeerId,
+            candidatePeers,
+            maxInFlightTotal: Math.max(2, transferWindow * 2),
+            maxInFlightPerPeer: transferWindow,
+            requestLeaseMs: 15_000
+          });
+          if (scheduled.every(item => item.type !== 'scheduled') && runtime.engine.getOutstandingRequestCount(manifest.fileId) === 0) {
+            // Fall back to direct owner pull if grid idles with work remaining.
+            const terminals = await controller.requestWindow(runtime.ownerPeerId, manifest.fileId, {
+              controllerId: 'browser-direct-fallback',
+              windowKey: `${runtime.sessionId}:${manifest.fileId}:direct`,
+              maxInFlight: transferWindow
+            });
+            if (terminals.length === 0 && runtime.engine.getOutstandingRequestCount(manifest.fileId, runtime.ownerPeerId) === 0) {
+              throw new Error(`No provider scheduled piece after ${progress.verifiedPieces}/${progress.totalPieces} verified`);
+            }
+          }
+          progress = await waitForPieceProgress(runtime.engine, manifest.fileId, before);
+          pushLog(`Grid room transfer ${progress.verifiedPieces}/${progress.totalPieces} (peers online: ${runtime.roomPeerIds.size}).`);
+        } else {
+          const terminals = await controller.requestWindow(runtime.ownerPeerId, manifest.fileId, {
+            controllerId: 'browser-direct',
+            windowKey: `${runtime.sessionId}:${manifest.fileId}`,
+            maxInFlight: transferWindow
+          });
+          if (terminals.length === 0 && runtime.engine.getOutstandingRequestCount(manifest.fileId, runtime.ownerPeerId) === 0) {
+            throw new Error(`No provider scheduled piece after ${progress.verifiedPieces}/${progress.totalPieces} verified`);
+          }
+          progress = await waitForPieceProgress(runtime.engine, manifest.fileId, before);
+          pushLog(`Direct room transfer ${progress.verifiedPieces}/${progress.totalPieces} verified (window ${transferWindow}).`);
+        }
+        const elapsedMs = Math.max(1, performance.now() - startedAt);
+        const measuredBytes = Math.round((manifest.size * progress.verifiedPieces) / Math.max(1, progress.totalPieces));
+        const speedBps = Math.round((measuredBytes / elapsedMs) * 1000);
+        const pct = Math.round((progress.verifiedPieces / Math.max(1, progress.totalPieces)) * 100);
+        setWebGet({
+          status: 'downloading',
+          code: runtime.sessionId.slice(0, 8).toUpperCase(),
+          fileName: manifest.name,
+          progress: pct,
+          speedBps,
+          securityLabel: useGrid() ? 'Grid mesh transfer' : 'Direct P2P transfer'
+        });
         if (globalThis.localStorage?.getItem('ponswarp-partial-resume') === '1' && progress.verifiedPieces >= Math.ceil(progress.totalPieces / 2)) {
           setState(current => ({ ...current, status: 'ready', manifest, progress, restoredProgress: progress, storageKind: storageKinds.current.get(runtime.sessionId), shareUrl: currentJoinUrl(runtime.sessionId), logs: [...current.logs, `Partial resume seed persisted at ${progress.verifiedPieces}/${progress.totalPieces} pieces.`] }));
           await controller.dispose('cancelled');
+          runtime.completed = false;
           return;
         }
       }
@@ -1206,14 +1414,12 @@ function App() {
         const downloadUrl = URL.createObjectURL(assembledFile);
         transferDownloadUrl = downloadUrl;
         controller.recordResumeValidation(restoredProgress.verifiedPieces, 0, 'passed');
-        await recordRtcMetrics(runtime.pc, controller, manifest.size, transferWindow, rtcStart.bytes);
+        await recordRtcMetrics(ownerPc, controller, manifest.size, transferWindow, rtcStart.bytes);
         await controller.dispose('succeeded');
         exposeTransferMetrics(controller);
-        runtime.completed = true;
-        setState(current => ({ ...current, status: 'complete', manifest, progress, restoredProgress, downloadUrl, assembledBytes: assembledFile.size, storageKind: storageKinds.current.get(runtime.sessionId), shareUrl: currentJoinUrl(runtime.sessionId), logs: [...current.logs, `Signaled WebRTC resume restored ${restoredProgress.verifiedPieces}/${restoredProgress.totalPieces}; assembled ${assembledFile.size} bytes.`] }));
-        setWebGet(current => current.status === 'downloading'
-          ? { status: 'complete', code: current.code, outputName: manifest.name, verificationLabel: 'fully verified', downloadUrl }
-          : current);
+        setState(current => ({ ...current, status: 'complete', manifest, progress, restoredProgress, downloadUrl, assembledBytes: assembledFile.size, storageKind: storageKinds.current.get(runtime.sessionId), shareUrl: currentJoinUrl(runtime.sessionId), logs: [...current.logs, `Room transfer complete; assembled ${assembledFile.size} bytes.`] }));
+        setWebGet({ status: 'complete', code: runtime.sessionId.slice(0, 8).toUpperCase(), outputName: manifest.name, verificationLabel: 'fully verified', downloadUrl });
+        setWebShare(current => current.status === 'serving' ? { ...current, downloads: current.downloads + 1 } : current);
       } finally {
         await restoredReceiver.dispose().catch(() => undefined);
       }
@@ -1337,9 +1543,9 @@ function App() {
 
         <div className="grid-noise" aria-hidden="true" />
         <section className="hero" aria-label="PonsWarp Grid intro">
-          <p className="hero-kicker"><span className="hero-kicker-dot" aria-hidden="true" />Piece-based P2P · resume · verify</p>
-          <h1>Files move device to device</h1>
-          <p>No cloud upload of your payload. WebRTC pieces, local resume, SHA-256 checks — keep the sender tab open and share a link.</p>
+          <p className="hero-kicker"><span className="hero-kicker-dot" aria-hidden="true" />Socket room · direct or mesh grid</p>
+          <h1>Share a room, not a cloud upload</h1>
+          <p>Creating a transfer opens a signaling room with a code, QR, and link. Receivers join the room and start pulling pieces immediately — 1:1 is direct; more peers in the room mesh with grid scheduling.</p>
           <div className="mesh-motif" aria-hidden="true">
             <svg viewBox="0 0 420 120" fill="none" xmlns="http://www.w3.org/2000/svg">
               <path d="M40 70 C 100 20, 160 120, 220 60 S 340 10, 380 55" stroke="url(#g)" strokeWidth="1.5" opacity="0.7" />
@@ -1364,8 +1570,8 @@ function App() {
             <div className="card-head">
               <span className="round-icon" aria-hidden="true"><Icon name="upload" size={34} strokeWidth={2} /></span>
               <div>
-                <h2>Send file</h2>
-                <p>Share any file directly to another device.</p>
+                <h2>Open a transfer room</h2>
+                <p>Pick a file to create a socket room, code, and QR.</p>
               </div>
             </div>
             <label className="drop-zone" onDragOver={event => event.preventDefault()} onDrop={event => { event.preventDefault(); handleFileSelection(event.dataTransfer.files?.[0] ?? null); }}>
@@ -1379,7 +1585,7 @@ function App() {
             </label>
             {(selectedFile || webShare.status === 'creating') && (
               <button onClick={() => void createWebShareLink()} disabled={webShare.status === 'creating'} className="primary-button" style={{ width: '100%', marginTop: 18 }}>
-                {webShare.status === 'creating' ? 'Creating link...' : 'Create link'}
+                {webShare.status === 'creating' ? 'Opening room…' : 'Create room & code'}
               </button>
             )}
             {webShare.status === 'serving' && (
@@ -1391,8 +1597,8 @@ function App() {
                   <img src={webShare.qrDataUrl} alt={`QR code for ${webShare.code}`} width={128} height={128} />
                   <p>Scan on a phone to open receive instantly. Sender must stay online.</p>
                 </div>
-                <p><strong>This device is online.</strong> Downloads: {webShare.downloads}</p>
-                <p className="live-hint">Keep this tab open while sharing.</p>
+                <p><strong>Room online · {webShare.devicesOnline} device{webShare.devicesOnline === 1 ? '' : 's'}</strong> · Downloads: {webShare.downloads}</p>
+                <p className="live-hint">Keep this tab open. New joiners enter the same room and start receiving immediately.</p>
               </div>
             )}
           </section>
@@ -1401,8 +1607,8 @@ function App() {
             <div className="card-head">
               <span className="round-icon" aria-hidden="true"><Icon name="download" size={34} strokeWidth={2} /></span>
               <div>
-                <h2>Receive file</h2>
-                <p>Enter the link or code from the sender.</p>
+                <h2>Join room & receive</h2>
+                <p>Code, QR, or link — join the socket room and download starts.</p>
               </div>
             </div>
             <div className="receive-form">
@@ -1415,12 +1621,12 @@ function App() {
               <p><strong style={{ color: '#fff' }}>Scan QR from sender</strong><br /><span>Open camera to scan</span></p>
               <span className="camera-button" aria-hidden="true"><Icon name="camera" size={26} strokeWidth={1.8} /></span>
             </div>
-            {location.hash.startsWith('#/join/') && state.sessionId && (
+            {(location.hash.startsWith('#/join/') || webGet.status === 'downloading') && state.sessionId && webGet.status !== 'complete' && (
               <div data-testid="signaled-receive-status" className="status-card">
-                <p><strong>Transfer status:</strong> {state.status}</p>
-                <progress max={100} value={state.progress?.progress ?? 0} />
-                <p>{state.progress ? `${state.progress.verifiedPieces}/${state.progress.totalPieces} pieces verified (${state.progress.progress.toFixed(1)}%)` : 'Connecting to sender...'}</p>
-                <p>Resume restored: {state.restoredProgress ? `${state.restoredProgress.verifiedPieces}/${state.restoredProgress.totalPieces} pieces` : 'not checked'}</p>
+                <p><strong>Room transfer:</strong> {state.status}</p>
+                <progress max={100} value={state.progress?.progress ?? (webGet.status === 'downloading' ? webGet.progress : 0)} />
+                <p>{state.progress ? `${state.progress.verifiedPieces}/${state.progress.totalPieces} pieces verified (${state.progress.progress.toFixed(1)}%)` : (webGet.status === 'downloading' ? webGet.securityLabel : 'Joining room…')}</p>
+                <p>Resume: {state.restoredProgress ? `${state.restoredProgress.verifiedPieces}/${state.restoredProgress.totalPieces} pieces` : 'pending'}</p>
                 {state.downloadUrl && state.manifest && (
                   <a href={state.downloadUrl} download={state.manifest.name}>Save file ({state.assembledBytes ?? state.manifest.size} bytes)</a>
                 )}
@@ -1429,8 +1635,7 @@ function App() {
             {webGet.status === 'ready' && (
               <div data-testid="receive-ready" className="status-card">
                 <p><strong>{webGet.fileName}</strong> · {typeof webGet.sizeBytes === 'number' ? formatBytes(webGet.sizeBytes) : 'size verifying with sender'}</p>
-                <p className="live-hint">{webGet.devicesOnline} device online · secure transfer</p>
-                <button onClick={() => void runWebGetDownload()} className="primary-button" style={{ width: '100%' }}>Download</button>
+                <p className="live-hint">Entering room with {webGet.devicesOnline} device{webGet.devicesOnline === 1 ? '' : 's'} online…</p>
                 <p>{webGet.helpText}</p>
               </div>
             )}
@@ -1501,8 +1706,8 @@ function makeSignal(type: 'WEBRTC_OFFER' | 'WEBRTC_ANSWER' | 'ICE_CANDIDATE', se
   return { protocol: SIGNALING_PROTOCOL, version: PROTOCOL_VERSION, messageId: messageId(), type, sessionId, fromPeerId, toPeerId, timestamp: Date.now(), payload };
 }
 function sendIce(client: BrowserSignalingClient, sessionId: SessionId, fromPeerId: PeerId, toPeerId: PeerId, candidate: RTCIceCandidateInit): void { client.sendRelay(makeSignal('ICE_CANDIDATE', sessionId, fromPeerId, toPeerId, { candidate })); }
-async function waitForTransportChannel(transport: WebRTCTransport, peerId: PeerId): Promise<void> {
-  const deadline = Date.now() + 30_000;
+async function waitForTransportChannel(transport: WebRTCTransport, peerId: PeerId, timeoutMs = 30_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const channel = transport.getPeer(peerId)?.getChannel();
     if (channel?.channel.readyState === 'open') return;

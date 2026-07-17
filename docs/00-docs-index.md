@@ -38,6 +38,7 @@
 | `23-grid-scheduler-endgame-design.md` | Grid 스케줄러/엔드게임 | rarest-first, multi-peer window, endgame cancel |
 | `24-adaptive-congestion-control-design.md` | 적응형 혼잡 제어 | RTT/AIMD 컨트롤러 이식 범위 (phase-4) |
 | `25-ui-ux-redesign-2026.md` | 2026 UI/UX 전면 재설계 | Award-product 비주얼 시스템, 반응형, 접근성 |
+| `26-room-mesh-transfer-design.md` | 룸 메시 전송 제품 경로 | 소켓 룸·코드/QR 즉시 수신, 1:1 direct / 다자 grid 분기 |
 
 ---
 
