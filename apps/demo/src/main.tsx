@@ -123,6 +123,16 @@ type FinalizedDownload = {
   hint?: string;
 };
 
+function extensionForSaveName(name: string): string | undefined {
+  const base = name.split(/[\\/]/).pop() ?? name;
+  const dot = base.lastIndexOf('.');
+  if (dot <= 0 || dot === base.length - 1) return undefined;
+  const ext = base.slice(dot).toLowerCase();
+  // File System Access API requires extensions like ".bin" (letter/digit only after the dot).
+  if (!/^\.[a-z0-9]{1,16}$/i.test(ext)) return undefined;
+  return ext;
+}
+
 async function openSaveWritable(suggestedName: string): Promise<WritableStream<Uint8Array> | null> {
   const picker = (globalThis as typeof globalThis & {
     showSaveFilePicker?: (options?: {
@@ -132,15 +142,21 @@ async function openSaveWritable(suggestedName: string): Promise<WritableStream<U
   }).showSaveFilePicker;
   if (typeof picker !== 'function') return null;
   try {
+    const ext = extensionForSaveName(suggestedName);
     const handle = await picker({
-      suggestedName,
-      types: [{ description: 'Received file', accept: { 'application/octet-stream': ['.*'] } }]
+      suggestedName: suggestedName || 'download.bin',
+      // Omit invalid wildcards; only pass a real extension when safe.
+      ...(ext
+        ? { types: [{ description: 'Received file', accept: { 'application/octet-stream': [ext] } }] }
+        : {})
     });
     return await handle.createWritable();
   } catch (error) {
-    // User cancel should not fail the transfer; fall through to other sinks.
-    if (error instanceof DOMException && (error.name === 'AbortError' || error.name === 'NotAllowedError')) return null;
-    throw error;
+    // Cancel / permission / picker option errors must not fail the completed transfer.
+    if (error instanceof DOMException && (error.name === 'AbortError' || error.name === 'NotAllowedError' || error.name === 'SecurityError')) return null;
+    if (error instanceof TypeError) return null;
+    console.warn('showSaveFilePicker failed; falling back', error);
+    return null;
   }
 }
 
