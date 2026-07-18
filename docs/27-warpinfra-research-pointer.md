@@ -24,3 +24,5 @@
 https://github.com/DeclanJeon/ponswarp-desktop (private) — `docs/` 디렉터리
 
 작성일: 2026-07-17
+
+Status/plan (2026-07-18): see desktop `docs/11-status-and-forward-plan-2026-07-18.md`.
