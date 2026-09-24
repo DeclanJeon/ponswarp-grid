@@ -1,0 +1,401 @@
+{
+  "version": 1,
+  "createdAt": "2026-07-05T16:02:45.441Z",
+  "updatedAt": "2026-07-05T16:02:56.872Z",
+  "briefPath": ".omx/ultragoal/brief.md",
+  "goalsPath": ".omx/ultragoal/goals.json",
+  "ledgerPath": ".omx/ultragoal/ledger.jsonl",
+  "codexGoalMode": "aggregate",
+  "goals": [
+    {
+      "id": "G001-core-transfer-robustness-multi-chunk",
+      "title": "core transfer robustness: multi-chunk piece transfer, retry, resume,...",
+      "objective": "core transfer robustness: multi-chunk piece transfer, retry, resume, provider churn;",
+      "status": "in_progress",
+      "attempt": 1,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:56.872Z",
+      "startedAt": "2026-07-05T16:02:56.872Z"
+    },
+    {
+      "id": "G002-measured-transfer-telemetry-real-spe",
+      "title": "measured transfer telemetry: real speed/RTT/buffer/retry reporting, n...",
+      "objective": "measured transfer telemetry: real speed/RTT/buffer/retry reporting, no hard-coded speed claims;",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G003-browser-product-flow-real-coordinato",
+      "title": "browser product flow: real coordinator share-code resolve/connect/tra...",
+      "objective": "browser product flow: real coordinator share-code resolve/connect/transfer/resume/download;",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G004-cli-product-flow-status-clean-coordi",
+      "title": "CLI product flow: `status`, `clean`, coordinator `get` completion, la...",
+      "objective": "CLI product flow: `status`, `clean`, coordinator `get` completion, large-file reports;",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G005-coordinator-contract-api-grid-v1-and",
+      "title": "coordinator contract: `/api/grid/v1/*` and `/ws/grid/*` route alignment;",
+      "objective": "coordinator contract: `/api/grid/v1/*` and `/ws/grid/*` route alignment;",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G006-cross-network-matrix-lan-nat-lte-5g",
+      "title": "cross-network matrix: LAN, NAT, LTE/5G, relay-only, UDP-blocked TCP/TLS;",
+      "objective": "cross-network matrix: LAN, NAT, LTE/5G, relay-only, UDP-blocked TCP/TLS;",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G007-production-hardening-validation-db-a",
+      "title": "production hardening validation: DB, auth, rate limit, metrics, clean...",
+      "objective": "production hardening validation: DB, auth, rate limit, metrics, cleanup, DR;",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G008-docs-release-gates-aligned-to-eviden",
+      "title": "docs/release gates aligned to evidence.",
+      "objective": "docs/release gates aligned to evidence.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G009-pnpm-test-pnpm-type-check-and-pnpm-b",
+      "title": "`pnpm test`, `pnpm type-check`, and `pnpm build` pass.",
+      "objective": "`pnpm test`, `pnpm type-check`, and `pnpm build` pass.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G010-final-scorecard-in-docs-16-grid-95-c",
+      "title": "Final scorecard in `docs/16-grid-95-completion-design.md` is >=95/100.",
+      "objective": "Final scorecard in `docs/16-grid-95-completion-design.md` is >=95/100.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G011-no-unwaived-sev-1-remains",
+      "title": "No unwaived SEV-1 remains.",
+      "objective": "No unwaived SEV-1 remains.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G012-artifacts-g95-final-readiness-report",
+      "title": "`artifacts/g95-final-readiness-report.md` exists and links every requ...",
+      "objective": "`artifacts/g95-final-readiness-report.md` exists and links every required proof.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G013-browser-and-cli-product-flows-have-a",
+      "title": "Browser and CLI product flows have automated or artifact-backed E2E e...",
+      "objective": "Browser and CLI product flows have automated or artifact-backed E2E evidence.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G014-cross-network-speed-matrix-reports-i",
+      "title": "Cross-network speed matrix reports include topology, transport/candid...",
+      "objective": "Cross-network speed matrix reports include topology, transport/candidate path, file size, chunk/piece size, throughput, retry/failure counts, memory, and final hash.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G015-freeze-contracts-and-schemas",
+      "title": "Freeze contracts and schemas.",
+      "objective": "Freeze contracts and schemas.\nCoordinator route contract.\nTransfer telemetry schema.\nNetwork matrix report schema.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G016-implement-core-transfer-robustness",
+      "title": "Implement core transfer robustness.",
+      "objective": "Implement core transfer robustness.\nMulti-chunk send/reassembly.\nChunk timeout/retry handling.\nBackpressure integration.\nTests for missing/corrupt/duplicate chunks.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G017-implement-telemetry-and-speed-report",
+      "title": "Implement telemetry and speed reporting.",
+      "objective": "Implement telemetry and speed reporting.\nEmit real `transfer:speed`, `buffer:watermark`, and transfer summary events.\nRemove or relabel hard-coded UI speed.\nAdd CLI/browser JSON reports.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G018-complete-product-clients",
+      "title": "Complete product clients.",
+      "objective": "Complete product clients.\nBrowser coordinator share/get flow.\nCLI status/clean/coordinator get.\nResume and large-file-safe UX.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G019-align-coordinator-deployment-contrac",
+      "title": "Align coordinator/deployment contracts.",
+      "objective": "Align coordinator/deployment contracts.\n`/api/grid/v1/*` and `/ws/grid/*` route tests.\nDeployment validator behavior checks.\nExternal Rust coordinator integration note or dev stub.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G020-build-qa-and-performance-gates",
+      "title": "Build QA and performance gates.",
+      "objective": "Build QA and performance gates.\nNetwork matrix harness.\n500MiB CLI transfer evidence.\n100MiB+ browser relay or explicit unsupported UX evidence.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G021-run-production-hardening-validators",
+      "title": "Run production-hardening validators.",
+      "objective": "Run production-hardening validators.\nDB readiness.\nSecurity/auth/rate-limit.\nMetrics/cleanup/restart/DR.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G022-align-docs-and-final-readiness-repor",
+      "title": "Align docs and final readiness report.",
+      "objective": "Align docs and final readiness report.\nREADME/user guide/release gates.\nFinal 95% scorecard.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G023-coordinator-implementation-may-live",
+      "title": "Coordinator implementation may live outside this repo. Mitigation: co...",
+      "objective": "Coordinator implementation may live outside this repo. Mitigation: contract tests and explicit external integration setup.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G024-synthetic-throughput-may-be-mistaken",
+      "title": "Synthetic throughput may be mistaken for network speed. Mitigation: `...",
+      "objective": "Synthetic throughput may be mistaken for network speed. Mitigation: `synthetic: true` metadata and docs language gate.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G025-chunking-rewrite-may-break-direct-cl",
+      "title": "Chunking rewrite may break direct CLI. Mitigation: preserve direct in...",
+      "objective": "Chunking rewrite may break direct CLI. Mitigation: preserve direct integration tests and add compatibility tests.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G026-network-matrix-may-be-too-manual-mit",
+      "title": "Network matrix may be too manual. Mitigation: machine-readable report...",
+      "objective": "Network matrix may be too manual. Mitigation: machine-readable report schema and required fields.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G027-real-network-reliability-is-the-prod",
+      "title": "Real network reliability is the product risk.",
+      "objective": "Real network reliability is the product risk.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G028-speed-claims-must-be-measured-on-rea",
+      "title": "Speed claims must be measured on real paths.",
+      "objective": "Speed claims must be measured on real paths.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G029-coordinator-contract-is-the-largest",
+      "title": "Coordinator contract is the largest gap between MVP and product.",
+      "objective": "Coordinator contract is the largest gap between MVP and product.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G030-polish-demo-only-rejected-does-not-c",
+      "title": "Polish demo only: rejected; does not close production gaps.",
+      "objective": "Polish demo only: rejected; does not close production gaps.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G031-duplicate-full-coordinator-in-ts-rej",
+      "title": "Duplicate full coordinator in TS: rejected as default; deployment poi...",
+      "objective": "Duplicate full coordinator in TS: rejected as default; deployment points to external Rust `mesh_api`.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G032-treat-direct-send-join-as-final-prod",
+      "title": "Treat direct send/join as final product: rejected; share-code/coordin...",
+      "objective": "Treat direct send/join as final product: rejected; share-code/coordinator product flow remains required.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G033-work-is-multi-lane-and-should-be-exe",
+      "title": "Work is multi-lane and should be executed through coordinated agents...",
+      "objective": "Work is multi-lane and should be executed through coordinated agents or a durable goal workflow.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G034-some-tasks-may-require-external-coor",
+      "title": "Some tasks may require external coordinator repo access.",
+      "objective": "Some tasks may require external coordinator repo access.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G035-final-docs-must-not-overclaim-unsupp",
+      "title": "Final docs must not overclaim unsupported network paths.",
+      "objective": "Final docs must not overclaim unsupported network paths.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G036-core-protocol-lane-executor-core-eng",
+      "title": "Core protocol lane: `executor` / Core engine engineer.",
+      "objective": "Core protocol lane: `executor` / Core engine engineer.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G037-browser-lane-designer-frontend-execu",
+      "title": "Browser lane: `designer` + frontend executor.",
+      "objective": "Browser lane: `designer` + frontend executor.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G038-cli-lane-cli-executor",
+      "title": "CLI lane: CLI executor.",
+      "objective": "CLI lane: CLI executor.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G039-coordinator-lane-backend-api-integra",
+      "title": "Coordinator lane: backend/API integrator.",
+      "objective": "Coordinator lane: backend/API integrator.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G040-qa-network-lane-tester-performance-e",
+      "title": "QA/network lane: tester/performance engineer.",
+      "objective": "QA/network lane: tester/performance engineer.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G041-release-docs-lane-writer-verifier",
+      "title": "Release/docs lane: writer + verifier.",
+      "objective": "Release/docs lane: writer + verifier.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G042-each-lane-returns-changed-files-targ",
+      "title": "Each lane returns changed files, targeted tests, and artifact paths.",
+      "objective": "Each lane returns changed files, targeted tests, and artifact paths.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    },
+    {
+      "id": "G043-verifier-lane-owns-final-scorecard-a",
+      "title": "Verifier lane owns final scorecard and blocks 95% claim until evidenc...",
+      "objective": "Verifier lane owns final scorecard and blocks 95% claim until evidence exists.",
+      "status": "pending",
+      "attempt": 0,
+      "createdAt": "2026-07-05T16:02:45.441Z",
+      "updatedAt": "2026-07-05T16:02:45.441Z"
+    }
+  ],
+  "codexObjective": "Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail.",
+  "activeGoalId": "G001-core-transfer-robustness-multi-chunk"
+}
